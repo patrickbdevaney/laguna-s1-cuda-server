@@ -74,6 +74,8 @@ back-to-back A/B/A.
 | 21 | **Router top-k on a warp, not on `threadIdx.x == 0`** | — | — | (folded into #20's measurement) |
 | 22 | **FP8 GEMM weight loads 8 B → 16 B**, now that 4 warps hide the latency | 25.63 | **26.59/26.66** | **WON +4.0 %** |
 | 23 | **Segmented GEMM: q\|k\|v\|g, sh_gate\|sh_up, mlp_gate\|mlp_up each one launch** | 26.63 | **27.18/27.35** | **WON +2.7 %**, bit-exact |
+| 24 | Shared-memory `x` staging at the verify shapes | 0.271 ms | 0.492 ms | **LOST 1.8x, default off** |
+| 25 | N-blocking the M>1 GEMM (2 or 4 outputs per warp) | 0.270 ms | 0.271 / 0.270 | **NEUTRAL, default 1** |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 

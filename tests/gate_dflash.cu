@@ -178,8 +178,12 @@ int main(int argc, char** argv) {
                          (3.0 * c.moe_intermediate * c.hidden) * (0.5 + 1.0 / c.nvfp4_group);
         double draft_b = DW.arena_bytes + (double)c.vocab * c.hidden * 2;
         double gbtok = (dense + experts + draft_b) / tau / 1e9;
-        printf("  %-4d %10.2f %10.3f %7.3f %10.2f %12ld %5d/%zu%s\n", k, tps, tau, ef, gbtok,
-               target_fwd, match, ncmp, (size_t)match == ncmp ? "" : "  <-- MISMATCH");
+        if (E.efrac)
+            printf("  %-4d %10.2f %10.3f %7.3f %10.2f %12ld %5d/%zu%s\n", k, tps, tau, ef, gbtok,
+                   target_fwd, match, ncmp, (size_t)match == ncmp ? "" : "  <-- MISMATCH");
+        else   // without LG_EFRAC the expert count is unknown, so GB/tok would be a fiction
+            printf("  %-4d %10.2f %10.3f %7s %10s %12ld %5d/%zu%s\n", k, tps, tau, "-", "-",
+                   target_fwd, match, ncmp, (size_t)match == ncmp ? "" : "  <-- MISMATCH");
         if (tps > best_tps) { best_tps = tps; best_k = k; }
         S.free_();
     }

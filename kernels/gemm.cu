@@ -378,97 +378,189 @@ struct GSegs {
     int    nseg;
 };
 
-template <int WARPS, int MM>
-__global__ __launch_bounds__(WARPS * 32)
-void k_gemm_bf16_seg(GSegs sg, const uint16_t* __restrict__ W,
-                     const uint16_t* __restrict__ xb, int M, int Ntot, int K) {
-    const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * WARPS + (threadIdx.x >> 5);
-    if (n >= Ntot) return;
-    const int m0 = blockIdx.y * MM;
-    const int mn = min(MM, M - m0);
-
-    float acc[MM];
-    #pragma unroll
-    for (int m = 0; m < MM; ++m) acc[m] = 0.f;
-
-    const uint4* wrow = (const uint4*)(W + (long)n * K);
-    const int K8 = K / 8;
-    for (int c = lane; c < K8; c += 32) {
-        uint4 wv = __ldcs(wrow + c);
-        const uint16_t* wh = (const uint16_t*)&wv;
-        #pragma unroll
-        for (int m = 0; m < MM; ++m) {
-            if (m >= mn) break;
-            const uint4 xv = *(const uint4*)(xb + (long)(m0 + m) * K + c * 8);
-            const uint16_t* xh = (const uint16_t*)&xv;
-            float s = 0.f;
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) s = fmaf(bf2f(wh[j]), bf2f(xh[j]), s);
-            acc[m] += s;
-        }
-    }
-    int seg = 0;
-    #pragma unroll
-    for (int t = 1; t < 4; ++t) if (t < sg.nseg && n >= sg.n0[t]) seg = t;
-    const int nl = n - sg.n0[seg], Ns = sg.N[seg];
-    float* o = sg.out[seg];
-    #pragma unroll
-    for (int m = 0; m < MM; ++m) {
-        if (m >= mn) break;
-        float v = warp_sum(acc[m]);
-        if (lane == 0) o[(long)(m0 + m) * Ns + nl] = v;
-    }
-}
-
-template <int WARPS, int MM, int VEC>
+// N-blocking for the verify shapes. At M=1 the weight read dominates and one output row per
+// warp is right. At M=k+1 the kernel is issue-bound on the ACTIVATION loads: per iteration a
+// lane reads VEC bytes of weight and M*32 bytes of x, so x costs 10x the weight at M=5.
+// Giving each warp NN consecutive output rows amortises those x loads over NN outputs
+// without touching the weight traffic at all -- the two weight rows are still one coalesced
+// read per lane.
+//
+// Bit-exact: each (n, m) dot product still sums over c in the same ascending order.
+template <int WARPS, int MM, int VEC, int NN>
 __global__ __launch_bounds__(WARPS * 32)
 void k_gemm_fp8_seg(GSegs sg, const uint8_t* __restrict__ W, const float* __restrict__ rs,
                     const uint16_t* __restrict__ xb, int M, int Ntot, int K) {
     const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * WARPS + (threadIdx.x >> 5);
-    if (n >= Ntot) return;
+    const int n0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * NN;
+    if (n0 >= Ntot) return;
+    const int nn = min(NN, Ntot - n0);
     const int m0 = blockIdx.y * MM;
     const int mn = min(MM, M - m0);
 
-    float acc[MM];
+    float acc[NN][MM];
     #pragma unroll
-    for (int m = 0; m < MM; ++m) acc[m] = 0.f;
+    for (int u = 0; u < NN; ++u)
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) acc[u][m] = 0.f;
 
     const int C = K / VEC;
     typedef typename WVec<VEC>::T wvec_t;
-    const wvec_t* wrow = (const wvec_t*)(W + (long)n * K);
     for (int c = lane; c < C; c += 32) {
-        wvec_t wv = __ldcs(wrow + c);
-        const uint8_t* wb = (const uint8_t*)&wv;
+        wvec_t wv[NN];
+        #pragma unroll
+        for (int u = 0; u < NN; ++u)
+            if (u < nn) wv[u] = __ldcs((const wvec_t*)(W + (long)(n0 + u) * K) + c);
         #pragma unroll
         for (int m = 0; m < MM; ++m) {
             if (m >= mn) break;
             const uint16_t* xp = xb + (long)(m0 + m) * K + c * VEC;
-            float s = 0.f;
             #pragma unroll
             for (int v = 0; v < VEC / 8; ++v) {
                 const uint4 xv = *(const uint4*)(xp + v * 8);
                 const uint16_t* xh = (const uint16_t*)&xv;
                 #pragma unroll
-                for (int j = 0; j < 8; ++j) s = fmaf(e4m3f(wb[v * 8 + j]), bf2f(xh[j]), s);
+                for (int u = 0; u < NN; ++u) {
+                    if (u >= nn) break;
+                    const uint8_t* wb = (const uint8_t*)&wv[u];
+                    float s = 0.f;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) s = fmaf(e4m3f(wb[v * 8 + j]), bf2f(xh[j]), s);
+                    acc[u][m] += s;
+                }
             }
-            acc[m] += s;
         }
     }
-    const float sc = rs[n];
-    int seg = 0;
     #pragma unroll
-    for (int t = 1; t < 4; ++t) if (t < sg.nseg && n >= sg.n0[t]) seg = t;
-    const int nl = n - sg.n0[seg], Ns = sg.N[seg];
-    float* o = sg.out[seg];
-    #pragma unroll
-    for (int m = 0; m < MM; ++m) {
-        if (m >= mn) break;
-        float v = warp_sum(acc[m]);
-        if (lane == 0) o[(long)(m0 + m) * Ns + nl] = v * sc;
+    for (int u = 0; u < NN; ++u) {
+        if (u >= nn) break;
+        const int n = n0 + u;
+        const float sc = rs[n];
+        int seg = 0;
+        #pragma unroll
+        for (int t = 1; t < 4; ++t) if (t < sg.nseg && n >= sg.n0[t]) seg = t;
+        const int nl = n - sg.n0[seg], Ns = sg.N[seg];
+        float* o = sg.out[seg];
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) {
+            if (m >= mn) break;
+            float v = warp_sum(acc[u][m]);
+            if (lane == 0) o[(long)(m0 + m) * Ns + nl] = v * sc;
+        }
     }
 }
+
+template <int WARPS, int MM, int NN>
+__global__ __launch_bounds__(WARPS * 32)
+void k_gemm_bf16_segN(GSegs sg, const uint16_t* __restrict__ W,
+                      const uint16_t* __restrict__ xb, int M, int Ntot, int K) {
+    const int lane = threadIdx.x & 31;
+    const int n0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * NN;
+    if (n0 >= Ntot) return;
+    const int nn = min(NN, Ntot - n0);
+    const int m0 = blockIdx.y * MM;
+    const int mn = min(MM, M - m0);
+
+    float acc[NN][MM];
+    #pragma unroll
+    for (int u = 0; u < NN; ++u)
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) acc[u][m] = 0.f;
+
+    const int K8 = K / 8;
+    for (int c = lane; c < K8; c += 32) {
+        uint4 wv[NN];
+        #pragma unroll
+        for (int u = 0; u < NN; ++u)
+            if (u < nn) wv[u] = __ldcs((const uint4*)(W + (long)(n0 + u) * K) + c);
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) {
+            if (m >= mn) break;
+            const uint4 xv = *(const uint4*)(xb + (long)(m0 + m) * K + c * 8);
+            const uint16_t* xh = (const uint16_t*)&xv;
+            #pragma unroll
+            for (int u = 0; u < NN; ++u) {
+                if (u >= nn) break;
+                const uint16_t* wh = (const uint16_t*)&wv[u];
+                float s = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) s = fmaf(bf2f(wh[j]), bf2f(xh[j]), s);
+                acc[u][m] += s;
+            }
+        }
+    }
+    #pragma unroll
+    for (int u = 0; u < NN; ++u) {
+        if (u >= nn) break;
+        const int n = n0 + u;
+        int seg = 0;
+        #pragma unroll
+        for (int t = 1; t < 4; ++t) if (t < sg.nseg && n >= sg.n0[t]) seg = t;
+        const int nl = n - sg.n0[seg], Ns = sg.N[seg];
+        float* o = sg.out[seg];
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) {
+            if (m >= mn) break;
+            float v = warp_sum(acc[u][m]);
+            if (lane == 0) o[(long)(m0 + m) * Ns + nl] = v;
+        }
+    }
+}
+
+// **NEUTRAL, default 1** (OPTIMIZATION_LOG #25). Measured at the verify shape M=6, FP8
+// q_proj: NN=1 0.270 ms, NN=2 0.271, NN=4 0.270 -- no effect whatsoever. So the M>1 GEMM is
+// not activation-load-bound either, which together with the shared-memory result (#24, 1.8x
+// slower) rules out both obvious explanations for why M=6 costs 2.25x M=1 on identical
+// weight traffic. Kept as a knob so the next person does not re-derive the same negative.
+static int gemm_nn() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("LG_GEMM_NN"); v = e ? atoi(e) : 1;
+                 if (v != 1 && v != 2 && v != 4) v = 2; }
+    return v;
+}
+
+// The M=1 decode path keeps NN=1 -- it is weight-bound, not activation-bound, and NN>1 would
+// only cut the grid. Only the verify shapes take the N-blocked form.
+#define GEMM_DISPATCH_N1(KERN, MMV, ...)                                                    \
+    do {                                                                                    \
+        const int WPB = gemm_warps();                                                       \
+        dim3 g_((N + WPB - 1) / WPB, (M + (MMV) - 1) / (MMV));                              \
+        switch (WPB) {                                                                      \
+        case 8: KERN<8, MMV, 1><<<g_, 8 * 32, 0, st>>>(__VA_ARGS__); break;                  \
+        case 4: KERN<4, MMV, 1><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__); break;                  \
+        case 2: KERN<2, MMV, 1><<<g_, 2 * 32, 0, st>>>(__VA_ARGS__); break;                  \
+        default: KERN<1, MMV, 1><<<g_, 32, 0, st>>>(__VA_ARGS__); break;                     \
+        }                                                                                   \
+    } while (0)
+
+#define GEMM_DISPATCH_VN1(KERN, MMV, VECV, ...)                                             \
+    do {                                                                                    \
+        const int WPB = gemm_warps();                                                       \
+        dim3 g_((N + WPB - 1) / WPB, (M + (MMV) - 1) / (MMV));                              \
+        switch (WPB) {                                                                      \
+        case 8: KERN<8, MMV, VECV, 1><<<g_, 8 * 32, 0, st>>>(__VA_ARGS__); break;            \
+        case 4: KERN<4, MMV, VECV, 1><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__); break;            \
+        case 2: KERN<2, MMV, VECV, 1><<<g_, 2 * 32, 0, st>>>(__VA_ARGS__); break;            \
+        default: KERN<1, MMV, VECV, 1><<<g_, 32, 0, st>>>(__VA_ARGS__); break;               \
+        }                                                                                   \
+    } while (0)
+
+#define NN_DISPATCH(KERN, MMV, ...)                                                         \
+    do {                                                                                    \
+        const int WPB = gemm_warps(), NNV = gemm_nn();                                      \
+        dim3 g_((N + WPB * NNV - 1) / (WPB * NNV), (M + (MMV) - 1) / (MMV));                \
+        if (NNV == 4)      KERN<4, MMV, 4><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__);              \
+        else if (NNV == 2) KERN<4, MMV, 2><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__);              \
+        else               KERN<4, MMV, 1><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__);              \
+    } while (0)
+
+#define NN_DISPATCH_V(KERN, MMV, VECV, ...)                                                 \
+    do {                                                                                    \
+        const int WPB = gemm_warps(), NNV = gemm_nn();                                      \
+        dim3 g_((N + WPB * NNV - 1) / (WPB * NNV), (M + (MMV) - 1) / (MMV));                \
+        if (NNV == 4)      KERN<4, MMV, VECV, 4><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__);        \
+        else if (NNV == 2) KERN<4, MMV, VECV, 2><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__);        \
+        else               KERN<4, MMV, VECV, 1><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__);        \
+    } while (0)
 
 static GSegs pack_segs(float* const* outs, const int* Ns, int nseg, int* Ntot) {
     GSegs sg; sg.nseg = nseg; int acc = 0;
@@ -488,8 +580,8 @@ extern "C" void gemm_bf16_seg(float* const* outs, const int* Ns, int nseg,
     if (smem_stage(M)) { gemm_bf16_seg2(outs, Ns, nseg, W, xb, M, K, st); return; }
     int N = 0;
     GSegs sg = pack_segs(outs, Ns, nseg, &N);
-    if (M == 1) { GEMM_DISPATCH(k_gemm_bf16_seg, 1, sg, W, xb, M, N, K); return; }
-    GEMM_DISPATCH(k_gemm_bf16_seg, MAXM, sg, W, xb, M, N, K);
+    if (M == 1) { GEMM_DISPATCH_N1(k_gemm_bf16_segN, 1, sg, W, xb, M, N, K); return; }
+    NN_DISPATCH(k_gemm_bf16_segN, MAXM, sg, W, xb, M, N, K);
 }
 
 extern "C" void gemm_fp8_seg(float* const* outs, const int* Ns, int nseg,
@@ -499,11 +591,11 @@ extern "C" void gemm_fp8_seg(float* const* outs, const int* Ns, int nseg,
     int N = 0;
     GSegs sg = pack_segs(outs, Ns, nseg, &N);
     if (fp8_vec() == 16) {
-        if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8_seg, 1, 16, sg, W, rs, xb, M, N, K); return; }
-        GEMM_DISPATCH_V(k_gemm_fp8_seg, MAXM, 16, sg, W, rs, xb, M, N, K);
+        if (M == 1) { GEMM_DISPATCH_VN1(k_gemm_fp8_seg, 1, 16, sg, W, rs, xb, M, N, K); return; }
+        NN_DISPATCH_V(k_gemm_fp8_seg, MAXM, 16, sg, W, rs, xb, M, N, K);
     } else {
-        if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8_seg, 1, 8, sg, W, rs, xb, M, N, K); return; }
-        GEMM_DISPATCH_V(k_gemm_fp8_seg, MAXM, 8, sg, W, rs, xb, M, N, K);
+        if (M == 1) { GEMM_DISPATCH_VN1(k_gemm_fp8_seg, 1, 8, sg, W, rs, xb, M, N, K); return; }
+        NN_DISPATCH_V(k_gemm_fp8_seg, MAXM, 8, sg, W, rs, xb, M, N, K);
     }
 }
 

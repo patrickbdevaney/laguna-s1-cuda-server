@@ -1,6 +1,6 @@
 """Gate A1 deliverable: golden tensors from the REAL 71.9 GB NVFP4 checkpoint.
 
-Strategy that makes this fit in memory: the 15.2 GB of BF16 non-expert weights are
+Strategy that makes this fit in memory: the 8.03 GB of BF16 non-expert weights are
 resident (as fp32 on GPU); the 63.9 GB of NVFP4 routed experts stay on disk and only
 the experts a token actually routes to are dequantised, through a bounded LRU.
 

@@ -42,7 +42,8 @@ is what made gemma's DFlash bit-exact against its own base path.
 `model.layers.0.mlp.{gate,up,down}_proj`, `re:.*\.self_attn\.q_proj$`, `k_proj`, `v_proj`,
 `o_proj`, `g_proj`, `re:.*\.mlp\.gate$`, `re:.*\.mlp\.shared_expert\.{gate,up,down}_proj$`.
 
-⇒ **15.2 GB of the checkpoint is BF16** and 5.61 GB of it is read on every decode step. This is
+⇒ **8.03 GB of the checkpoint is BF16** and 5.61 GB of it is read on every decode step (the
+gap is `embed_tokens`, of which a decode step touches one row). This is
 the single most consequential fact in the inventory; see `ROOFLINE.md` §0 and §5.
 
 ## 4. KV cache scheme

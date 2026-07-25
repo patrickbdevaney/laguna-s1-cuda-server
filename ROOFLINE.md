@@ -72,7 +72,7 @@ Quantization coverage, from `quantization_config`:
 |---|---|
 | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `g_proj` (all 48 layers) | `experts.{0..255}.{gate,up,down}_proj` (47 layers) |
 | `mlp.gate` (router), `shared_expert.*`, layer-0 dense MLP, `lm_head`, `embed_tokens`, all norms | — |
-| **15.2 GB of checkpoint** | **63.9 GB of checkpoint (88.8 %)** |
+| **8.03 GB of checkpoint** | **63.87 GB of checkpoint (88.8 %)** |
 
 Effective expert weight density: 4.5 bits/param (4-bit E2M1 + one E4M3 scale per 16) =
 0.5625 B/param — same as gemma's NVFP4, **not** the 0.531 the directive assumed.
@@ -252,7 +252,7 @@ section. Until then all speculative numbers are quoted at correlation 0 (pessimi
 
 ## 5. The lever the directive does not name: self-quantizing the BF16 remainder
 
-Poolside quantized only the routed experts. The other 15.2 GB of the checkpoint — and 7.41 GB of
+Poolside quantized only the routed experts. The other 8.03 GB of the checkpoint — and 7.41 GB of
 every decode step — is BF16. We already own a validated NVFP4 path from the gemma work.
 
 | scenario | FIXED | `B_tok` | AR@135 | AR@200 | spec@135 | spec@200 |

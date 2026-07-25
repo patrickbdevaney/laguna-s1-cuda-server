@@ -96,7 +96,7 @@ final layer only.
 
 ### A1.4 Golden tensors from the real 71.9 GB checkpoint — PASS
 
-`oracle/golden.py`. 15.2 GB of BF16 non-expert weights resident as fp32 on GPU; the 63.9 GB
+`oracle/golden.py`. 8.03 GB of BF16 non-expert weights resident as fp32 on GPU; the 63.87 GB
 of NVFP4 experts stay on disk and only routed experts are dequantized, through a 384-entry
 LRU. Peak host memory 53 GB.
 
@@ -131,3 +131,88 @@ values exact. **ROPE GATE: PASS.**
 `transformers==5.12.1`, `torch 2.10.0+cu130`, `tokenizers` (oracle venv),
 `safetensors 0.7.0`, driver 580.00, CUDA 13.0.48, L4T R38.4.0.
 Recorded because DFlash upstream is still moving (vLLM #46853, SGLang #29446, TRT-LLM #15666).
+
+---
+
+## Correction — 2026-07-24 (self-caught before the loader was written)
+
+Earlier prose in `MODEL_INVENTORY.md`, `ROOFLINE.md` and `LOOP_LOG.md` stated the BF16
+(non-expert) portion of the checkpoint as **15.2 GB**. Measured exactly:
+
+| | bytes |
+|---|---:|
+| routed experts (`weight_packed` 56.7741 + `weight_scale` 7.0968 + globals 0.0003) | **63.8712 GB** |
+| everything else (BF16 attention, shared experts, router, layer-0 MLP, `lm_head`, `embed_tokens`, norms) | **8.0276 GB** |
+| total | 71.8987 GB ✓ matches the index |
+
+The correct figure is **8.03 GB**. The 15.2 came from subtracting only `weight_packed`
+(56.77) from the total and forgetting that `weight_scale` is also part of the expert payload.
+
+**No downstream number changes.** `B_tok`'s fixed term was always computed per component
+(7.4110 GB) and reconciles exactly: 8.0276 − 0.6166 (`embed_tokens`, of which a decode step
+reads one row) + 0.0000 = 7.411 GB. The roofline, the k-sweep, and the quantization-scenario
+table are unaffected; only the prose was wrong. Sizing the loader's device allocations is the
+first thing that would have consumed the wrong figure, which is why it was re-derived first.
+
+---
+
+## Gate L1 — loader · **PASS** · 2026-07-24
+
+`include/laguna_weights.h` + `tests/test_loader.cu`. Requirements were: device load OK,
+peak memory < 85 GB, fast restart < 60 s.
+
+| | result |
+|---|---|
+| arena | **71.899 GB in ONE `cudaMalloc`**, 1096 reservations, 256 B-aligned |
+| cold load (page cache dropped) | **44.6 s** — io 34.7 s + H2D 4.5 s |
+| peak host RSS | **4.92 GB** |
+| **peak total (device + host)** | **76.8 GB** — under the 85 GB limit |
+| device free afterwards | **52.07 GB** for KV + draft + activations |
+| tensors placed | 109 057 of 145 153; the other 36 096 are `input_global_scale`, intentionally unused (W4A16) |
+| verification | every planned tensor found; dtype and byte-size checked per tensor; `e_gate_inv[0]` = 8.68056e-05 = 1/11520 exactly |
+
+### What made it fast — three measurements, not guesses
+
+The first working version took **74.4 s** and used 145 153 individual `cudaMemcpy` calls from
+a lazily-faulted mmap. `tests/h2d_probe.cu` isolated why:
+
+| path | GB/s |
+|---|---:|
+| one big memcpy from warm pageable mmap | **109.4** |
+| 1365 × 1.5 MB copies (what the loader does per expert) | 21.7 |
+| memcpy → `cudaHostAlloc` pinned → H2D | 10.6 |
+| `cudaHostRegister` on the mmap | *not supported* on this platform |
+| **cold `pread` → pageable → H2D** | **6.95** |
+
+So the bottleneck was never the copies — it was mmap page-fault I/O at ~1 GB/s. Switching to
+bulk `pread` (64 MB requests) into a reusable host buffer took io to 34.7 s. **Pinned staging
+was measured and rejected: it is 10× slower than copying straight from pageable memory on
+this integrated part.**
+
+### Peak RSS: 9.67 → 4.92 GB
+
+`std::vector::resize` growing organically per shard held old+new buffers simultaneously
+during realloc. Sizing the read buffer once to the largest shard fixed it.
+
+### The repack cache is currently WORTHLESS — disabled by default
+
+Implemented as the directive asks (`save_cache`/`load_cache`, a byte image of the arena),
+measured, and then turned off:
+
+| path | time |
+|---|---|
+| cold from safetensors | **44.6 s** |
+| from 71.9 GB cache file | **50.0 s** |
+| cost to build the cache | 209 s + 71.9 GB of disk |
+
+The cache is slower than the thing it caches, because our "repack" is presently a copy —
+there is no expensive transform to amortise. The code stays (it will earn its keep the moment
+a genuine mma-fragment-order repack lands, per `OPTIMIZATION_LOG` backlog), but the default
+is off and the 71.9 GB file is deleted. **Gate L1's "second start < 60 s" is met by the cold
+path itself.**
+
+### Note for the KV budget
+
+52.07 GB free after weights, before the 2.23 GB draft. That is *more* headroom than
+`RESCOPE.md` §4 assumed (36.87 GB), so the KV capacity figure there is conservative;
+it will be restated once the draft and activation buffers are real.

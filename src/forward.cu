@@ -129,7 +129,13 @@ struct Engine {
         A((void**)&kk,  (size_t)MAXTOK * kvd * 4);
         A((void**)&vv,  (size_t)MAXTOK * kvd * 4);
         A((void**)&att, (size_t)MAXTOK * maxq * 4);
-        A((void**)&attb,(size_t)MAXTOK * maxq * 2);
+        // attb is reused as the bf16 staging buffer for THREE different widths: the
+        // attention output (q_dim, up to 9216), the layer-0 dense MLP intermediate (12288)
+        // and the shared expert (1024). Sizing it by q_dim alone overflowed by M*3072
+        // elements on every forward -- 6 KB at M=1, which landed in cudaMalloc slack and so
+        // never showed up in the short greedy gate, and 393 KB at M=64, which corrupted
+        // prefill. Found by tests/gate_longctx.cu.
+        A((void**)&attb,(size_t)MAXTOK * std::max(maxq, c.intermediate) * 2);
         A((void**)&gp,  (size_t)MAXTOK * maxheads * 4);
         A((void**)&mlp_a, (size_t)MAXTOK * c.intermediate * 4);
         A((void**)&mlp_b, (size_t)MAXTOK * c.intermediate * 4);

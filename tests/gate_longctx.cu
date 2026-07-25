@@ -17,13 +17,18 @@ using namespace laguna;
 
 int main(int argc, char** argv) {
     std::string md = "models/Laguna-S-2.1-NVFP4";
-    int P   = getenv("P")   ? atoi(getenv("P"))   : 700;    // > 512
+    std::vector<int> PS;
+    { const char* e = getenv("P"); std::string t = e ? e : "300,500,700";
+      size_t p = 0; while (p < t.size()) { size_t q = t.find(',', p);
+        PS.push_back(atoi(t.substr(p, q == std::string::npos ? q : q - p).c_str()));
+        if (q == std::string::npos) break; p = q + 1; } }
+    int P = PS[0];
     int CTX = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
     Config c = load_config(md + "/config.json");
     bool FP8A = getenv("LG_FP8ATTN") != nullptr;
     Loader ld(md, c, FP8A); Weights W = ld.load("", false);
     Engine E; E.c = c; E.W = W; E.init(64);
-    printf("[longctx] P=%d  window=%d  MAXTOK=%d\n", P, c.sliding_window, E.MAXTOK);
+    printf("[longctx] window=%d  MAXTOK=%d\n", c.sliding_window, E.MAXTOK);
 
     // deterministic pseudo-random token stream
     std::vector<int> ids(P);
@@ -56,6 +61,11 @@ int main(int argc, char** argv) {
         return lg;
     };
 
+  bool allok = true;
+  for (int Pi : PS) {
+    P = Pi;
+    printf("\n--- P=%d (%s window %d) ---\n", P, P > c.sliding_window ? "ABOVE" : "below",
+           c.sliding_window);
     Session Sb; Sb.alloc(c, CTX, E.MAXTOK);
     printf("[longctx] batched prefill (M up to %d) ...\n", E.MAXTOK);
     auto lb = last_logits(Sb, true);
@@ -76,5 +86,8 @@ int main(int argc, char** argv) {
            mx, rel, ab, as);
     bool ok = (ab == as) && rel < 5e-4;
     printf("[longctx] %s\n", ok ? "PASS" : "FAIL - the batched path disagrees with decode");
-    return ok ? 0 : 1;
+    allok &= ok;
+  }
+    printf("\n%s\n", allok ? "ALL PASS" : "FAILURES PRESENT");
+    return allok ? 0 : 1;
 }

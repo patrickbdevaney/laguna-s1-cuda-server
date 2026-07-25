@@ -66,6 +66,7 @@ back-to-back A/B/A.
 | 13 | Sliding-ring `cap = window + MAXTOK` | — | — | **CORRECTNESS FIX** |
 | 14 | MoE gate/up on separate warps (320→640 warps) | 18.90 | 18.62/18.68 | **LOST −1.3 %, default off** |
 | 15 | **FP8 e4m3 attention weights, per-output-row scale** | 18.94 | **20.44** | **WON +8.1 %** |
+| 16 | Attention kernel: template `G`, Q in registers (stack 224 B → **0**) | 20.79 | 20.75 / 21.16 | NEUTRAL at short ctx, **kept** — see below |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
@@ -270,7 +271,35 @@ Quality: greedy-exact on the 8-token gate, which is a *weak* signal. The researc
 Llama-3.1-8B moves ppl 7.32 → 7.33 — so confidence is high, but the flag stays opt-in and the
 BF16 path remains the bit-exact gate oracle.
 
-### Where the time actually goes (per-category profile, `LG_PROF=1`)
+### #16 — attention accumulator was in local memory (kept; the win is at long context)
+
+`k_attn_split` declared `acc[9][4] + mx[9] + ls[9]` with **runtime** `G`, so the compiler
+could not unroll the g-loops, the indices were dynamic, and ptxas placed the accumulator in
+**local memory** — a measured **224-byte stack frame**, executing ~72 local loads and ~72
+local stores per key position. This is the third instance of the same failure mode in this
+project (after the `e2m1f` LUT and the MoE token loop).
+
+Templating `G` on its only two values (6 global, 9 sliding) and moving Q from shared memory to
+registers gives **0 bytes of stack frame** on both instantiations, and drops G=6 shared memory
+from 23 328 to 12 480 B. Bit-identical: 13/13 kernel gates, attention at 1.5e-07, greedy 8/8.
+
+**Measured NEUTRAL at the benchmark's context** (20.75 / 21.16 against a 20.79 control) — and
+that is the expected result, not a disappointment: at 83 live tokens the attention core is a
+small share of the step. Kept because it is free, bit-exact, and removes a structural defect
+whose cost grows linearly with context. **Its value has to be demonstrated on the context
+curve, not here** — which is exactly the measurement hygiene point below.
+
+### ⚠ MEASUREMENT SCOPE — every number in this log was taken at ~83 tokens of context
+
+`bench_decode` defaults `PRE=0`; `CTX` sizes KV *capacity*, not live context. So the profile
+that ranked every lever in this file was taken at a live position of a few dozen tokens, where
+the 12 global layers read ~130 KB instead of the 100 MB they read at ctx 4096. Attention's
+share of the step is ~12 % here and materially larger at real context.
+
+This does not invalidate the wins — the MoE repack, the CUDA graph, the fused norm and FP8
+attention are all context-independent — but it does mean **the ranking is only valid for short
+context**, and levers whose payoff scales with context (#16, the split heuristic, sub-FP8 KV)
+are systematically under-valued by it. `tests/bench_ctx.cu` measures the curve properly.
 
 | category | share of step |
 |---|---:|

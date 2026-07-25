@@ -17,6 +17,8 @@
 // budget work: 36 of 48 layers cost a constant 1.05 MB per sequence no matter how long the
 // conversation runs (ROOFLINE.md §6 — a 4.0x KV win over a uniformly-global model).
 #include "laguna_kernels.cuh"
+#include <cstdio>
+#include <cstdlib>
 
 using namespace lgk;
 
@@ -119,6 +121,7 @@ void k_attn(float* __restrict__ out, const float* __restrict__ Q,
     }
 
     // combine the NW partial softmaxes
+    #pragma unroll
     for (int g = 0; g < G; ++g) {
         if (lane == 0) { red_ml[warp][g][0] = mx[g]; red_ml[warp][g][1] = ls[g]; }
         #pragma unroll
@@ -127,6 +130,7 @@ void k_attn(float* __restrict__ out, const float* __restrict__ Q,
     __syncthreads();
 
     if (warp == 0) {
+        #pragma unroll
         for (int g = 0; g < G; ++g) {
             float M0 = -1e30f;
             #pragma unroll
@@ -153,11 +157,22 @@ void k_attn(float* __restrict__ out, const float* __restrict__ Q,
 // occupancy. This is the standard flash-decoding split; it is a pure scheduling change, so
 // the numerics are unchanged apart from a different (still deterministic) combine order.
 // ---------------------------------------------------------------------------------------
+// G is a TEMPLATE parameter, not a runtime one. With a runtime G the compiler cannot unroll
+// the g-loops, so `acc[G][4] + mx[G] + ls[G]` is dynamically indexed and ptxas puts the whole
+// accumulator in LOCAL memory -- measured 224 bytes of stack frame, and the kernel ran at
+// 9-26 GB/s against 141-172 achievable for the identical access pattern. Same failure mode as
+// the e2m1f LUT (WON #1) and the MoE token loop (WON #6). Verify with -Xptxas -v that the
+// stack frame is 0 bytes; if it is not, an index is still dynamic somewhere.
+//
+// Q also moves from shared memory to registers: each lane owns 4 consecutive head-dim slots,
+// so one float4 load per head replaces the staging loop, its __syncthreads, and 4608 B of
+// shared memory.
+template <int G>
 __global__ __launch_bounds__(NW * 32)
 void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
                   const float* __restrict__ Q,
                   const uint8_t* __restrict__ Kc, const uint8_t* __restrict__ Vc,
-                  float ks, float vs, int nkv, int G, int cap, int window,
+                  float ks, float vs, int nkv, int cap, int window,
                   float qscale, int NSP, const int* __restrict__ dbase) {
     const int m  = blockIdx.x;
     const int kh = blockIdx.y;
@@ -166,15 +181,15 @@ void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
     const int warp = threadIdx.x >> 5;
     const int d0 = lane * 4;
 
-    __shared__ float qs[MAXG][HD];
-    __shared__ float red_acc[NW][MAXG][HD];
-    __shared__ float red_ml[NW][MAXG][2];
+    __shared__ float red_acc[NW][G][HD];
+    __shared__ float red_ml[NW][G][2];
 
-    for (int i = threadIdx.x; i < G * HD; i += NW * 32) {
-        int g = i / HD, d = i % HD;
-        qs[g][d] = Q[((long)m * (nkv * G) + kh * G + g) * HD + d];
+    float qr[G][4];
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float4 t = *(const float4*)(Q + ((long)m * (nkv * G) + kh * G + g) * HD + d0);
+        qr[g][0] = t.x; qr[g][1] = t.y; qr[g][2] = t.z; qr[g][3] = t.w;
     }
-    __syncthreads();
 
     const int p = *dbase + m;
     const int lo = (window > 0) ? max(0, p - window + 1) : 0;
@@ -183,9 +198,9 @@ void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
     const int jlo = lo + sp * chunk;
     const int jhi = min(p, jlo + chunk - 1);
 
-    float mx[MAXG], ls[MAXG], acc[MAXG][4];
+    float mx[G], ls[G], acc[G][4];
     #pragma unroll
-    for (int g = 0; g < MAXG; ++g) {
+    for (int g = 0; g < G; ++g) {
         mx[g] = -1e30f; ls[g] = 0.f;
         #pragma unroll
         for (int i = 0; i < 4; ++i) acc[g][i] = 0.f;
@@ -200,10 +215,11 @@ void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
         float kv[4], vv[4];
         #pragma unroll
         for (int i = 0; i < 4; ++i) { kv[i] = e4m3f(kb[i]) * ks; vv[i] = e4m3f(vb[i]) * vs; }
+        #pragma unroll
         for (int g = 0; g < G; ++g) {
             float part = 0.f;
             #pragma unroll
-            for (int i = 0; i < 4; ++i) part = fmaf(qs[g][d0 + i], kv[i], part);
+            for (int i = 0; i < 4; ++i) part = fmaf(qr[g][i], kv[i], part);
             float s = warp_sum(part) * qscale;
             float mnew = fmaxf(mx[g], s);
             float corr = __expf(mx[g] - mnew);
@@ -214,6 +230,7 @@ void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
             mx[g] = mnew;
         }
     }
+    #pragma unroll
     for (int g = 0; g < G; ++g) {
         if (lane == 0) { red_ml[warp][g][0] = mx[g]; red_ml[warp][g][1] = ls[g]; }
         #pragma unroll
@@ -222,6 +239,7 @@ void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
     __syncthreads();
 
     if (warp == 0) {
+        #pragma unroll
         for (int g = 0; g < G; ++g) {
             float M0 = -1e30f;
             #pragma unroll
@@ -289,7 +307,14 @@ extern "C" void attend_split(float* out, float* pacc, float* pml, const float* Q
         return;
     }
     dim3 g(M, nkv, NSP);
-    k_attn_split<<<g, NW * 32, 0, st>>>(pacc, pml, Q, Kc, Vc, k_scale, v_scale, nkv, G, cap,
-                                        window, qscale, NSP, dbase);
+    // Only two GQA groups exist in this model: 6 (global, 48 heads) and 9 (sliding, 72).
+    if (G == 6)
+        k_attn_split<6><<<g, NW * 32, 0, st>>>(pacc, pml, Q, Kc, Vc, k_scale, v_scale, nkv, cap,
+                                               window, qscale, NSP, dbase);
+    else if (G == 9)
+        k_attn_split<9><<<g, NW * 32, 0, st>>>(pacc, pml, Q, Kc, Vc, k_scale, v_scale, nkv, cap,
+                                               window, qscale, NSP, dbase);
+    else
+        { fprintf(stderr, "attend_split: unsupported GQA group %d\n", G); abort(); }
     k_attn_combine<<<M * nkv * G, HD, 0, st>>>(out, pacc, pml, M * nkv * G, NSP);
 }

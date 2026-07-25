@@ -15,13 +15,12 @@ corrections to its factual premises: `RESCOPE.md`.
 | **R1** roofline | ✅ `B_tok` = 10.04 GB/token, AR wall 22.6 tok/s |
 | **A1** oracle + arch delta | ✅ bit-exact vs shipped `modeling_laguna.py`; golden tensors from real weights |
 | **L1** loader | ✅ 71.899 GB in one arena, 44.6 s cold, 4.92 GB peak RSS |
-| **B1** kernels G1–G8 | ✅ 13/13 kernel gates; full forward **greedy-exact** vs oracle |
-| **B1** G9 CUDA graph | ⏳ |
+| **B1** kernels G1–G9 | ✅ 13/13 kernel gates; full forward **greedy-exact**; CUDA graph capture |
 | **D1** DFlash + k-sweep | ⏳ |
 | **S1** server layer | ⏳ |
 
-**Current decode: 9.23 tok/s median** (ctx 4096, greedy, no speculation) = 92.7 GB/s effective
-= 41 % of the measured 227 GB/s ceiling. Prefill 15.4 tok/s.
+**Current decode: 18.74 tok/s median** (ctx 4096, greedy, no speculation) = 188.2 GB/s effective
+= **83 % of the measured 227 GB/s ceiling**. Prefill 55 tok/s.
 Reference point: poolside measured **13–14 tok/s** for this model on a DGX Spark (same
 bandwidth class) under vLLM, and **22–24 tok/s** with DFlash.
 

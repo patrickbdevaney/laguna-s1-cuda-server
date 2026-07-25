@@ -30,23 +30,23 @@ using namespace lgk;
 __global__ void k_store_kv(uint8_t* __restrict__ Kc, uint8_t* __restrict__ Vc,
                            const float* __restrict__ K, const float* __restrict__ V,
                            float inv_ks, float inv_vs,
-                           int M, int nkv, int hd, int cap, int base) {
+                           int M, int nkv, int hd, int cap, const int* __restrict__ dbase) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= M * nkv * hd) return;
     int d = t % hd;
     int kh = (t / hd) % nkv;
     int m = t / (hd * nkv);
-    int slot = (base + m) % cap;                       // == base+m when cap >= ctx
+    int slot = (*dbase + m) % cap;                     // == base+m when cap >= ctx
     long dst = ((long)kh * cap + slot) * hd + d;
     Kc[dst] = f2e4m3(K[t] * inv_ks);
     Vc[dst] = f2e4m3(V[t] * inv_vs);
 }
 extern "C" void store_kv(uint8_t* Kc, uint8_t* Vc, const float* K, const float* V,
                          float k_scale, float v_scale, int M, int nkv, int hd, int cap,
-                         int base, cudaStream_t st) {
+                         const int* dbase, cudaStream_t st) {
     int T = 256, n = M * nkv * hd;
     k_store_kv<<<(n + T - 1) / T, T, 0, st>>>(Kc, Vc, K, V, 1.f / k_scale, 1.f / v_scale,
-                                              M, nkv, hd, cap, base);
+                                              M, nkv, hd, cap, dbase);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -57,7 +57,7 @@ extern "C" void store_kv(uint8_t* Kc, uint8_t* Vc, const float* K, const float* 
 __global__ __launch_bounds__(NW * 32)
 void k_attn(float* __restrict__ out, const float* __restrict__ Q,
             const uint8_t* __restrict__ Kc, const uint8_t* __restrict__ Vc,
-            float ks, float vs, int nkv, int G, int cap, int window, int base, float qscale) {
+            float ks, float vs, int nkv, int G, int cap, int window, const int* __restrict__ dbase, float qscale) {
     const int m  = blockIdx.x;
     const int kh = blockIdx.y;
     const int lane = threadIdx.x & 31;
@@ -79,7 +79,7 @@ void k_attn(float* __restrict__ out, const float* __restrict__ Q,
     }
     __syncthreads();
 
-    const int p = base + m;                        // absolute position of this query
+    const int p = *dbase + m;                      // absolute position of this query
     const int jlo = (window > 0) ? max(0, p - window + 1) : 0;
     const int jhi = p;
 
@@ -157,8 +157,8 @@ __global__ __launch_bounds__(NW * 32)
 void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
                   const float* __restrict__ Q,
                   const uint8_t* __restrict__ Kc, const uint8_t* __restrict__ Vc,
-                  float ks, float vs, int nkv, int G, int cap, int window, int base,
-                  float qscale, int NSP) {
+                  float ks, float vs, int nkv, int G, int cap, int window,
+                  float qscale, int NSP, const int* __restrict__ dbase) {
     const int m  = blockIdx.x;
     const int kh = blockIdx.y;
     const int sp = blockIdx.z;
@@ -176,7 +176,7 @@ void k_attn_split(float* __restrict__ pacc, float* __restrict__ pml,
     }
     __syncthreads();
 
-    const int p = base + m;
+    const int p = *dbase + m;
     const int lo = (window > 0) ? max(0, p - window + 1) : 0;
     const int len = p - lo + 1;
     const int chunk = (len + NSP - 1) / NSP;
@@ -264,10 +264,10 @@ __global__ void k_attn_combine(float* __restrict__ out, const float* __restrict_
 
 extern "C" void attend(float* out, const float* Q, const uint8_t* Kc, const uint8_t* Vc,
                        float k_scale, float v_scale, int M, int nkv, int G, int cap,
-                       int window, int base, float qscale, cudaStream_t st) {
+                       int window, const int* dbase, float qscale, cudaStream_t st) {
     dim3 g(M, nkv);
     k_attn<<<g, NW * 32, 0, st>>>(out, Q, Kc, Vc, k_scale, v_scale, nkv, G, cap, window,
-                                  base, qscale);
+                                  dbase, qscale);
 }
 
 // Choose the split so the grid lands at ~4 blocks/SM (20 SMs), capped by the key range.
@@ -282,14 +282,14 @@ extern "C" int attend_nsplit(int M, int nkv, int len) {
 
 extern "C" void attend_split(float* out, float* pacc, float* pml, const float* Q,
                              const uint8_t* Kc, const uint8_t* Vc, float k_scale, float v_scale,
-                             int M, int nkv, int G, int cap, int window, int base,
+                             int M, int nkv, int G, int cap, int window, const int* dbase,
                              float qscale, int NSP, cudaStream_t st) {
     if (NSP <= 1) {
-        attend(out, Q, Kc, Vc, k_scale, v_scale, M, nkv, G, cap, window, base, qscale, st);
+        attend(out, Q, Kc, Vc, k_scale, v_scale, M, nkv, G, cap, window, dbase, qscale, st);
         return;
     }
     dim3 g(M, nkv, NSP);
     k_attn_split<<<g, NW * 32, 0, st>>>(pacc, pml, Q, Kc, Vc, k_scale, v_scale, nkv, G, cap,
-                                        window, base, qscale, NSP);
+                                        window, qscale, NSP, dbase);
     k_attn_combine<<<M * nkv * G, HD, 0, st>>>(out, pacc, pml, M * nkv * G, NSP);
 }

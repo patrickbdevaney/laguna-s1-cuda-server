@@ -17,11 +17,11 @@ void dequant_nvfp4(float*,const uint8_t*,const uint8_t*,float,int,int,int,cudaSt
 void gemm_bf16(float*,const uint16_t*,const uint16_t*,int,int,int,cudaStream_t);
 void gemm_fp4(float*,const uint8_t*,const uint8_t*,float,const uint16_t*,int,int,int,int,cudaStream_t);
 void rmsnorm(float*,const float*,const uint16_t*,int,int,float,cudaStream_t);
-void rope_tables(float*,float*,const float*,int,int,int,float,cudaStream_t);
+void rope_tables(float*,float*,const float*,int,const int*,int,float,cudaStream_t);
 void router(int*,float*,float*,const float*,const float*,int,int,int,float,int,cudaStream_t);
 void f32_to_bf16(uint16_t*,const float*,long,cudaStream_t);
-void store_kv(uint8_t*,uint8_t*,const float*,const float*,float,float,int,int,int,int,int,cudaStream_t);
-void attend(float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,int,float,cudaStream_t);
+void store_kv(uint8_t*,uint8_t*,const float*,const float*,float,float,int,int,int,int,const int*,cudaStream_t);
+void attend(float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,const int*,float,cudaStream_t);
 void moe_invert(int*,int*,int*,int*,int*,int*,const int*,int,int,int,cudaStream_t);
 void moe_gateup_rp(float*,const uint8_t*,const uint8_t*,const float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,int,cudaStream_t);
 void moe_down_rp(float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,cudaStream_t);
@@ -118,7 +118,7 @@ int main(){
         std::vector<float> inv; for(auto&v:RJ[key]["inv"]) inv.push_back(v.get<float>());
         float scale=RJ[key]["scale"].get<float>();
         auto*dinv=todev(inv); float *dc,*ds; CK(cudaMalloc(&dc,wc.size()*4)); CK(cudaMalloc(&ds,ws.size()*4));
-        rope_tables(dc,ds,dinv,S,0,rot/2,scale,0); CK(cudaDeviceSynchronize());
+        {int*db3;CK(cudaMalloc(&db3,4));CK(cudaMemset(db3,0,4));rope_tables(dc,ds,dinv,S,db3,rot/2,scale,0);} CK(cudaDeviceSynchronize());
         std::vector<float> gc(wc.size()),gs(ws.size());
         CK(cudaMemcpy(gc.data(),dc,gc.size()*4,cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(gs.data(),ds,gs.size()*4,cudaMemcpyDeviceToHost));
@@ -158,9 +158,9 @@ int main(){
         auto*dq=todev(q); auto*dk=todev(k); auto*dv=todev(v);
         uint8_t *dKc,*dVc; CK(cudaMalloc(&dKc,(size_t)nkv*cap*hd)); CK(cudaMalloc(&dVc,(size_t)nkv*cap*hd));
         CK(cudaMemset(dKc,0,(size_t)nkv*cap*hd)); CK(cudaMemset(dVc,0,(size_t)nkv*cap*hd));
-        store_kv(dKc,dVc,dk,dv,ks,vs,Sm,nkv,hd,cap,0,0); CK(cudaGetLastError());
+        {int*db2;CK(cudaMalloc(&db2,4));CK(cudaMemset(db2,0,4));store_kv(dKc,dVc,dk,dv,ks,vs,Sm,nkv,hd,cap,db2,0);} CK(cudaGetLastError());
         float* dout; CK(cudaMalloc(&dout,q.size()*4));
-        attend(dout,dq,dKc,dVc,ks,vs,Sm,nkv,G,cap,win,0,1.0f/sqrtf((float)hd),0);
+        {int*db;CK(cudaMalloc(&db,4));CK(cudaMemset(db,0,4));attend(dout,dq,dKc,dVc,ks,vs,Sm,nkv,G,cap,win,db,1.0f/sqrtf((float)hd),0);}
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         std::vector<float> got(q.size()); CK(cudaMemcpy(got.data(),dout,got.size()*4,cudaMemcpyDeviceToHost));
         cmp((std::string("attention ")+tag+" (G="+std::to_string(G)+")").c_str(),got,want,5e-6);

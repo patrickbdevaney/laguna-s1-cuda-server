@@ -26,21 +26,27 @@ int main(int argc,char**argv){
     if(PRE>0){ std::vector<int> pad(64, ids[3]);
         for(int i=0;i<PRE;i+=64){ int n=std::min(64,PRE-i);
             CUDA_CHECK(cudaMemcpy(d,pad.data(),n*4,cudaMemcpyHostToDevice));
-            E.forward(S,d,n,pos); pos+=n; } CUDA_CHECK(cudaDeviceSynchronize()); }
+            set_base(E.dbase,pos,0); E.forward(S,d,n,pos); pos+=n; } CUDA_CHECK(cudaDeviceSynchronize()); }
 
     CUDA_CHECK(cudaMemcpy(d,ids.data(),ids.size()*4,cudaMemcpyHostToDevice));
+    set_base(E.dbase,pos,0);
     double t0=wall_now(); E.forward(S,d,(int)ids.size(),pos); CUDA_CHECK(cudaDeviceSynchronize());
     double tpre=wall_now()-t0; pos+=ids.size();
 
     std::vector<float> lg(c.vocab);
     auto amax=[&](int M_){ CUDA_CHECK(cudaMemcpy(lg.data(),E.logits+(size_t)(M_-1)*c.vocab,c.vocab*4,cudaMemcpyDeviceToHost));
         int b=0; float bv=lg[0]; for(int i=1;i<c.vocab;++i) if(lg[i]>bv){bv=lg[i];b=i;} return b; };
+    bool USEG = getenv("LG_NOGRAPH")==nullptr;
+    if(USEG) E.capture(S,d,pos);
     int nxt=amax((int)ids.size());
     std::vector<int> got{nxt};
     std::vector<double> ts;
     for(int i=1;i<N;++i){
         CUDA_CHECK(cudaMemcpy(d,&nxt,4,cudaMemcpyHostToDevice));
-        double a=wall_now(); E.forward(S,d,1,pos); CUDA_CHECK(cudaDeviceSynchronize());
+        double a=wall_now();
+        if(USEG){ if(E.needs_recapture(pos)) E.capture(S,d,pos); E.step_graph(pos); }
+        else { set_base(E.dbase,pos,0); E.forward(S,d,1,pos); }
+        CUDA_CHECK(cudaDeviceSynchronize());
         ts.push_back(wall_now()-a);
         pos++; nxt=amax(1); got.push_back(nxt);
     }

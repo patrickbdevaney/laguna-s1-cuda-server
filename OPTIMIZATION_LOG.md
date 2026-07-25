@@ -60,6 +60,8 @@ back-to-back A/B/A.
 | 7 | **Offline expert repack + thread-per-output MoE** | 9.71 | **16.57** | **WON +70.6 %** |
 | 8 | Same repack applied to the BF16 attention/dense GEMMs | 16.57 | 11.14 | **LOST −33 %, reverted** |
 | 9 | GEMM M-loop specialised at M=1 (registers 59→32) | 16.57 | 16.59 | NEUTRAL (kept: register headroom) |
+| 10 | **G9 — whole-step CUDA graph** (device-side position counter) | 16.59 | **17.88** | **WON +7.8 %** |
+| 11 | Doubling re-capture bound for the attention split count | 17.88 | **18.74** | **WON +4.8 %** |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
@@ -160,6 +162,28 @@ cut registers 59 → 32. Measured 16.57 → 16.59, i.e. nothing. The GEMM is evi
 register-limited. Kept only because the register headroom is free and may matter once CUDA
 graphs and the verify shapes raise pressure; **logged as neutral so it is not mistaken for a
 win.**
+
+### #10/#11 — CUDA graphs, and the position counter that makes them possible (WON, +12.9 % combined)
+
+~1665 launches per decode step at 4.15 µs measured is 11.5 % of a 60 ms step — but the
+measurement showed the real cost is worse than that: without a graph the step time is wildly
+variable (median 12.6 tok/s, **best 17.5**), because 1665 host-side launches per token expose
+every CPU scheduling hiccup. The graph removes the variance as well as the overhead.
+
+To capture at all, nothing in the step may depend on a host-side position. Every
+position-dependent kernel (`rope_tables`, `store_kv`, `attend`, `attend_split`) now reads the
+decode position from **device memory** via a pointer.
+
+Note the pointer, not an `extern __device__` global: `__device__` globals are **per-module**
+without `-rdc=true`, so `attention.cu` and `elementwise.cu` would each have silently gotten
+their own copy. nvcc warns (`#20044-D: extern declaration ... treated as a static definition`)
+and the warning is easy to miss.
+
+**#11:** the attention split count becomes `grid.z`, so it is baked in at capture. Sizing it
+from full KV *capacity* made it correct but wasteful (10 splits per global layer from token
+one). Sizing it from a **doubling context bound**, and re-capturing when the conversation
+outgrows it, recovered another 4.8 %. Capture costs one step, and doubling makes re-captures
+logarithmically rare.
 
 ### Where the time actually goes (per-category profile, `LG_PROF=1`)
 

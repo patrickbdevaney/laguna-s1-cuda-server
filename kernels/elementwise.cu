@@ -6,6 +6,16 @@
 
 using namespace lgk;
 
+// Decode position, held in DEVICE MEMORY so a captured CUDA graph can replay across steps
+// without re-capture. Passed as a pointer rather than an `extern __device__` global because
+// __device__ globals are per-module without -rdc=true, so each translation unit would get its
+// own silent copy. The pointer is stable, so baking it into a graph is safe; only the
+// contents change per step.
+__global__ void k_set_base(int* p, int v) { *p = v; }
+__global__ void k_inc_base(int* p, int n) { *p += n; }
+extern "C" void set_base(int* p, int v, cudaStream_t st) { k_set_base<<<1,1,0,st>>>(p, v); }
+extern "C" void inc_base(int* p, int n, cudaStream_t st) { k_inc_base<<<1,1,0,st>>>(p, n); }
+
 // ---------------------------------------------------------------------------------------
 // G3a — LagunaRMSNorm (modeling_laguna.py:49-63):
 //   x32 = x.float(); x32 *= rsqrt(mean(x32^2) + eps); out = w.float() * x32.to(dt).float()
@@ -51,21 +61,21 @@ extern "C" void rmsnorm_heads(float* out, const float* x, const uint16_t* w,
 //   freqs = pos * inv_freq ; emb = cat(freqs,freqs) ; cos = cos(emb)*attn_scale
 // ---------------------------------------------------------------------------------------
 __global__ void k_rope_tables(float* __restrict__ cosT, float* __restrict__ sinT,
-                              const float* __restrict__ inv, int npos, int base,
+                              const float* __restrict__ inv, int npos, const int* __restrict__ dbase,
                               int half, float scale) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= npos * half) return;
     int p = t / half, i = t % half;
-    float a = (float)(base + p) * inv[i];
+    float a = (float)(*dbase + p) * inv[i];
     float c = __cosf(a) * scale, s = __sinf(a) * scale;
     int rot = half * 2;
     cosT[(long)p * rot + i] = c;  cosT[(long)p * rot + i + half] = c;
     sinT[(long)p * rot + i] = s;  sinT[(long)p * rot + i + half] = s;
 }
 extern "C" void rope_tables(float* cosT, float* sinT, const float* inv,
-                            int npos, int base, int half, float scale, cudaStream_t st) {
+                            int npos, const int* dbase, int half, float scale, cudaStream_t st) {
     int T = 256, n = npos * half;
-    k_rope_tables<<<(n + T - 1) / T, T, 0, st>>>(cosT, sinT, inv, npos, base, half, scale);
+    k_rope_tables<<<(n + T - 1) / T, T, 0, st>>>(cosT, sinT, inv, npos, dbase, half, scale);
 }
 
 // Partial rotary (modeling_laguna.py:271-306): only the first `rot` dims of each head

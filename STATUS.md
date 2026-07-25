@@ -11,14 +11,14 @@ Reference, **read-only**: `~/gemma-cuda-hybrid`.
 | **R1 — roofline** | ✅ **PASS** | `ROOFLINE.md`, generator `tools/roofline.py`, raw `docs/roofline_ctx*.txt` |
 | **A1 — oracle + arch delta** | ✅ **PASS** | `MODEL_INVENTORY.md`, `ARCH_DELTA.md`, `oracle/`, golden tensors in `docs/golden/` → `LOOP_LOG.md` |
 | L1 — loader | ⏳ next | |
-| B1 — kernels G1–G9 | 🟡 **G1–G8 PASS** | `gate_kernels` 13/13; `gate_forward` 8/8 greedy exact; **16.59 tok/s decode / 166.7 GB/s / 73 % of ceiling**; G9 CUDA graph pending |
+| **B1 — kernels G1–G9** | ✅ **PASS** | `gate_kernels` 13/13; `gate_forward` 8/8 greedy exact; **18.74 tok/s decode / 188.2 GB/s / 83 % of ceiling**; G9 CUDA graph DONE |
 | D1 — DFlash + k-sweep | ▫ | |
 | S1 — server | ▫ | |
 
 ## Current state
 
-Working pure-CUDA Laguna forward pass: **greedy-exact vs the oracle**, **16.59 tok/s median**
-decode at ctx 4096 (166.7 GB/s effective, **73 % of the 227 GB/s ceiling**), prefill 55.0 tok/s.
+Working pure-CUDA Laguna forward pass: **greedy-exact vs the oracle**, **18.74 tok/s median**
+decode at ctx 4096 (188.2 GB/s effective, **83 % of the 227 GB/s ceiling**), prefill 55.0 tok/s.
 For reference, poolside measured **13–14 tok/s** for this model on a DGX Spark (same bandwidth
 class) under vLLM — so the autoregressive path is already ahead of that, before speculation.
 Everything from the checkpoint on disk through to logits is C++/CUDA; Python exists only in
@@ -34,7 +34,8 @@ weight-resident MoE, and the full 48-layer forward.
 1. **Gate D1 — DFlash.** Now the biggest remaining multiplier (1.6–1.9×) and a deliverable in
    its own right. The kernel arc has spent its easy structural wins: MoE and the BF16
    attention GEMMs are now ~37 % each, so no single kernel dominates.
-2. **G9 — whole-step CUDA graph.** ~1665 launches/step at 4.15 µs each.
+2. **Deep-research findings** — five axes commissioned (`RESEARCH_PROMPT.md`); implement the
+   surviving EV-ranked levers.
 3. **Gate D1 — DFlash.** Mechanism now fully specified from the `speculators` reference —
    see `ARCH_DELTA.md` §8. It is **cross-attention over the target's fused aux hidden states**,
    not a small autoregressive LM. **`k` is hard-bounded to [1,15]** by `block_size` 16, and

@@ -26,17 +26,19 @@ void gemm_fp4(float*, const uint8_t*, const uint8_t*, float, const uint16_t*, in
 void f32_to_bf16(uint16_t*, const float*, long, cudaStream_t);
 void rmsnorm(float*, const float*, const uint16_t*, int, int, float, cudaStream_t);
 void rmsnorm_heads(float*, const float*, const uint16_t*, int, int, int, float, cudaStream_t);
-void rope_tables(float*, float*, const float*, int, int, int, float, cudaStream_t);
+void rope_tables(float*, float*, const float*, int, const int*, int, float, cudaStream_t);
 void rope_apply(float*, const float*, const float*, int, int, int, int, cudaStream_t);
 void router(int*, float*, float*, const float*, const float*, int, int, int, float, int, cudaStream_t);
 void gate_softplus(float*, const float*, int, int, int, cudaStream_t);
 void swiglu(float*, const float*, const float*, long, cudaStream_t);
 void add_inplace(float*, const float*, long, cudaStream_t);
 void embed_rows(float*, const uint16_t*, const int*, int, int, cudaStream_t);
-void store_kv(uint8_t*, uint8_t*, const float*, const float*, float, float, int, int, int, int, int, cudaStream_t);
-void attend(float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, int, float, cudaStream_t);
+void store_kv(uint8_t*, uint8_t*, const float*, const float*, float, float, int, int, int, int, const int*, cudaStream_t);
+void attend(float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, const int*, float, cudaStream_t);
 int  attend_nsplit(int, int, int);
-void attend_split(float*, float*, float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, int, float, int, cudaStream_t);
+void attend_split(float*, float*, float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, const int*, float, int, cudaStream_t);
+void set_base(int*, int, cudaStream_t);
+void inc_base(int*, int, cudaStream_t);
 void moe_invert(int*, int*, int*, int*, int*, int*, const int*, int, int, int, cudaStream_t);
 void moe_gateup_rp(float*, const uint8_t*, const uint8_t*, const float*, const uint8_t*, const uint8_t*,
                 const float*, const uint16_t*, const int*, const int*, const int*, const int*,
@@ -83,7 +85,17 @@ struct Engine {
     int *sel, *ecount, *eoff, *elist, *cursor, *active, *nactive;
     float *cos_f, *sin_f, *cos_s, *sin_s, *inv_f, *inv_s;
     float *pacc, *pml;                 // split-attention partials
+    int   *dbase = nullptr;            // decode position, device-side (graph-safe)
     static const int MAXSPLIT = 32;
+
+    // --- CUDA graph for the M=1 decode step
+    cudaGraphExec_t g_exec = nullptr;
+    bool graph_ready = false;
+    // Upper bound on context used to size the attention split count. It becomes grid.z, so it
+    // is baked into a captured graph — hence a *bound*, not the live position. Sizing it from
+    // full KV capacity would launch 10 splits per global layer from token one; instead we
+    // capture against a doubling bound and re-capture when the conversation outgrows it.
+    int  split_ctx = 0;
 
     void init(int maxtok) {
         MAXTOK = maxtok;
@@ -121,6 +133,8 @@ struct Engine {
         size_t nh_max = (size_t)MAXTOK * c.n_kv_heads * gmax * MAXSPLIT;
         A((void**)&pacc, nh_max * c.head_dim * 4);
         A((void**)&pml,  nh_max * 2 * 4);
+        A((void**)&dbase, 4);
+        CUDA_CHECK(cudaMemset(dbase, 0, 4));
 
         // rope: one table per layer TYPE (not per layer) — Laguna has exactly two
         auto ivf = c.rope_full.inv_freq(c.head_dim);
@@ -164,9 +178,9 @@ struct Engine {
 
         mark();
         embed_rows(h, W.embed, d_ids, M, H, st);
-        rope_tables(cos_f, sin_f, inv_f, M, base, c.rope_full.rotary_dim / 2,
+        rope_tables(cos_f, sin_f, inv_f, M, dbase, c.rope_full.rotary_dim / 2,
                     (float)c.rope_full.attention_factor, st);
-        rope_tables(cos_s, sin_s, inv_s, M, base, c.rope_slide.rotary_dim / 2,
+        rope_tables(cos_s, sin_s, inv_s, M, dbase, c.rope_slide.rotary_dim / 2,
                     (float)c.rope_slide.attention_factor, st);
         acc(0);
 
@@ -194,12 +208,17 @@ struct Engine {
             rope_apply(q,  cosT, sinT, M, nh,           hd, rot, st);
             rope_apply(kk, cosT, sinT, M, c.n_kv_heads, hd, rot, st);
             store_kv(S.Kc[L], S.Vc[L], kk, vv, w.k_scale, w.v_scale, M, c.n_kv_heads, hd,
-                     S.cap[L], base, st);
-            int klen = slide ? std::min(base + M, c.sliding_window) : (base + M);
+                     S.cap[L], dbase, st);
+            // The split count must NOT depend on the current position: it becomes grid.z and
+            // would be baked into a captured graph. Size it from the cache CAPACITY instead,
+            // so it is constant for the life of the session; blocks whose key range is empty
+            // exit immediately and contribute a -inf partial that the combine ignores.
+            int klen = slide ? c.sliding_window
+                             : std::min(split_ctx > 0 ? split_ctx : S.cap[L], S.cap[L]);
             int nsp = attend_nsplit(M, c.n_kv_heads, klen);
             if (nsp > MAXSPLIT) nsp = MAXSPLIT;
             attend_split(att, pacc, pml, q, S.Kc[L], S.Vc[L], w.k_scale, w.v_scale, M,
-                         c.n_kv_heads, G, S.cap[L], slide ? c.sliding_window : 0, base,
+                         c.n_kv_heads, G, S.cap[L], slide ? c.sliding_window : 0, dbase,
                          qscale, nsp, st);
             gate_softplus(att, gp, M, nh, hd, st);
             acc(3); mark();
@@ -258,6 +277,35 @@ struct Engine {
         f32_to_bf16(hb, hn, (long)M * H, st);
         gemm_bf16(logits, W.lm_head, hb, M, c.vocab, H, st);   // NOT tied to the embedding
         acc(7);
+    }
+
+    // ---- G9: capture the M=1 decode step once, replay it every token.
+    // Everything position-dependent reads `dbase` from device memory, so one graph is valid
+    // at every step. The only per-token host work is writing the new id into `d_tok` and
+    // setting `dbase`. The attention split count is sized from cache CAPACITY, not the
+    // current position, precisely so it does not get baked in wrong.
+    // Re-capture when the live position outgrows the bound the graph was built against.
+    bool needs_recapture(int pos) const { return !graph_ready || pos >= split_ctx; }
+
+    void capture(Session& S, int* d_tok, int pos = 0) {
+        if (prof) return;                     // profiling needs per-category syncs
+        split_ctx = 256; while (split_ctx <= pos) split_ctx <<= 1;   // doubling bound
+        cudaStream_t cap;
+        CUDA_CHECK(cudaStreamCreate(&cap));
+        CUDA_CHECK(cudaStreamBeginCapture(cap, cudaStreamCaptureModeThreadLocal));
+        forward(S, d_tok, 1, 0, cap);
+        cudaGraph_t g;
+        CUDA_CHECK(cudaStreamEndCapture(cap, &g));
+        if (g_exec) cudaGraphExecDestroy(g_exec);
+        CUDA_CHECK(cudaGraphInstantiate(&g_exec, g, nullptr, nullptr, 0));
+        cudaGraphDestroy(g);
+        CUDA_CHECK(cudaStreamDestroy(cap));
+        graph_ready = true;
+    }
+
+    void step_graph(int pos, cudaStream_t st = 0) {
+        set_base(dbase, pos, st);
+        CUDA_CHECK(cudaGraphLaunch(g_exec, st));
     }
 };
 

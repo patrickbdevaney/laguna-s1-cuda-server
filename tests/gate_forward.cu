@@ -30,6 +30,7 @@ int main(int argc,char**argv){
     CUDA_CHECK(cudaMemcpy(d_ids,ids.data(),ids.size()*4,cudaMemcpyHostToDevice));
 
     double t0=wall_now();
+    set_base(E.dbase,0,0);
     E.forward(S,d_ids,(int)ids.size(),0);
     CUDA_CHECK(cudaDeviceSynchronize());
     double tp=wall_now()-t0;
@@ -51,7 +52,7 @@ int main(int argc,char**argv){
     for(int i=1;i<GEN;++i){
         CUDA_CHECK(cudaMemcpy(d_ids,&nxt,4,cudaMemcpyHostToDevice));
         double a=wall_now();
-        E.forward(S,d_ids,1,pos);
+        if(E.graph_ready) E.step_graph(pos); else { set_base(E.dbase,pos,0); E.forward(S,d_ids,1,pos); }
         CUDA_CHECK(cudaDeviceSynchronize());
         td+=wall_now()-a;
         pos++; nxt=argmax_last(1); got.push_back(nxt);

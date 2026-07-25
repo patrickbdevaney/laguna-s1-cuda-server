@@ -185,3 +185,41 @@ def main():
           f"{44*GB/naive/1e6:.2f} M tokens; SWA split is a {naive/perTok:.1f}x KV win)")
 
 main()
+
+# ---- KV POLICY: context capacity vs decode speed -----------------------------
+def kv_policy():
+    print(f"\n{'='*78}\nKV SIZING POLICY - capacity is free, only USED context costs bandwidth\n{'='*78}")
+    aH = fit_alpha(15, 6.438); aT = fit_alpha(7, 3.0)
+    print(f"  Allocation cost: {kv_capacity_bytes_per_token()} B/token (12 global layers) "
+          f"+ {len(SLIDING)*SW*KV_PER_TOK_PER_LAYER/1e6:.1f} MB/seq constant ring.")
+    print(f"  Bandwidth cost : the SAME bytes, but read ONCE PER BLOCK under speculation,")
+    print(f"                   so the per-token KV tax divides by tau.\n")
+    hdr = (f"  {'used ctx':>9s}{'KV GB':>8s}{'alloc GB':>9s}{'KV% Btok':>9s}"
+           f"{'AR@135':>8s}{'AR@175':>8s}{'spec@135':>9s}{'spec@175':>9s}{'k*':>4s}{'vs 4K':>7s}")
+    print(hdr); print("  " + "-"*(len(hdr)-2))
+    base = None
+    for c in (4096, 16384, 32768, 65536, 131072, 196608, 262144, 524288, 1048576):
+        kv = kv_read(c); bt = FIXED + AR_EXPERTS + kv
+        best = {}
+        for bw in (135, 175):
+            cand = [(tau(k,aH)*bw*1e9/(verify_bytes(k,c)+DRAFT_STEP), k) for k in range(2,16)]
+            best[bw] = max(cand)
+        alloc = (len(GLOBAL)*c*KV_PER_TOK_PER_LAYER + len(SLIDING)*SW*KV_PER_TOK_PER_LAYER)
+        if base is None: base = best[175][0]
+        print(f"  {c:>9d}{kv/GB:8.2f}{alloc/GB:9.2f}{kv/bt*100:8.1f}%"
+              f"{135e9/bt:8.1f}{175e9/bt:8.1f}{best[135][0]:9.1f}{best[175][0]:9.1f}"
+              f"{best[175][1]:4d}{best[175][0]/base*100:6.0f}%")
+    print(f"\n  Knee analysis (AR, the strict case):")
+    for pct in (5, 10, 20, 33):
+        # kv/(FIXED+AR_EXPERTS+kv) = pct  =>  kv = pct/(1-pct) * (FIXED+AR_EXPERTS)
+        f = pct/100.0; kv = f/(1-f)*(FIXED+AR_EXPERTS)
+        c = (kv - len(SLIDING)*SW*KV_PER_TOK_PER_LAYER)/(len(GLOBAL)*KV_PER_TOK_PER_LAYER)
+        print(f"    KV = {pct:2d}% of B_tok  ->  used context = {c/1024:8.1f} K tokens")
+    print(f"\n  Memory budget (115 GB avail - 71.90 weights - 2.23 draft - 4.0 runtime = "
+          f"{115-71.90-2.23-4.0:.2f} GB for KV):")
+    budget = (115-71.90-2.23-4.0)*GB
+    print(f"    single-sequence max context = {budget/ (len(GLOBAL)*KV_PER_TOK_PER_LAYER)/1024/1024:.2f} M tokens")
+    for c in (262144, 524288, 1048576):
+        per = len(GLOBAL)*c*KV_PER_TOK_PER_LAYER + len(SLIDING)*SW*KV_PER_TOK_PER_LAYER
+        print(f"    concurrent sequences at {c//1024:>4d}K ctx = {int(budget//per)}  ({per/GB:.2f} GB each)")
+kv_policy()

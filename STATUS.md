@@ -9,8 +9,8 @@ Reference, **read-only**: `~/gemma-cuda-hybrid`.
 |---|---|---|
 | **H1 — capacity** | ✅ **PASS** | 122 GB unified / 115 GB available / 379 GB disk → `HARDWARE.md` |
 | **R1 — roofline** | ✅ **PASS** | `ROOFLINE.md`, generator `tools/roofline.py`, raw `docs/roofline_ctx*.txt` |
-| A1 — oracle + arch delta | ⏳ next | weights downloading; `MODEL_INVENTORY.md` / `ARCH_DELTA.md` not yet written |
-| L1 — loader | ▫ | |
+| **A1 — oracle + arch delta** | ✅ **PASS** | `MODEL_INVENTORY.md`, `ARCH_DELTA.md`, `oracle/`, golden tensors in `docs/golden/` → `LOOP_LOG.md` |
+| L1 — loader | ⏳ next | |
 | B1 — kernels G1–G9 | ▫ | |
 | D1 — DFlash + k-sweep | ▫ | |
 | S1 — server | ▫ | |

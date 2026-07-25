@@ -35,10 +35,11 @@ weight-resident MoE, and the full 48-layer forward.
    its own right. The kernel arc has spent its easy structural wins: MoE and the BF16
    attention GEMMs are now ~37 % each, so no single kernel dominates.
 2. **G9 — whole-step CUDA graph.** ~1665 launches/step at 4.15 µs each.
-3. **Gate D1 — DFlash.** Load the 6-layer draft in BF16 (never quantize it), share the
-   target's embed + `lm_head`, implement propose/verify with lossless sampling, then run the
-   k-sweep and re-measure `E_frac` on real draft blocks (the current measurement is from
-   prompt tokens — `ROOFLINE.md` §10 caveat).
+3. **Gate D1 — DFlash.** Mechanism now fully specified from the `speculators` reference —
+   see `ARCH_DELTA.md` §8. It is **cross-attention over the target's fused aux hidden states**,
+   not a small autoregressive LM. **`k` is hard-bounded to [1,15]** by `block_size` 16, and
+   Gate D1 passes only if τ lands near poolside's published 6.44 — τ near 1 would mean the
+   structure is wrong.
 4. **Gate S1 — server layer.** Tokenizer (ByteLevel BPE, 2-stage Unicode pre-tokenizer),
    poolside_v1 chat/tool/reasoning grammar with preserved thinking, prefix cache, SSE.
 5. **The §5 self-quantization lever** — the largest single win available (+39 % to +113 % on

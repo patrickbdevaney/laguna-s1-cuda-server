@@ -37,6 +37,9 @@ void gate_softplus(float*, const float*, int, int, int, cudaStream_t);
 void swiglu(float*, const float*, const float*, long, cudaStream_t);
 void add_inplace(float*, const float*, long, cudaStream_t);
 void embed_rows(float*, const uint16_t*, const int*, int, int, cudaStream_t);
+void tap_store(float*, const float*, int, int, int, int, int, cudaStream_t);
+void tap_concat_cast(uint16_t*, const float*, int, int, int, int, int, cudaStream_t);
+void rmsnorm_tap(float*, const uint16_t*, int, int, int, int, int, float, cudaStream_t);
 void store_kv(uint8_t*, uint8_t*, const float*, const float*, float, float, int, int, int, int, const int*, cudaStream_t);
 void attend(float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, const int*, float, cudaStream_t);
 int  attend_nsplit(int, int, int);
@@ -162,6 +165,12 @@ struct Engine {
     // batched forward and a single-token decode of the SAME token combine their partials in
     // different orders. Pinning it makes the two paths bit-comparable.
     int  nsp_force = 0;
+
+    // ---- DFlash target taps. Non-null enables capture of the residual stream after the
+    // layers in `tap_of`, which is the ONLY thing the draft consumes from the target.
+    float* taps = nullptr;
+    int    tap_cap = 0;                    // ring length in positions
+    std::vector<int> tap_of;               // tap_of[L] = slot, or -1
 
     void init(int maxtok) {
         MAXTOK = maxtok;
@@ -367,6 +376,8 @@ struct Engine {
                 add_inplace(h, hn, (long)M * H, st);
                 acc(6);
             }
+            if (taps && tap_of[L] >= 0)
+                tap_store(taps, h, M, H, base, tap_cap, tap_of[L], st);
             dbg_grab(M);
         }
         mark();

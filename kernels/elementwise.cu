@@ -303,3 +303,69 @@ extern "C" void embed_rows(float* o, const uint16_t* emb, const int* ids, int ro
     int T = 256, n = rows * H;
     k_embed<<<(n + T - 1) / T, T, 0, st>>>(o, emb, ids, rows, H);
 }
+
+// ---------------------------------------------------------------------------------------
+// DFlash target taps. The draft's context K/V are projected from the TARGET's residual
+// stream after layers `target_layer_ids` = [1,10,19,29,38,47] — six 3072-vectors per
+// position, which the draft's `fc [3072,18432]` then fuses. `slot` is which of the six.
+//
+// Stored as [6][cap][H] rather than [cap][6*H]: each tap gets its own contiguous [C,H]
+// block so it can be RMS-normed by `aux_hidden_norms.{slot}` with the plain rmsnorm kernel,
+// and the concatenation into [C,18432] happens afterwards, in the cast to bf16.
+// ---------------------------------------------------------------------------------------
+__global__ void k_tap_store(float* __restrict__ taps, const float* __restrict__ h,
+                            int M, int H, int base, int cap, int slot) {
+    long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    if (t >= (long)M * H) return;
+    const int m = (int)(t / H), d = (int)(t % H);
+    // A ring, not a flat buffer: the draft's window is 512 on every layer, so only the last
+    // `cap` positions can ever be attended and the tap store is O(1) in conversation length.
+    const int p = (base + m) % cap;
+    taps[((long)slot * cap + p) * H + d] = h[t];
+}
+
+extern "C" void tap_store(float* taps, const float* h, int M, int H, int base, int cap,
+                          int slot, cudaStream_t st) {
+    long n = (long)M * H; int T = 256;
+    k_tap_store<<<(int)((n + T - 1) / T), T, 0, st>>>(taps, h, M, H, base, cap, slot);
+}
+
+// Norm each tap with its own `aux_hidden_norms.{slot}` and concatenate the six results into
+// the [R][ntap*H] bf16 matrix `fc` consumes — one pass, no intermediate fp32 buffer.
+//
+// The reduction shape and the final expression are copied from k_rmsnorm exactly, so a tap
+// normed here and the same vector normed there agree bit for bit.
+struct TapNorms { const uint16_t* w[8]; };
+
+__global__ void k_tap_fuse(uint16_t* __restrict__ out, const float* __restrict__ taps,
+                           TapNorms wn, int R, int H, int cap, int r0, int ntap, float eps) {
+    const int slot = blockIdx.x % ntap;
+    const int r    = blockIdx.x / ntap;
+    if (r >= R) return;
+    const float* xr = taps + ((long)slot * cap + (r0 + r) % cap) * H;
+    uint16_t* orow  = out + (long)r * ntap * H + (long)slot * H;
+    const uint16_t* w = wn.w[slot];
+
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) { float v = xr[i]; ss += v * v; }
+    ss = warp_sum(ss);
+    __shared__ float red[32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < (blockDim.x + 31) / 32) ? red[lane] : 0.f;
+        v = warp_sum(v);
+        if (lane == 0) red[0] = rsqrtf(v / H + eps);
+    }
+    __syncthreads();
+    float inv = red[0];
+    for (int i = threadIdx.x; i < H; i += blockDim.x)
+        orow[i] = f2bf(bf2f(w[i]) * (xr[i] * inv));
+}
+
+extern "C" void tap_fuse(uint16_t* out, const float* taps, const uint16_t* const* wn,
+                         int R, int H, int cap, int r0, int ntap, float eps, cudaStream_t st) {
+    TapNorms t; for (int i = 0; i < 8; ++i) t.w[i] = i < ntap ? wn[i] : nullptr;
+    k_tap_fuse<<<R * ntap, 256, 0, st>>>(out, taps, t, R, H, cap, r0, ntap, eps);
+}

@@ -134,16 +134,41 @@ struct Engine {
         A((void**)&sin_s, (size_t)MAXTOK * c.rope_slide.rotary_dim * 4);
     }
 
+    // ---- optional per-category profiling (LG_PROF=1). Serialises the step, so it is
+    // strictly a diagnostic: never enable it while timing tok/s.
+    static const int NCAT = 8;
+    double cat_ms[NCAT] = {0};
+    long   cat_n[NCAT] = {0};
+    bool prof = false;
+    const char* CATN[NCAT] = {"embed+rope","norm+cast","attn_qkvo_gemm","attn_core",
+                              "shared+dense","router","moe_experts","lm_head"};
+    double t_mark = 0;
+    inline void mark() { if (prof) { cudaDeviceSynchronize(); t_mark = wall_now(); } }
+    inline void acc(int i) {
+        if (prof) { cudaDeviceSynchronize(); cat_ms[i] += (wall_now() - t_mark) * 1e3; ++cat_n[i]; }
+    }
+    void prof_report(int steps) {
+        if (!prof) return;
+        double tot = 0; for (int i = 0; i < NCAT; ++i) tot += cat_ms[i];
+        printf("\n  %-18s %10s %8s %8s\n","category","ms/step","%","launches");
+        for (int i = 0; i < NCAT; ++i)
+            printf("  %-18s %10.3f %7.1f%% %8ld\n", CATN[i], cat_ms[i]/steps,
+                   100.0*cat_ms[i]/tot, cat_n[i]/steps);
+        printf("  %-18s %10.3f\n","TOTAL",tot/steps);
+    }
+
     // One forward over M tokens starting at absolute position `base`.
     void forward(Session& S, const int* d_ids, int M, int base, cudaStream_t st = 0) {
         const int H = c.hidden, E = c.n_experts, TK = c.top_k, MI = c.moe_intermediate;
         const float qscale = 1.0f / sqrtf((float)c.head_dim);
 
+        mark();
         embed_rows(h, W.embed, d_ids, M, H, st);
         rope_tables(cos_f, sin_f, inv_f, M, base, c.rope_full.rotary_dim / 2,
                     (float)c.rope_full.attention_factor, st);
         rope_tables(cos_s, sin_s, inv_s, M, base, c.rope_slide.rotary_dim / 2,
                     (float)c.rope_slide.attention_factor, st);
+        acc(0);
 
         for (int L = 0; L < c.n_layers; ++L) {
             const LayerW& w = W.L[L];
@@ -155,12 +180,15 @@ struct Engine {
             const int rot = slide ? c.rope_slide.rotary_dim : c.rope_full.rotary_dim;
 
             // ---- attention
+            mark();
             rmsnorm(hn, h, w.in_ln, M, H, (float)c.rms_eps, st);
             f32_to_bf16(hb, hn, (long)M * H, st);
+            acc(1); mark();
             gemm_bf16(q,  w.q, hb, M, qd,  H, st);
             gemm_bf16(kk, w.k, hb, M, kvd, H, st);
             gemm_bf16(vv, w.v, hb, M, kvd, H, st);
             gemm_bf16(gp, w.g, hb, M, nh,  H, st);        // gate from the NORMED input
+            acc(2); mark();
             rmsnorm_heads(q,  q,  w.q_norm, M, nh,          hd, (float)c.rms_eps, st);
             rmsnorm_heads(kk, kk, w.k_norm, M, c.n_kv_heads, hd, (float)c.rms_eps, st);
             rope_apply(q,  cosT, sinT, M, nh,           hd, rot, st);
@@ -174,13 +202,16 @@ struct Engine {
                          c.n_kv_heads, G, S.cap[L], slide ? c.sliding_window : 0, base,
                          qscale, nsp, st);
             gate_softplus(att, gp, M, nh, hd, st);
+            acc(3); mark();
             f32_to_bf16(attb, att, (long)M * qd, st);
             gemm_bf16(hn, w.o, attb, M, H, qd, st);
             add_inplace(h, hn, (long)M * H, st);
+            acc(2); mark();
 
             // ---- MLP / MoE
             rmsnorm(hn, h, w.post_ln, M, H, (float)c.rms_eps, st);
             f32_to_bf16(hb, hn, (long)M * H, st);
+            acc(1); mark();
             if (c.is_dense(L)) {
                 int I = c.intermediate;
                 gemm_bf16(mlp_a, w.mlp_gate, hb, M, I, H, st);
@@ -189,6 +220,7 @@ struct Engine {
                 f32_to_bf16(attb, mlp_a, (long)M * I, st);
                 gemm_bf16(hn, w.mlp_down, attb, M, H, I, st);
                 add_inplace(h, hn, (long)M * H, st);
+                acc(4);
             } else {
                 // shared expert
                 int SI = c.shared_intermediate;
@@ -198,12 +230,14 @@ struct Engine {
                 f32_to_bf16(attb, mlp_a, (long)M * SI, st);
                 gemm_bf16(hn, w.sh_down, attb, M, H, SI, st);
                 add_inplace(h, hn, (long)M * H, st);      // shared expert added first
+                acc(4); mark();
 
                 // routed experts
                 gemm_bf16(rlogit, w.router, hb, M, E, H, st);
                 router(sel, rwts, nullptr, rlogit, w.router_bias, M, E, TK,
                        (float)c.router_softcap, c.norm_topk_prob ? 1 : 0, st);
                 moe_invert(ecount, eoff, elist, cursor, active, nactive, sel, M, TK, E, st);
+                acc(5); mark();
                 // Grid must be sized by the tokens in THIS call, not by MAXTOK: at decode
                 // M=1 there are at most 10 active experts, and launching 256 x (MI/4) blocks
                 // means 96 % of them exist only to read *nactive and exit.
@@ -216,11 +250,14 @@ struct Engine {
                          ecount, active, nactive, nact, H, MI, c.nvfp4_group, st);
                 moe_finalize(hn, dpart, rwts, sel, M, H, TK, (float)c.routed_scaling, st);
                 add_inplace(h, hn, (long)M * H, st);
+                acc(6);
             }
         }
+        mark();
         rmsnorm(hn, h, W.final_norm, M, H, (float)c.rms_eps, st);
         f32_to_bf16(hb, hn, (long)M * H, st);
         gemm_bf16(logits, W.lm_head, hb, M, c.vocab, H, st);   // NOT tied to the embedding
+        acc(7);
     }
 };
 

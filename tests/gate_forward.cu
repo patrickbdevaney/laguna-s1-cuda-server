@@ -1,5 +1,6 @@
 // G8: full autoregressive forward vs the oracle's golden greedy output.
 #include "../src/forward.cu"
+#include <algorithm>
 #include <fstream>
 #include <cmath>
 using namespace laguna;
@@ -20,6 +21,7 @@ int main(int argc,char**argv){
     printf("[G8] loading weights...\n");
     Loader ld(md,c); Weights W = ld.load("",false);
     Engine E; E.c=c; E.W=W; E.init(std::max(64,(int)ids.size()));
+    E.prof = getenv("LG_PROF")!=nullptr;
     Session S; S.alloc(c,CTX);
     printf("[G8] KV %.3f GB for ctx=%d  (12 global full + 36 sliding rings of %d)\n",
            S.bytes/1e9,CTX,c.sliding_window);
@@ -55,10 +57,12 @@ int main(int argc,char**argv){
         pos++; nxt=argmax_last(1); got.push_back(nxt);
     }
     printf("[G8] decode %d tok in %.3fs = %.2f tok/s\n",GEN-1,td,(GEN-1)/td);
+    E.prof_report(GEN-1);
     printf("[G8] got : "); for(int x:got) printf("%d ",x); printf("\n");
     printf("[G8] want: "); for(size_t i=0;i<want.size()&&i<got.size();++i) printf("%d ",want[i]); printf("\n");
-    int match=0; for(size_t i=0;i<got.size()&&i<want.size();++i) if(got[i]==want[i]) ++match; else break;
-    printf("[G8] leading greedy match: %d / %zu  %s\n",match,got.size(),
-           (size_t)match==got.size()?"PASS":"FAIL");
-    return (size_t)match==got.size()?0:1;
+    size_t ncmp=std::min(got.size(),want.size());
+    int match=0; for(size_t i=0;i<ncmp;++i){ if(got[i]==want[i]) ++match; else break; }
+    printf("[G8] leading greedy match: %d / %zu compared (golden has %zu) %s\n",
+           match,ncmp,want.size(),(size_t)match==ncmp?"PASS":"FAIL");
+    return (size_t)match==ncmp?0:1;
 }

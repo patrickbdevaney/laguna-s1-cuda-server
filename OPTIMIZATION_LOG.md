@@ -44,7 +44,64 @@ Device also reports `integrated=1`, `pageableMemoryAccess=1`, `hostRegisterSuppo
 
 ## Attempts
 
-*(none yet — kernel work begins at Gate B1)*
+Baseline for this arc: **`tests/bench_decode.cu`, median of N steps at ctx 4096**, greedy
+output re-checked on the same run. Thermal drift is real on this box, so every entry below is
+back-to-back A/B/A.
+
+| # | change | before | after | verdict |
+|---|---|---:|---:|---|
+| 1 | FP4 dequant: `e2m1f` LUT → HW `__nv_cvt_fp4x2_to_halfraw2` | 11.0 GB/s | **27.1 GB/s** | **WON (2.5x on the kernel)** |
+| 2 | Attention: flash-decoding split over the key range | 8 blocks/step | ~80 blocks | **WON** |
+| 3 | MoE grid sized by actual M, not `MAXTOK` | 256-wide grid | 10-wide | **WON** |
+| — | *(1+2+3 combined, end to end)* | **3.66 tok/s** | **9.23 tok/s** | **+152 %** |
+| 4 | MoE accumulators templated on a compile-time token bound | 9.00 | 9.31 | marginal (+3 %, within noise) |
+| 5 | MoE E4M3 scale rows staged in shared memory | 9.34 | 9.17 | **LOST, reverted** |
+
+### #1 — the LUT was in local memory (WON)
+`e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
+cannot keep that in registers, so every weight cost a **local-memory** load. The hardware
+converter decodes both nibbles of a byte in one instruction, register-only.
+Generalised lesson: **any small lookup table indexed by a runtime value inside an inner loop
+is local memory until proven otherwise.**
+
+### #2 — attention was grid-starved by construction (WON)
+One block per (query, kv_head) is 1×8 = **8 blocks on 20 SMs** at decode. It measured 1–2 % of
+streaming roofline. Split the key range, combine with a second pass. Pure scheduling change,
+deterministic combine.
+
+### #3 — grid sized for the wrong M (WON)
+The MoE grid used `min(E, MAXTOK·topk) = 256`, but at decode there are at most 10 active
+experts, so ~96 % of blocks launched only to read `*nactive` and exit.
+
+### #5 — shared-memory scale staging (LOST, −1.8 %)
+Hypothesis: the E4M3 scale stream is read as 1-byte loads at stride 64, so one warp
+instruction touches 16 cache lines — a 16× amplification on a stream that is 1/8 of the
+payload. Staged the scale rows cooperatively into shared instead.
+
+Measured A/B/A: **9.34 → 9.17 → 9.33**. Thermally stable, so the −1.8 % is real. The
+amplification is evidently already absorbed by L2 (a 192-byte scale row is one or two lines
+and is reused by all 32 lanes), and the `__syncwarp` plus shared round-trip costs more than it
+saves. **Reverted.** Recorded so it is not retried: on this shape, scale reads are not the
+problem.
+
+### Where the time actually goes (per-category profile, `LG_PROF=1`)
+
+| category | share of step |
+|---|---:|
+| **routed-expert MoE** | **81.5 %** |
+| attention q/k/v/o GEMMs | 11.6 % |
+| shared expert + dense | 2.7 % |
+| attention core | 1.3 % |
+| lm_head | 1.1 % |
+| router | 0.9 % |
+| norms + casts | 0.9 % |
+
+The MoE is the bottleneck by a wide margin and the next arc belongs to it. Note this
+*contradicts* `RESCOPE.md` §2's byte-based priority order, which put the attention path first
+because it is 56 % of `B_tok`: attention is now running at ~150 GB/s while the MoE runs at
+~30 GB/s, so the MoE's 25 % of the bytes costs 81 % of the time. **Bytes ranked the levers;
+the profile re-ranked them.** RESCOPE §2 priority 1 (attention) is banked as "efficient
+enough for now"; priority 3 (MoE) is promoted to first.
 
 ---
 

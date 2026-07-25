@@ -105,10 +105,18 @@ struct Drafter {
         // Built here rather than reused from the target because the target's sliding rope has
         // the same theta but the full rope does not, and silently sharing one would be a bug
         // that only shows up as a slightly worse acceptance rate.
+        // The NVFP4 draft's config says theta 1e4, but poolside's BF16, FP8 and INT4 draft
+        // checkpoints -- same architecture, same size, separately trained -- all say 5e5.
+        // The configs were hand-edited upstream (SGLang notes the rope_parameters block was
+        // flattened on 2026-07-21), so one family of them is likely wrong. We follow the
+        // config we actually load, and expose the override so the question can be settled by
+        // measuring tau rather than by argument.
+        double theta = d.rope_theta;
+        if (const char* e = getenv("LG_DRAFT_THETA")) theta = atof(e);
         int half = d.head_dim / 2;
         std::vector<float> iv(half);
         for (int i = 0; i < half; ++i)
-            iv[i] = 1.0f / (float)std::pow(d.rope_theta, (double)(2 * i) / d.head_dim);
+            iv[i] = 1.0f / (float)std::pow(theta, (double)(2 * i) / d.head_dim);
         A((void**)&inv_freq, half * 4);
         CUDA_CHECK(cudaMemcpy(inv_freq, iv.data(), half * 4, cudaMemcpyHostToDevice));
         A((void**)&cosT, (size_t)MAXROW * d.head_dim * 4);
@@ -148,12 +156,22 @@ struct Drafter {
         tap_fuse(fcx, taps, W.aux_norm.data(), C, H, tap_cap, p0, ntap(), (float)d.rms_eps, st);
         gemm_bf16(fused, W.fc, fcx, C, H, ntap() * H, st);
         rmsnorm(fused, fused, W.hidden_norm, C, H, (float)d.rms_eps, st);
-        f32_to_bf16(hb, fused, (long)C * H, st);
 
         set_base(dpos, p0, st);
         rope_tables(cosT, sinT, inv_freq, C, dpos, d.head_dim / 2, 1.0f, st);
         for (int l = 0; l < d.n_layers; ++l) {
             const auto& w = W.L[l];
+            // Each layer applies its OWN input_layernorm to the shared fused vector before
+            // projecting K/V. This is Laguna-specific -- the z-lab DFlash reference and the
+            // generic vLLM Qwen3 path both project from the un-normed target hidden -- and
+            // omitting it is invisible except as a depressed acceptance rate, because the
+            // output stays exactly correct either way (rejected drafts are simply replaced).
+            // Confirmed against vLLM's laguna_dflash.py, which stacks the six
+            // input_layernorm weights and RMS-norms the context states per layer, and against
+            // TensorRT-LLM PR #15666, which describes the same thing as "folds input layer
+            // normalization into KV weights".
+            rmsnorm(hn, fused, w.in_ln, C, H, (float)d.rms_eps, st);
+            f32_to_bf16(hb, hn, (long)C * H, st);
             // rows [qd, qd+2*kvd) of the fused qkv_proj are k then v
             float* outs[2] = {kk, vv};
             int    Ns[2]   = {kvd(), kvd()};

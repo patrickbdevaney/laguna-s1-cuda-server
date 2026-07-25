@@ -41,6 +41,10 @@ __device__ __forceinline__ float bf2f(uint16_t v) {
 
 #define RPNB 32
 #define RPU  4
+#define LG_XW4(P) const uint4 W0_ = *(const uint4*)(P),      W1_ = *(const uint4*)((P) + 8), \
+                             W2_ = *(const uint4*)((P) + 16), W3_ = *(const uint4*)((P) + 24)
+#define LG_XLO(w) bf2f((uint16_t)((w) & 0xffffu))
+#define LG_XHI(w) bf2f((uint16_t)((w) >> 16))
 
 // MODE: 0 FULL, 1 NOSCALE, 2 NODEQ, 3 STREAM, 4 VECSCALE
 //
@@ -113,15 +117,26 @@ void k_bisect(float* __restrict__ out, const uint8_t* __restrict__ gp,
             if (c >= C) break;
             const uint8_t* gbb = (const uint8_t*)&gv[u];
             const uint8_t* ubb = (const uint8_t*)&uv[u];
+            // The activation row must be read the SAME way in every variant, or the
+            // comparison is meaningless. Two defects were found here after the fact:
+            //   * MODE 2 and 3 `continue`d before touching x at all, so they were compared
+            //     against a FULL that carried the entire activation stream -- the residual
+            //     that got attributed to "the scale stream" was partly activations.
+            //   * x was read as 32 scalar 2-byte loads, which is exactly the defect entry #20
+            //     removed from production. 93 % of this harness's load requests came from an
+            //     artifact the real kernel does not have.
+            // Both are fixed: every variant now issues the production uint4 loads.
+            LG_XW4(xrow + c * 32);
+            const float xs = LG_XLO(W0_.x) + LG_XHI(W0_.x) + LG_XLO(W3_.w) + LG_XHI(W3_.w);
             if (MODE == 3) {                        // pure read: one accumulate per 16 B
-                accg += (float)gbb[0]; accu += (float)ubb[0];
+                accg += (float)gbb[0] * xs; accu += (float)ubb[0] * xs;
                 continue;
             }
             if (MODE == 2) {                        // no FP4 decode, raw byte FMAs
                 float g = 0.f, u2 = 0.f;
                 #pragma unroll
                 for (int j = 0; j < 16; ++j) { g += (float)gbb[j]; u2 += (float)ubb[j]; }
-                accg += g; accu += u2;
+                accg += g * xs; accu += u2 * xs;
                 continue;
             }
             const uint16_t* xh = xrow + c * 32;

@@ -78,6 +78,7 @@ back-to-back A/B/A.
 | 25 | N-blocking the M>1 GEMM (2 or 4 outputs per warp) | 0.270 ms | 0.271 / 0.270 | **NEUTRAL, default 1** |
 | 26 | MoE gate/up K-split (grid.z over the K axis + deterministic combine) | 27.30/27.49 | 26.9/26.7 (KS=2), 27.41/27.47 (KS=3) | **NEUTRAL, default off** |
 | 27 | **NVFP4 scale layout `[grp][lane]` → `[grp/8][lane][8]`** (bit-exact) | 27.30/27.49 | **30.80/29.54** | **WON +11 %** |
+| 28 | **DFlash context K/V: add the per-layer `input_layernorm`** | τ 3.06 / 3.30 | **τ 3.12 / 3.37** | **CORRECTNESS FIX** (k=3 / k=4) |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 
@@ -504,8 +505,21 @@ kernel at the *same* occupancy and remove **one thing at a time**.
 | NODEQ | 229–234 | + the FP4 hardware decode — **free** |
 | STREAM | 229–241 | + the entire FMA chain — **free** |
 
-The FP4 decode and the arithmetic cost *nothing*. The whole gap was the **second memory
-stream**. Scales are 1/16 of the bytes but the layout `[n_block][group][lane]` puts the eight
+**Correction, from the research pass (`RESEARCH_FINDINGS_V2.md` §A2).** This harness had a
+defect when those numbers were taken: it read the activation row as 32 scalar 2-byte loads —
+the exact defect #20 removed from production — and MODE 2/3 skipped the activation stream
+entirely, so FULL was being compared against variants carrying no activation traffic. 93 % of
+its load requests came from an artifact production does not have. With every variant issuing
+the production `uint4` loads the shape of the answer survives at a smaller magnitude:
+FULL 187, NOSCALE 217, NODEQ 223, STREAM 225 — **scales cost 16 %, not 24 %**.
+
+The end-to-end result was never in doubt (27.3/27.5 → 30.8/29.5 in the real model, greedy 8/8);
+the *explanation* was cleaner than the evidence supported. `ncu` counters, which turn out to
+work under `sudo`, confirm the weight stream is already perfect — 16 sectors/request, 127.1 of
+128 bytes per wavefront — and that we are not MIO-throttled (0.04 %).
+
+The FP4 decode and the arithmetic cost *nothing*. The dominant remaining cost was the **second
+memory stream**. Scales are 1/16 of the bytes but the layout `[n_block][group][lane]` puts the eight
 group-bytes a lane needs 32 B apart, so it issued **eight one-byte loads** where the codes
 needed two vector loads — four transactions per two, for 6 % of the bytes.
 

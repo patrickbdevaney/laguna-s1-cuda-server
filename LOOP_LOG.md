@@ -459,3 +459,87 @@ form of the test — which is why it is worth keeping — and that any future ga
 numerically-different-but-both-valid paths must compare against the oracle, never against each
 other. `LG_TEXT=tests/data/sample.txt` switches the same gate to real prose for the
 in-distribution case.
+
+---
+
+## Gate D1 — DFlash speculative decoding · **PASS (correctness), QUALIFIED (speedup)** · 2026-07-25
+
+`tests/gate_dflash.cu`. Two independent things had to hold, and the second is the one that
+does the work:
+
+* **Correctness.** Greedy speculative decoding must emit the *exact* token stream greedy
+  autoregressive decoding emits. **8/8 against the golden continuation at every k from 1 to
+  15.** Gate B1c is what makes this meaningful: the verify pass runs at M=k+1 and decode at
+  M=1, and those only became bit-identical once `attend_nsplit` stopped depending on M.
+* **Acceptance.** τ = accepted tokens per target forward. **4.32 at k=15**, inside poolside's
+  published 4.02–6.44 band. Nothing in the shipped checkpoint documents where the six
+  `aux_hidden_norms` apply or which end of the layer the taps come from; τ is the only
+  evidence that those choices are right, and it is strong evidence.
+
+### The bug that only τ could catch
+
+`Drafter::init` sized every scratch buffer for the 16-row query block, while `context_kv` ran
+over the whole 512-wide draft window. `rope_tables`, `hb`, `fcx`, `kk` and `vv` all wrote past
+their ends. It does not crash. The draft simply emits **one constant token forever** — and the
+correctness gate **passes**, because every draft token is rejected and the target's own token
+is committed instead.
+
+> **A correctness test cannot see a broken speculator.** Rejection is indistinguishable from a
+> conservative draft. τ = 1.000 was the only signal, which is why it is a gate and not a
+> statistic.
+
+### The k sweep, and the finding that matters
+
+96 generated tokens, ctx 4096, `E_frac` = mean fraction of the 256 experts a forward touches:
+
+| k | tok/s | τ | E_frac | GB/accepted token |
+|---:|---:|---:|---:|---:|
+| 1 | 25.42 | 1.863 | 0.078 | 6.70 |
+| 2 | 28.70 | 2.500 | 0.103 | 5.61 |
+| **3** | **29.28** | 2.969 | 0.123 | 5.15 |
+| 4 | 28.65 | 3.393 | 0.141 | **4.86** |
+| 6 | 24.27 | 3.654 | 0.169 | 5.00 |
+| 8 | 20.36 | 4.130 | 0.197 | 4.86 |
+| 15 | 14.29 | 4.318 | 0.264 | 5.64 |
+
+**k\* = 3–4, not the 7 the model card recommends or the 15 poolside benchmark at.** And the
+speedup is **1.07×** (29.28 against 27.35 base), where the byte budget says 1.48×
+(7.20 → 4.86 GB per accepted token).
+
+Two things cause that, and the byte model in `ROOFLINE.md` §4 missed both:
+
+1. **The MoE expert blow-up on the verify side.** Verifying k+1 tokens routes (k+1)·10
+   assignments, and the MoE kernel pays for the *distinct* experts. E_frac goes 0.039 (decode)
+   → 0.141 at k=4 → 0.264 at k=15. Measured in the profile: `k_moe_gateup_rp` costs 200 µs
+   per layer at M=1 and **815 µs at M=5**. MoE alone is 62 ms of the ~119 ms verify+propose
+   step. This is why τ rising past k=4 does not buy throughput — the experts are eating the
+   tokens the draft is winning. The roofline modelled E_frac (0.18 predicted at k=5, 0.155
+   measured) but treated the verify pass as costing one decode step.
+2. **The dense GEMM is issue-bound at M>1.** The fused q/k/v/g reads 34.8 MB in 293 µs at
+   M=5 (119 GB/s) against 230 GB/s at M=1. Per token that is still 2.6× better, but it means
+   the dense half of a verify costs ~2× a decode step, not 1×.
+
+Net: the spec loop runs at **151 GB/s** where the M=1 CUDA graph runs at 197.
+
+### A hypothesis that was wrong, recorded because the reasoning was plausible
+
+The M>1 GEMM looked x-bound: each lane reads VEC bytes of weight against M·32 of activation,
+and all four warps in a block re-read the same x. Staging x in shared memory, tiled over K to
+avoid the 324 KB blow-up that killed staging at prefill, measured **1.8× slower** —
+0.271 → 0.492 ms on FP8 q_proj at M=6. The barriers cost more than the L2 re-reads they save.
+
+The hypothesis also rested on a misread: BF16 at M=6 is already at 196 GB/s (87 % of ceiling),
+and only FP8 looked bad at 104. But this kernel is *issue*-bound at M=6, so FP8 moving half
+the bytes in the same time reads as half the bandwidth. In wall clock, FP8 at M=6 (0.271 ms)
+is **faster** than BF16 (0.288) for identical N and K. There was no defect.
+
+> **On an issue-bound kernel, GB/s is a misleading metric.** Compare times.
+
+### Status
+
+D1 passes on correctness and on acceptance. The speedup is real but small, and the reason is
+structural rather than a bug: a 256-expert top-10 MoE is close to the worst case for
+speculation, because every extra speculative token widens the expert set the verify pass must
+read. Recorded in the backlog: N-blocking the dense GEMM at M>1 (amortise the x loads over 2–4
+output rows per warp) is the concrete ~+12 % lever, and capturing the verify forward in its own
+CUDA graph is worth the ~8 % the decode graph is already measured to give.

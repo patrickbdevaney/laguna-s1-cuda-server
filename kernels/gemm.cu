@@ -141,12 +141,20 @@ static int gemm_warps() {
         }                                                                                   \
     } while (0)
 
+extern "C" void gemm_bf16_seg2(float* const*, const int*, int, const uint16_t*,
+                               const uint16_t*, int, int, cudaStream_t);
+extern "C" void gemm_fp8_seg2(float* const*, const int*, int, const uint8_t*, const float*,
+                              const uint16_t*, int, int, cudaStream_t);
+static bool smem_stage(int M);
+
 extern "C" void gemm_bf16(float* out, const uint16_t* W, const uint16_t* xb,
                           int M, int N, int K, cudaStream_t st) {
     // Specialise the M-loop the way the MoE token loop was specialised (OPTIMIZATION_LOG #6):
     // at decode M=1, and unrolling an 8-wide loop that only ever runs once burns registers
     // and issue slots for nothing.
     if (M == 1) { GEMM_DISPATCH(k_gemm_bf16, 1, out, W, xb, M, N, K); return; }
+    if (smem_stage(M)) { float* o1[1] = {out}; int n1[1] = {N};
+                         gemm_bf16_seg2(o1, n1, 1, W, xb, M, K, st); return; }
     GEMM_DISPATCH(k_gemm_bf16, MAXM, out, W, xb, M, N, K);
 }
 
@@ -336,6 +344,8 @@ static int fp8_vec() {
 extern "C" void gemm_fp8(float* out, const uint8_t* W, const float* rs, const uint16_t* xb,
                          int M, int N, int K, cudaStream_t st) {
     const int VEC = fp8_vec();
+    if (smem_stage(M)) { float* o1[1] = {out}; int n1[1] = {N};
+                         gemm_fp8_seg2(o1, n1, 1, W, rs, xb, M, K, st); return; }
     if (VEC == 16) {
         if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8, 1, 16, out, W, rs, xb, M, N, K); return; }
         GEMM_DISPATCH_V(k_gemm_fp8, MAXM, 16, out, W, rs, xb, M, N, K);
@@ -475,6 +485,7 @@ static GSegs pack_segs(float* const* outs, const int* Ns, int nseg, int* Ntot) {
 extern "C" void gemm_bf16_seg(float* const* outs, const int* Ns, int nseg,
                               const uint16_t* W, const uint16_t* xb, int M, int K,
                               cudaStream_t st) {
+    if (smem_stage(M)) { gemm_bf16_seg2(outs, Ns, nseg, W, xb, M, K, st); return; }
     int N = 0;
     GSegs sg = pack_segs(outs, Ns, nseg, &N);
     if (M == 1) { GEMM_DISPATCH(k_gemm_bf16_seg, 1, sg, W, xb, M, N, K); return; }
@@ -484,6 +495,7 @@ extern "C" void gemm_bf16_seg(float* const* outs, const int* Ns, int nseg,
 extern "C" void gemm_fp8_seg(float* const* outs, const int* Ns, int nseg,
                              const uint8_t* W, const float* rs, const uint16_t* xb,
                              int M, int K, cudaStream_t st) {
+    if (smem_stage(M)) { gemm_fp8_seg2(outs, Ns, nseg, W, rs, xb, M, K, st); return; }
     int N = 0;
     GSegs sg = pack_segs(outs, Ns, nseg, &N);
     if (fp8_vec() == 16) {
@@ -493,4 +505,145 @@ extern "C" void gemm_fp8_seg(float* const* outs, const int* Ns, int nseg,
         if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8_seg, 1, 8, sg, W, rs, xb, M, N, K); return; }
         GEMM_DISPATCH_V(k_gemm_fp8_seg, MAXM, 8, sg, W, rs, xb, M, N, K);
     }
+}
+
+// =======================================================================================
+// Verify-path GEMM: stage x in shared memory.
+//
+// At decode M=1 the weight read dominates and reading x straight from L2 is right. At the
+// speculative-verify shape M=k+1 it inverts: each lane reads VEC bytes of weight against
+// M*32 bytes of x, and every warp in the block re-reads the same x. Measured on
+// q_proj [9216,3072] with identical weight traffic:
+//
+//     M=1  0.120 ms (236 GB/s)      M=6  0.270 ms (105 GB/s)
+//
+// That 2.25x is paid on every verify pass, which is exactly where DFlash has to win its
+// speedup back. Registers are not the problem (54 at MM=8, no spill) -- it is x traffic.
+//
+// So for 1 < M <= MAXM, tile K and stage x[0..M-1][chunk] in shared memory once per block.
+// The earlier note that "staging does not scale -- at prefill M=54 a [M,K] tile is 324 KB"
+// is still true and still the reason the M=1 and prefill paths do not use this: tiling by
+// SMEM_K bounds it at MM*SMEM_K*2 = 8 KB regardless of K.
+//
+// Each lane still walks c ascending within a chunk and chunks ascend, so the dot product
+// sums in exactly the order the unstaged kernel used: **bit-exact**.
+// =======================================================================================
+#define SMEM_K 512                          // K elements staged per pass: 8 x 512 x 2 = 8 KB
+
+template <int WARPS, int MM, int VEC, bool FP8>
+__global__ __launch_bounds__(WARPS * 32)
+void k_gemm_seg_smem(GSegs sg, const void* __restrict__ Wv, const float* __restrict__ rs,
+                     const uint16_t* __restrict__ xb, int M, int Ntot, int K) {
+    extern __shared__ uint16_t xs[];        // [MM][SMEM_K]
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    const int m0 = blockIdx.y * MM;
+    const int mn = min(MM, M - m0);
+    const bool live = (n < Ntot);
+
+    float acc[MM];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) acc[m] = 0.f;
+
+    typedef typename WVec<VEC>::T wvec_t;
+    const uint8_t*  W8  = (const uint8_t*)Wv;
+    const uint16_t* W16 = (const uint16_t*)Wv;
+    const int STEP = FP8 ? VEC : 8;         // elements per lane per iteration
+
+    for (int k0 = 0; k0 < K; k0 += SMEM_K) {
+        const int kn = min(SMEM_K, K - k0);
+        for (int m = 0; m < mn; ++m)
+            for (int i = threadIdx.x; i < kn; i += WARPS * 32)
+                xs[m * SMEM_K + i] = xb[(long)(m0 + m) * K + k0 + i];
+        __syncthreads();
+        if (live) {
+            const int C = kn / STEP;
+            for (int c = lane; c < C; c += 32) {
+                uint4 wv4; wvec_t wv8;
+                if (FP8) wv8 = __ldcs((const wvec_t*)(W8 + (long)n * K + k0) + c);
+                else     wv4 = __ldcs((const uint4*)(W16 + (long)n * K + k0) + c);
+                const uint8_t*  wb = (const uint8_t*)&wv8;
+                const uint16_t* wh = (const uint16_t*)&wv4;
+                #pragma unroll
+                for (int m = 0; m < MM; ++m) {
+                    if (m >= mn) break;
+                    const uint16_t* xp = xs + m * SMEM_K + c * STEP;
+                    float s = 0.f;
+                    if (FP8) {
+                        #pragma unroll
+                        for (int v = 0; v < VEC / 8; ++v)
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j)
+                                s = fmaf(e4m3f(wb[v * 8 + j]), bf2f(xp[v * 8 + j]), s);
+                    } else {
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) s = fmaf(bf2f(wh[j]), bf2f(xp[j]), s);
+                    }
+                    acc[m] += s;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    const float sc = FP8 ? rs[n] : 1.f;
+    int seg = 0;
+    #pragma unroll
+    for (int t = 1; t < 4; ++t) if (t < sg.nseg && n >= sg.n0[t]) seg = t;
+    const int nl = n - sg.n0[seg], Ns = sg.N[seg];
+    float* o = sg.out[seg];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) {
+        if (m >= mn) break;
+        float v = warp_sum(acc[m]);
+        if (lane == 0) o[(long)(m0 + m) * Ns + nl] = v * sc;
+    }
+}
+
+// **LOST, default off** (OPTIMIZATION_LOG #24). The hypothesis was that at M=k+1 the kernel
+// is x-bound -- each lane reads VEC bytes of weight against M*32 of activation, and all four
+// warps re-read the same x. Staging measured 1.8x SLOWER: 0.271 -> 0.492 ms on FP8 q_proj at
+// M=6, 0.288 -> 0.470 on BF16. The cooperative load and its two __syncthreads per K-tile cost
+// more than the L2 re-reads they remove.
+//
+// The hypothesis was also based on a misread. BF16 at M=6 already runs at 196 GB/s (87 % of
+// ceiling); only FP8 looked bad at 104. But at M=6 this kernel is ISSUE-bound, so FP8 moving
+// half the bytes in the same time reads as half the bandwidth. In wall-clock FP8 at M=6
+// (0.271 ms) is FASTER than BF16 (0.288) for the same N and K. There was no defect to fix.
+// Lesson: on an issue-bound kernel, GB/s is a misleading metric -- compare times.
+// Kept behind LG_SMEM=1 so the measurement is reproducible.
+static bool smem_stage(int M) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("LG_SMEM"); on = e ? atoi(e) : 0; }
+    return on && M > 1 && M <= MAXM;
+}
+
+#define SMEM_DISPATCH(FP8V, VECV, ...)                                                      \
+    do {                                                                                    \
+        const int WPB = gemm_warps();                                                       \
+        dim3 g_((N + WPB - 1) / WPB, (M + MAXM - 1) / MAXM);                                \
+        const size_t shb = (size_t)MAXM * SMEM_K * 2;                                       \
+        switch (WPB) {                                                                      \
+        case 8: k_gemm_seg_smem<8, MAXM, VECV, FP8V><<<g_, 8*32, shb, st>>>(__VA_ARGS__); break; \
+        case 4: k_gemm_seg_smem<4, MAXM, VECV, FP8V><<<g_, 4*32, shb, st>>>(__VA_ARGS__); break; \
+        case 2: k_gemm_seg_smem<2, MAXM, VECV, FP8V><<<g_, 2*32, shb, st>>>(__VA_ARGS__); break; \
+        default: k_gemm_seg_smem<1, MAXM, VECV, FP8V><<<g_, 32, shb, st>>>(__VA_ARGS__); break;  \
+        }                                                                                   \
+    } while (0)
+
+extern "C" void gemm_bf16_seg2(float* const* outs, const int* Ns, int nseg,
+                               const uint16_t* W, const uint16_t* xb, int M, int K,
+                               cudaStream_t st) {
+    int N = 0;
+    GSegs sg = pack_segs(outs, Ns, nseg, &N);
+    SMEM_DISPATCH(false, 8, sg, (const void*)W, (const float*)nullptr, xb, M, N, K);
+}
+
+extern "C" void gemm_fp8_seg2(float* const* outs, const int* Ns, int nseg,
+                              const uint8_t* W, const float* rs, const uint16_t* xb,
+                              int M, int K, cudaStream_t st) {
+    int N = 0;
+    GSegs sg = pack_segs(outs, Ns, nseg, &N);
+    if (fp8_vec() == 16) SMEM_DISPATCH(true, 16, sg, (const void*)W, rs, xb, M, N, K);
+    else                 SMEM_DISPATCH(true,  8, sg, (const void*)W, rs, xb, M, N, K);
 }

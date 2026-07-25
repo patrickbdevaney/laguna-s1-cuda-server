@@ -81,7 +81,9 @@ int main(int argc, char** argv) {
         return b;
     };
 
-    printf("\n  %-4s %10s %10s %12s %10s %10s\n", "k", "tok/s", "tau", "target fwd", "gen", "match");
+    E.efrac = getenv("LG_EFRAC") != nullptr;
+    printf("\n  %-4s %10s %10s %8s %10s %12s %8s\n",
+           "k", "tok/s", "tau", "E_frac", "GB/tok", "target fwd", "match");
     double best_tps = 0; int best_k = 0;
     for (int k : KS) {
         // ---- fresh session, prefill the prompt (this also fills the tap ring) ----
@@ -90,6 +92,7 @@ int main(int argc, char** argv) {
         for (auto p : D.Vc) CUDA_CHECK(cudaMemset(p, 0, (size_t)D.kvd() * D.cap));
 
         int pos = 0;
+        E.efrac_sum = 0; E.efrac_n = 0;
         for (size_t i = 0; i < prompt.size(); i += BLK) {
             int n = (int)std::min((size_t)BLK, prompt.size() - i);
             CUDA_CHECK(cudaMemcpy(d_tok, prompt.data() + i, n * 4, cudaMemcpyHostToDevice));
@@ -159,13 +162,24 @@ int main(int argc, char** argv) {
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         double secs = wall_now() - t0;
+        // Reset the counters after prefill would be cleaner, but prefill is 4 of ~30 forwards
+        // and runs at M=16 where every expert is active, so it is reported separately below.
+        double ef = E.efrac_n ? (double)E.efrac_sum / (double)E.efrac_n / c.n_experts : 0.0;
 
         size_t ncmp = std::min(got.size(), want.size());
         int match = 0; for (size_t i = 0; i < ncmp; ++i) { if (got[i] == want[i]) ++match; else break; }
         double tps = got.size() / secs;
         double tau = (double)accepted_total / (double)target_fwd;
-        printf("  %-4d %10.2f %10.3f %12ld %10zu %6d/%zu%s\n", k, tps, tau, target_fwd,
-               got.size(), match, ncmp, (size_t)match == ncmp ? "" : "  <-- MISMATCH");
+        // Bytes per accepted token, from the same accounting bench_decode uses, plus the
+        // expert term at the MEASURED activation fraction and the draft's own weights.
+        double dense = bytes_per_token(c, FP8A, pos) - c.top_k * 47.0 *
+                       (3.0 * c.moe_intermediate * c.hidden) * (0.5 + 1.0 / c.nvfp4_group);
+        double experts = (ef * c.n_experts) * 47.0 *
+                         (3.0 * c.moe_intermediate * c.hidden) * (0.5 + 1.0 / c.nvfp4_group);
+        double draft_b = DW.arena_bytes + (double)c.vocab * c.hidden * 2;
+        double gbtok = (dense + experts + draft_b) / tau / 1e9;
+        printf("  %-4d %10.2f %10.3f %7.3f %10.2f %12ld %5d/%zu%s\n", k, tps, tau, ef, gbtok,
+               target_fwd, match, ncmp, (size_t)match == ncmp ? "" : "  <-- MISMATCH");
         if (tps > best_tps) { best_tps = tps; best_k = k; }
         S.free_();
     }

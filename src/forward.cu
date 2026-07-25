@@ -166,6 +166,13 @@ struct Engine {
     // different orders. Pinning it makes the two paths bit-comparable.
     int  nsp_force = 0;
 
+    // ---- E_frac instrumentation: how many of the 256 experts a forward actually touches.
+    // At decode M=1 it is at most top_k=10. At the speculative-verify shape M=k+1 the block
+    // routes M*top_k assignments, and the DISTINCT count is what the MoE kernel pays for.
+    // This is the number that decides whether speculation is worth anything on a MoE target.
+    bool efrac = false;
+    long efrac_sum = 0, efrac_n = 0;
+
     // ---- DFlash target taps. Non-null enables capture of the residual stream after the
     // layers in `tap_of`, which is the ONLY thing the draft consumes from the target.
     float* taps = nullptr;
@@ -372,6 +379,12 @@ struct Engine {
                 }
                 moe_down_rp(dpart, w.e_down_p, w.e_down_s, w.e_down_inv, moe_hb, elist, eoff,
                          ecount, active, nactive, nact, H, MI, c.nvfp4_group, (M == 1 ? 1 : 4), st);
+                if (efrac) {
+                    int na = 0;
+                    CUDA_CHECK(cudaMemcpyAsync(&na, nactive, 4, cudaMemcpyDeviceToHost, st));
+                    CUDA_CHECK(cudaStreamSynchronize(st));
+                    efrac_sum += na; ++efrac_n;
+                }
                 moe_finalize(hn, dpart, rwts, sel, M, H, TK, (float)c.routed_scaling, st);
                 add_inplace(h, hn, (long)M * H, st);
                 acc(6);

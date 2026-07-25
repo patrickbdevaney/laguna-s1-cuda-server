@@ -76,6 +76,7 @@ back-to-back A/B/A.
 | 23 | **Segmented GEMM: q\|k\|v\|g, sh_gate\|sh_up, mlp_gate\|mlp_up each one launch** | 26.63 | **27.18/27.35** | **WON +2.7 %**, bit-exact |
 | 24 | Shared-memory `x` staging at the verify shapes | 0.271 ms | 0.492 ms | **LOST 1.8x, default off** |
 | 25 | N-blocking the M>1 GEMM (2 or 4 outputs per warp) | 0.270 ms | 0.271 / 0.270 | **NEUTRAL, default 1** |
+| 26 | MoE gate/up K-split (grid.z over the K axis + deterministic combine) | 27.30/27.49 | 26.9/26.7 (KS=2), 27.41/27.47 (KS=3) | **NEUTRAL, default off** |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 
@@ -488,7 +489,33 @@ enough for now"; priority 3 (MoE) is promoted to first.
 
 EV = expected gain × P(works) ÷ cost. Derived from `ROOFLINE.md` and `RESCOPE.md` §2.
 
-### 0. MoE gate/up is grid-starved — the largest remaining base-decode lever
+### 0. ~~MoE gate/up is grid-starved~~ — **tested three ways, it is not. Gap unexplained.**
+
+The theory was clean: `k_moe_gateup_rp` sits at 177 GB/s (70 % of the ~254 ceiling) and
+launches only `nact_max × MI/(RPNB·WY)` = 80 blocks = 320 warps of the 960 the part holds,
+while `k_moe_down_rp` launches 240 blocks and responded to the vector-load fix (#20) exactly
+as an instruction-starved kernel should. So gate/up looked grid-starved.
+
+It is not. Three independent attacks, all negative:
+
+| attempt | result |
+|---|---|
+| #24 stage `x` in shared memory (verify shapes) | **1.8× slower** |
+| #25 N-block: 2 or 4 output rows per warp | exactly neutral (0.270 / 0.271 / 0.270 ms) |
+| #26 K-split: grid.z over the K axis, 320 → 960 warps, deterministic combine | 27.44 vs 27.40 tok/s — **nothing** |
+
+And #14 in the table above had already doubled the warp count a different way and *lost* 1.3 %.
+Four experiments now say the same thing: **this kernel's 177 GB/s is not limited by warp
+occupancy, by load width, or by K-parallelism.** Compute is not the limit either — it issues
+about 2 FMAs per weight byte against roughly 6× headroom.
+
+Recorded as unexplained rather than papered over with a fifth guess. The next person should
+start from a hardware-counter profile (`ncu`) of this one kernel rather than from another
+structural hypothesis; every structural hypothesis available from first principles has now
+been tried and priced. The K-split survives behind `LG_MOE_KS` so the measurement is
+reproducible, and costs nothing at the default of 1.
+
+### 1. Self-quantize the BF16 remainder
 
 `k_moe_gateup_rp` sits at 177 GB/s (70 % of the ~254 ceiling) and 9.4 ms/step, the worst of
 the four big kernels. The vector-load fix (#20) moved `k_moe_down_rp` 148 → 169 GB/s and did
@@ -507,7 +534,7 @@ Second-order: `o_proj` runs at 228 GB/s against `q_proj`'s 236 for identical byt
 with K=9216 gives 36 iterations per lane where q gives 12. Worth one sweep of the load width
 for that shape specifically.
 
-### 1. Self-quantize the BF16 remainder — **the largest lever, now evidence-staged**
+### 2. Self-quantize the BF16 remainder — **the largest lever, now evidence-staged**
 Poolside quantized only the routed experts; 7.41 GB of every decode step is BF16.
 
 | variant | `B_tok` | AR @227 | gain | quality evidence |

@@ -340,7 +340,8 @@ __global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
                                 const int* __restrict__ elist, const int* __restrict__ eoff,
                                 const int* __restrict__ ecount, const int* __restrict__ active,
                                 const int* __restrict__ nactive,
-                                int H, int MI, int topk, int GRP) {
+                                int H, int MI, int topk, int GRP,
+                                float* __restrict__ part, int KS) {
     const int slot = blockIdx.x;
     if (slot >= *nactive) return;
     const int e = active[slot];
@@ -353,6 +354,14 @@ __global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
 
     const int C  = H / 32;                                     // 16-byte code chunks
     const int NG = H / GRP;                                    // scale groups
+    // K-split. gate/up launches only nact_max * MI/(RPNB*WY) = 80 blocks at decode = 320 warps
+    // of the 960 the part can hold, and unlike k_moe_down_rp (240 blocks) it is grid-starved
+    // rather than instruction-starved -- which is why the vector-load fix moved `down` 12 %
+    // and did nothing here. Splitting the K axis is the same move that made the attention
+    // flash-decoding split the biggest early win.
+    const int zs = blockIdx.z;
+    const int cw = (C + KS - 1) / KS;
+    const int c_lo = zs * cw, c_hi = min(C, c_lo + cw);
     const size_t eb = (size_t)e * nblocks;
     const uint8_t* gbase = gp + ((eb + nb) * C) * RPNB * 16;
     const uint8_t* ubase = up + ((eb + nb) * C) * RPNB * 16;
@@ -370,13 +379,13 @@ __global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
         xrow[i] = xb + (long)(((i < nt) ? elist[base + t0 + i] : 0) / topk) * H;
     }
 
-    for (int c0 = 0; c0 < C; c0 += RPU) {
+    for (int c0 = c_lo; c0 < c_hi; c0 += RPU) {
         uint4 gv[RPU], uv[RPU];
         float gsc[RPU][2], usc[RPU][2];
         #pragma unroll
         for (int u = 0; u < RPU; ++u) {
             const int c = c0 + u;
-            if (c < C) {
+            if (c < c_hi) {
                 gv[u] = __ldcs((const uint4*)(gbase + ((size_t)c * RPNB + lane) * 16));
                 uv[u] = __ldcs((const uint4*)(ubase + ((size_t)c * RPNB + lane) * 16));
                 const int g0 = (c * 32) / GRP, g1 = (c * 32 + 16) / GRP;
@@ -389,7 +398,7 @@ __global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
         #pragma unroll
         for (int u = 0; u < RPU; ++u) {
             const int c = c0 + u;
-            if (c >= C) break;
+            if (c >= c_hi) break;
             const uint8_t* gbb = (const uint8_t*)&gv[u];
             const uint8_t* ubb = (const uint8_t*)&uv[u];
             #pragma unroll
@@ -419,9 +428,41 @@ __global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
     #pragma unroll
     for (int i = 0; i < TM; ++i) {
         if (i >= nt) break;
-        hbuf[(long)elist[base + t0 + i] * MI + n] = silu(accg[i]) * accu[i];   // no reduction
+        const long row = elist[base + t0 + i];
+        if (KS == 1) {
+            hbuf[row * MI + n] = silu(accg[i]) * accu[i];      // no reduction
+        } else {
+            // Two partial planes per split, gate then up. The combine sums z ASCENDING, so
+            // the result is a fixed regrouping of the same ascending-c sum -- deterministic,
+            // though not bit-identical to KS=1 (fp addition is not associative).
+            part[((long)zs * 2 + 0) * (long)gridDim.x * topk * MI + row * MI + n] = accg[i];
+            part[((long)zs * 2 + 1) * (long)gridDim.x * topk * MI + row * MI + n] = accu[i];
+        }
     }
   }
+}
+
+// Sum the K-split partials and apply the SwiGLU that k_moe_gateup_rp does inline at KS=1.
+__global__ void k_moe_gu_combine(float* __restrict__ hbuf, const float* __restrict__ part,
+                                 const int* __restrict__ elist, const int* __restrict__ eoff,
+                                 const int* __restrict__ ecount, const int* __restrict__ active,
+                                 const int* __restrict__ nactive,
+                                 int MI, int KS, long plane) {
+    const int slot = blockIdx.x;
+    if (slot >= *nactive) return;
+    const int e = active[slot];
+    const int cnt = ecount[e], base = eoff[e];
+    for (int t = 0; t < cnt; ++t) {
+        const long row = elist[base + t];
+        for (int n = blockIdx.y * blockDim.x + threadIdx.x; n < MI; n += gridDim.y * blockDim.x) {
+            float g = 0.f, u = 0.f;
+            for (int z = 0; z < KS; ++z) {
+                g += part[((long)z * 2 + 0) * plane + row * MI + n];
+                u += part[((long)z * 2 + 1) * plane + row * MI + n];
+            }
+            hbuf[row * MI + n] = silu(g) * u;
+        }
+    }
 }
 
 template <int TM>
@@ -505,15 +546,28 @@ extern "C" void moe_gateup_rp(float* hbuf, const uint8_t* gp, const uint8_t* gs,
                               const uint16_t* xb, const int* elist, const int* eoff,
                               const int* ecount, const int* active, const int* nactive,
                               int nact_max, int H, int MI, int topk, int GRP, int maxtok,
-                              cudaStream_t st) {
+                              float* part, cudaStream_t st) {
     const int WY = 4;
-    dim3 blk(RPNB, WY), grd(nact_max, (MI / RPNB + WY - 1) / WY);
+    // KS only helps the DECODE shape. At verify M=k+1 the active-expert count already fills
+    // the grid, and the split would just add partial traffic.
+    static int KSENV = -1;
+    if (KSENV < 0) { const char* e = getenv("LG_MOE_KS"); KSENV = e ? atoi(e) : 1;
+                     if (KSENV < 1) KSENV = 1; if (KSENV > 8) KSENV = 8; }
+    const int KS = (maxtok <= 1 && part) ? KSENV : 1;
+    dim3 blk(RPNB, WY), grd(nact_max, (MI / RPNB + WY - 1) / WY, KS);
     if (maxtok <= 1)
         k_moe_gateup_rp<1><<<grd, blk, 0, st>>>(hbuf, gp, gs, ginv, up, us, uinv, xb, elist,
-                                                eoff, ecount, active, nactive, H, MI, topk, GRP);
+                                                eoff, ecount, active, nactive, H, MI, topk, GRP,
+                                                part, KS);
     else
         k_moe_gateup_rp<TMAX><<<grd, blk, 0, st>>>(hbuf, gp, gs, ginv, up, us, uinv, xb, elist,
-                                                   eoff, ecount, active, nactive, H, MI, topk, GRP);
+                                                   eoff, ecount, active, nactive, H, MI, topk,
+                                                   GRP, part, KS);
+    if (KS > 1) {
+        const long plane = (long)nact_max * topk * MI;
+        k_moe_gu_combine<<<dim3(nact_max, 8), 128, 0, st>>>(hbuf, part, elist, eoff, ecount,
+                                                            active, nactive, MI, KS, plane);
+    }
 }
 extern "C" void moe_down_rp(float* dpart, const uint8_t* dp, const uint8_t* ds, const float* dinv,
                             const uint16_t* hb, const int* elist, const int* eoff,

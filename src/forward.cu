@@ -49,7 +49,7 @@ void inc_base(int*, int, cudaStream_t);
 void moe_invert(int*, int*, int*, int*, int*, int*, const int*, int, int, int, cudaStream_t);
 void moe_gateup_rp(float*, const uint8_t*, const uint8_t*, const float*, const uint8_t*, const uint8_t*,
                 const float*, const uint16_t*, const int*, const int*, const int*, const int*,
-                const int*, int, int, int, int, int, int, cudaStream_t);
+                const int*, int, int, int, int, int, int, float*, cudaStream_t);
 void moe_down_rp(float*, const uint8_t*, const uint8_t*, const float*, const uint16_t*, const int*,
               const int*, const int*, const int*, const int*, int, int, int, int, int, cudaStream_t);
 void moe_finalize(float*, const float*, const float*, const int*, int, int, int, float, cudaStream_t);
@@ -137,6 +137,7 @@ struct Engine {
     float *cos_f, *sin_f, *cos_s, *sin_s, *inv_f, *inv_s;
     float *pacc, *pml;                 // split-attention partials
     float *moe_u = nullptr;            // second gate/up accumulator for the split-warp path
+    float *moe_part = nullptr;         // K-split partials for the decode-shape gate/up
     bool  moe_split = false;   // LOST end-to-end: see OPTIMIZATION_LOG #14
     int   *dbase = nullptr;            // decode position, device-side (graph-safe)
     static const int MAXSPLIT = 32;
@@ -210,6 +211,11 @@ struct Engine {
         A((void**)&moe_hb,(size_t)MAXTOK * TK * MI * 2);
         A((void**)&moe_u, (size_t)MAXTOK * TK * MI * 4);
         A((void**)&dpart, (size_t)MAXTOK * TK * H * 4);
+        // K-split partials for the decode-shape gate/up: [KS][2][E][topk][MI] fp32. Sized for
+        // the maximum split (8) at the decode shape only, which is 8*2*256*10*1024*4 -- no,
+        // the plane is nact_max*topk*MI and nact_max at M=1 is topk, so 8*2*10*10*1024*4 =
+        // 6.6 MB. Trivial next to a 69 GB arena.
+        A((void**)&moe_part, (size_t)8 * 2 * TK * TK * MI * 4);
         A((void**)&rlogit,(size_t)MAXTOK * E * 4);
         A((void**)&rwts,  (size_t)MAXTOK * TK * 4);
         A((void**)&logits,(size_t)MAXTOK * V * 4);
@@ -377,7 +383,8 @@ struct Engine {
                 } else {
                     moe_gateup_rp(moe_h, w.e_gate_p, w.e_gate_s, w.e_gate_inv,
                                w.e_up_p, w.e_up_s, w.e_up_inv, hb, elist, eoff, ecount,
-                               active, nactive, nact, H, MI, TK, c.nvfp4_group, (M == 1 ? 1 : 4), st);
+                               active, nactive, nact, H, MI, TK, c.nvfp4_group, (M == 1 ? 1 : 4),
+                               moe_part, st);
                     f32_to_bf16(moe_hb, moe_h, (long)M * TK * MI, st);
                 }
                 moe_down_rp(dpart, w.e_down_p, w.e_down_s, w.e_down_inv, moe_hb, elist, eoff,

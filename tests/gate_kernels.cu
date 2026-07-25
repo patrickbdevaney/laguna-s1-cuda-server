@@ -8,6 +8,8 @@
 #include <fstream>
 #include <cuda_runtime.h>
 #include "../include/third_party/json.hpp"
+#include "../include/laguna_config.h"
+#include "../include/laguna_weights.h"
 #define CK(x) do{cudaError_t e=(x); if(e){printf("CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
 
 extern "C" {
@@ -18,6 +20,12 @@ void rmsnorm(float*,const float*,const uint16_t*,int,int,float,cudaStream_t);
 void rope_tables(float*,float*,const float*,int,int,int,float,cudaStream_t);
 void router(int*,float*,float*,const float*,const float*,int,int,int,float,int,cudaStream_t);
 void f32_to_bf16(uint16_t*,const float*,long,cudaStream_t);
+void store_kv(uint8_t*,uint8_t*,const float*,const float*,float,float,int,int,int,int,int,cudaStream_t);
+void attend(float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,int,float,cudaStream_t);
+void moe_invert(int*,int*,int*,int*,int*,int*,const int*,int,int,int,cudaStream_t);
+void moe_gateup(float*,const uint8_t*,const uint8_t*,const float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,cudaStream_t);
+void moe_down(float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,cudaStream_t);
+void moe_finalize(float*,const float*,const float*,const int*,int,int,int,float,cudaStream_t);
 }
 
 static std::string DIR="docs/kernel_refs/";
@@ -135,6 +143,71 @@ int main(){
         printf("  %-28s mismatching indices = %zu / %zu  %s\n","top-k selection INDEX-EXACT",bad,gsel.size(),bad?"FAIL":"PASS");
         bad?++FAIL:++PASS;
         cmp("normalised weights",gwts,wwts,5e-6);
+    }
+
+    printf("\n=== G5  head-packed GQA over FP8 KV ===\n");
+    for(const char* tag : {"full","slide"}){
+        auto& J=REFS[std::string("g5_")+tag];
+        int nh=J["nh"],nkv=J["nkv"],hd=J["hd"],G=J["G"],win=J["window"],Sm=J["S"];
+        float ks=J["k_scale"],vs=J["v_scale"];
+        auto q=loadbin<float>(std::string("g5_q_")+tag);
+        auto k=loadbin<float>(std::string("g5_k_")+tag);
+        auto v=loadbin<float>(std::string("g5_v_")+tag);
+        auto want=loadbin<float>(std::string("g5_out_")+tag);
+        int cap = win? win : Sm;
+        auto*dq=todev(q); auto*dk=todev(k); auto*dv=todev(v);
+        uint8_t *dKc,*dVc; CK(cudaMalloc(&dKc,(size_t)nkv*cap*hd)); CK(cudaMalloc(&dVc,(size_t)nkv*cap*hd));
+        CK(cudaMemset(dKc,0,(size_t)nkv*cap*hd)); CK(cudaMemset(dVc,0,(size_t)nkv*cap*hd));
+        store_kv(dKc,dVc,dk,dv,ks,vs,Sm,nkv,hd,cap,0,0); CK(cudaGetLastError());
+        float* dout; CK(cudaMalloc(&dout,q.size()*4));
+        attend(dout,dq,dKc,dVc,ks,vs,Sm,nkv,G,cap,win,0,1.0f/sqrtf((float)hd),0);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        std::vector<float> got(q.size()); CK(cudaMemcpy(got.data(),dout,got.size()*4,cudaMemcpyDeviceToHost));
+        cmp((std::string("attention ")+tag+" (G="+std::to_string(G)+")").c_str(),got,want,5e-6);
+    }
+
+    printf("\n=== G6  grouped routed-expert MoE (256 experts, top-10) ===\n");
+    {
+        using namespace laguna;
+        auto& J=REFS["g6"];
+        int Lr=J["layer"],rows=J["rows"],E=J["E"],TK=J["topk"],MI=J["MI"];
+        float scaling=J["scaling"];
+        Config c = load_config("models/Laguna-S-2.1-NVFP4/config.json");
+        Loader ld("models/Laguna-S-2.1-NVFP4", c);
+        printf("  (loading real expert weights for layer %d ...)\n", Lr);
+        Weights W = ld.load("", false);
+        const LayerW& lw = W.L[Lr];
+
+        auto x=loadbin<float>("g6_x"); auto sel=loadbin<int32_t>("g6_sel");
+        auto wt=loadbin<float>("g6_wts"); auto want=loadbin<float>("g6_out");
+        auto*dx=todev(x); auto*dsel=todev(sel); auto*dwt=todev(wt);
+        uint16_t* dxb; CK(cudaMalloc(&dxb,x.size()*2)); f32_to_bf16(dxb,dx,x.size(),0);
+
+        int nass=rows*TK;
+        int *ec,*eo,*el,*cur,*act,*na;
+        CK(cudaMalloc(&ec,E*4)); CK(cudaMalloc(&eo,(E+1)*4)); CK(cudaMalloc(&el,nass*4));
+        CK(cudaMalloc(&cur,E*4)); CK(cudaMalloc(&act,E*4)); CK(cudaMalloc(&na,4));
+        moe_invert(ec,eo,el,cur,act,na,dsel,rows,TK,E,0); CK(cudaGetLastError());
+        int h_na; CK(cudaMemcpy(&h_na,na,4,cudaMemcpyDeviceToHost));
+        printf("  active experts = %d of %d for %d tokens x top-%d\n",h_na,E,rows,TK);
+
+        float* hbuf; CK(cudaMalloc(&hbuf,(size_t)nass*MI*4));
+        moe_gateup(hbuf,lw.e_gate_p,lw.e_gate_s,lw.e_gate_inv,lw.e_up_p,lw.e_up_s,lw.e_up_inv,
+                   dxb,el,eo,ec,act,na,h_na,c.hidden,MI,TK,c.nvfp4_group,0);
+        CK(cudaGetLastError());
+        uint16_t* hbf; CK(cudaMalloc(&hbf,(size_t)nass*MI*2));
+        f32_to_bf16(hbf,hbuf,(long)nass*MI,0);
+        float* dpart; CK(cudaMalloc(&dpart,(size_t)nass*c.hidden*4));
+        moe_down(dpart,lw.e_down_p,lw.e_down_s,lw.e_down_inv,hbf,el,eo,ec,act,na,h_na,
+                 c.hidden,MI,c.nvfp4_group,0);
+        CK(cudaGetLastError());
+        float* dout; CK(cudaMalloc(&dout,(size_t)rows*c.hidden*4));
+        moe_finalize(dout,dpart,dwt,dsel,rows,c.hidden,TK,scaling,0);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        std::vector<float> got((size_t)rows*c.hidden);
+        CK(cudaMemcpy(got.data(),dout,got.size()*4,cudaMemcpyDeviceToHost));
+        cmp("routed experts vs reference",got,want,3e-5);
+        CK(cudaFree(W.arena));
     }
 
     printf("\n%d passed, %d failed\n",PASS,FAIL);

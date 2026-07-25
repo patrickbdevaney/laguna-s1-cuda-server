@@ -113,3 +113,81 @@ meta["config"] = {k: cfg[k] for k in ("hidden_size", "num_experts", "num_experts
 meta["seq_len"] = int(S)
 json.dump(meta, open(os.path.join(OUT, "refs.json"), "w"), indent=2)
 print("\nwrote", OUT)
+
+# ---- G5: attention (head-packed GQA over an FP8 KV cache), both layer types.
+# The reference quantises K/V to e4m3 with the checkpoint's static scales first, so the gate
+# isolates attention correctness from FP8 rounding (which is a separate, deliberate loss).
+import torch.nn.functional as F
+def fp8_rt(t, scale):
+    return (t / scale).to(torch.float8_e4m3fn).float() * scale
+
+for tag, LREF in (("full", 0), ("slide", 1)):
+    nh = cfg["num_attention_heads_per_layer"][LREF]
+    nkv, hd = cfg["num_key_value_heads"], cfg["head_dim"]
+    G = nh // nkv
+    win = cfg["sliding_window"] if cfg["layer_types"][LREF] == "sliding_attention" else 0
+    Sm = 24                                       # queries; positions 0..Sm-1
+    torch.manual_seed(99 + LREF)
+    q = torch.randn(Sm, nh, hd) * 0.3
+    k = torch.randn(Sm, nkv, hd) * 0.3
+    v = torch.randn(Sm, nkv, hd) * 0.3
+    ks = float(raw(f"model.layers.{LREF}.self_attn.k_scale"))
+    vs = float(raw(f"model.layers.{LREF}.self_attn.v_scale"))
+    kq, vq = fp8_rt(k, ks), fp8_rt(v, vs)
+    # reference: repeat_kv then masked softmax, fp32
+    kr = kq.permute(1, 0, 2).repeat_interleave(G, 0)      # [nh,S,hd]
+    vr = vq.permute(1, 0, 2).repeat_interleave(G, 0)
+    qq = q.permute(1, 0, 2)                                # [nh,S,hd]
+    att = (qq @ kr.transpose(1, 2)) * (hd ** -0.5)
+    pos = torch.arange(Sm)
+    allowed = pos[None, :] <= pos[:, None]
+    if win: allowed &= pos[None, :] > (pos[:, None] - win)
+    att = att.masked_fill(~allowed[None], float("-inf"))
+    o = (F.softmax(att, -1, dtype=torch.float32) @ vr).permute(1, 0, 2)   # [S,nh,hd]
+    save(f"g5_q_{tag}", q.reshape(Sm, nh * hd), f"queries [S,{nh}*{hd}] fp32")
+    save(f"g5_k_{tag}", k.reshape(Sm, nkv * hd), "keys pre-quant fp32")
+    save(f"g5_v_{tag}", v.reshape(Sm, nkv * hd), "values pre-quant fp32")
+    save(f"g5_out_{tag}", o.reshape(Sm, nh * hd), "expected attention out fp32")
+    meta[f"g5_{tag}"] = {"nh": nh, "nkv": nkv, "hd": hd, "G": G, "window": win,
+                         "S": Sm, "k_scale": ks, "v_scale": vs}
+json.dump(meta, open(os.path.join(OUT, "refs.json"), "w"), indent=2)
+print("appended G5 attention refs")
+
+# ---- G6: routed-expert MoE for a real layer, real hidden state, real experts.
+#
+# PRECISION: matched to the kernel's W4A16 choices, which are deliberately *more* precise
+# than torch-bf16: activations enter each GEMM as bf16, accumulation is fp32, and the only
+# intermediate rounding is h = silu(gate)*up -> bf16 before down_proj (because down_proj's
+# activation operand must be bf16 too). torch's bf16 path would additionally round gate and
+# up. The end-to-end greedy gate (G8) is what checks that this choice costs nothing.
+L = 1
+E, TK = cfg["num_experts"], cfg["num_experts_per_tok"]
+MI, Hh = cfg["moe_intermediate_size"], cfg["hidden_size"]
+xin = hn[:8].contiguous()                       # 8 tokens is the verify-shape regime
+sel8 = sel[:8].contiguous(); w8 = wts[:8].contiguous()
+xb = xin.bfloat16().float()
+
+def expert_w(e, which):
+    p = f"model.layers.{L}.mlp.experts.{e}.{which}."
+    return dequant_nvfp4(raw(p + "weight_packed"), raw(p + "weight_scale"),
+                         float(raw(p + "weight_global_scale")))
+
+out = torch.zeros(xin.shape[0], Hh)
+for t in range(xin.shape[0]):
+    # accumulate in ASCENDING EXPERT INDEX, matching modeling_laguna's expert_hit iteration
+    order = sorted(range(TK), key=lambda j: int(sel8[t, j]))
+    for j in order:
+        e = int(sel8[t, j])
+        g = xb[t] @ expert_w(e, "gate_proj").T
+        u = xb[t] @ expert_w(e, "up_proj").T
+        h = (torch.nn.functional.silu(g) * u).bfloat16().float()
+        out[t] += (h @ expert_w(e, "down_proj").T) * float(w8[t, j])
+out *= cfg["moe_routed_scaling_factor"]
+save("g6_x", xb, "bf16-rounded hidden [8,3072] fp32")
+save("g6_sel", sel8.to(torch.int32), "top-10 expert ids [8,10] i32")
+save("g6_wts", w8, "normalised routing weights [8,10] fp32")
+save("g6_out", out, "expected routed-expert output (x2.5 scaling) [8,3072] fp32")
+meta["g6"] = {"layer": L, "rows": int(xin.shape[0]), "E": E, "topk": TK, "MI": MI,
+              "scaling": cfg["moe_routed_scaling_factor"]}
+json.dump(meta, open(os.path.join(OUT, "refs.json"), "w"), indent=2)
+print("appended G6 MoE refs")

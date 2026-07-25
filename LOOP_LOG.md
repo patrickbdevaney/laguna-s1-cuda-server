@@ -279,3 +279,37 @@ not the fp32 one, or a stated tolerance that accounts for exactly this effect.
 selection boundary are common (min gap 1e-5 on a 54-token sample). Any future change to
 activation precision on the router path — including the §5 self-quantisation lever — must
 re-measure selection agreement, not just output norms.
+
+### G5 — head-packed GQA over FP8 KV, both tilings · **PASS**
+
+`kernels/attention.cu`. maxrel **1.67e-07** (global, G=6) and **1.49e-07** (sliding, G=9),
+against a reference that FP8-round-trips K/V with the checkpoint's static scales first, so the
+gate isolates attention from the deliberate FP8 loss.
+
+**Failure on the way — a silent 31/32 data loss.** The cross-warp softmax combine buffered
+each warp's partial as `red[NW][G][{m,l,acc[4]}]`. But `acc[4]` is *per-lane* (each lane owns
+4 distinct head-dim slots), so all 32 lanes of a warp wrote the same 4 shared floats: a race
+that keeps one lane's partial and discards the other 31. Output was ~170 % wrong. Fixed by
+carrying the head-dim axis: `red_acc[NW][G][HD]`, which also forced `NW` 8 → 4 to keep shared
+memory at 23 KB. The lesson generalises — **any per-lane accumulator crossing a shared-memory
+reduction must keep its lane axis.**
+
+Known and deliberate limitation: at decode (M=1) the grid is (1, nkv) = **8 blocks on 20 SMs**,
+so attention is grid-starved in exactly the shape that matters most. Logged for the
+optimisation loop (split the key range across blocks with a second-stage combine); not fixed
+now because correctness gates precede speed gates.
+
+### G6 — grouped routed-expert MoE · **PASS**
+
+`kernels/moe.cu`. maxrel **3.00e-05** on real layer-1 experts and a real hidden state,
+8 tokens × top-10. Structure: invert → weight-resident grouped gate/up → weight-resident down
+→ deterministic finalize. **No atomics** (float atomics would make the verify step disagree
+with itself run to run), and the finalize sums in **ascending expert index** to match the
+reference's `expert_hit` iteration order.
+
+Tolerance is looser here (3e-5) than elsewhere because `h = silu(gate)·up` is rounded to bf16
+before `down_proj`, which the reference mirrors — that rounding is the dominant residual.
+
+**It also produced a real measurement:** 44 active experts of 256 for 8 tokens, against 70.5
+from the independent-uniform union model. That prompted the full `E_frac` measurement now in
+`ROOFLINE.md` §10, which raises `k*` and improves every speculative projection.

@@ -66,16 +66,36 @@ DRAFT_W = sum(nbytes(DHDR, k) for k in DHDR)
 DRAFT_STEP = DRAFT_W + lmhead                            # + target lm_head for draft logits
 
 # ---- expert union model ------------------------------------------------------
-def union(k, corr=0.0):
-    """Expected distinct experts per MoE layer for k tokens x top-k of N.
-    corr in [0,1) shrinks the spread to model routing correlation between
-    adjacent tokens (corr=0 => independent-uniform upper bound)."""
+# MEASURED expert union, from docs/golden/efrac_measured.json: distinct experts per MoE
+# layer averaged over all contiguous k-token windows and all 47 MoE layers of the golden
+# run. Real routing is markedly more correlated between adjacent tokens than the
+# independent-uniform bound -- at k=15, 71.4 experts vs the model's 115.2.
+_MEAS = {}
+try:
+    for r in json.load(open(f"{R}/docs/golden/efrac_measured.json")):
+        _MEAS[r["k"]] = r["u_measured"]
+except Exception:
+    pass
+
+def union(k, corr=0.0, measured=True):
+    """Expected distinct experts per MoE layer for k tokens x top-k of N."""
+    if measured and _MEAS:
+        ks = sorted(_MEAS)
+        if k in _MEAS: return _MEAS[k]
+        if k < ks[0]:  return _MEAS[ks[0]]
+        if k > ks[-1]:                                   # linear extrapolation from the tail
+            a, b = ks[-2], ks[-1]
+            return _MEAS[b] + (_MEAS[b] - _MEAS[a]) * (k - b) / (b - a)
+        lo = max(x for x in ks if x <= k); hi = min(x for x in ks if x >= k)
+        if lo == hi: return _MEAS[lo]
+        f = (k - lo) / (hi - lo)
+        return _MEAS[lo] * (1 - f) + _MEAS[hi] * f
     p = TOPK / NEXP
     u = NEXP * (1.0 - (1.0 - p) ** k)
     return TOPK + (u - TOPK) * (1.0 - corr)
 
-def verify_bytes(k, ctx, corr=0.0):
-    return FIXED + union(k, corr) * EXPERT_B * len(MOE_L) + kv_read(ctx)
+def verify_bytes(k, ctx, corr=0.0, measured=True):
+    return FIXED + union(k, corr, measured) * EXPERT_B * len(MOE_L) + kv_read(ctx)
 
 def efrac(k, corr=0.0):
     return union(k, corr) * EXPERT_B * len(MOE_L) / EXPERT_POOL
@@ -123,11 +143,11 @@ def main():
               f"{91e9/b:8.2f}{135e9/b:8.2f}{227e9/b:8.2f}")
 
     print(f"\n{'-'*78}\nExpert union / E_frac (independent-uniform upper bound)\n{'-'*78}")
-    print(f"  {'k':>3s}{'U(k)/256':>10s}{'E_frac':>9s}{'expert GB':>11s}{'fixed GB':>10s}{'block GB':>10s}")
+    print(f"  {'k':>3s}{'U meas':>9s}{'U model':>9s}{'E_frac':>9s}{'expert GB':>11s}{'fixed GB':>10s}{'block GB':>10s}")
     KS = [1,3,5,7,9,11,15]
     for k in KS:
         u = union(k); eb = u*EXPERT_B*len(MOE_L)
-        print(f"  {k:>3d}{u:10.1f}{efrac(k):9.3f}{eb/GB:11.3f}{FIXED/GB:10.3f}"
+        print(f"  {k:>3d}{u:9.1f}{union(k,0.0,False):9.1f}{u/NEXP:9.3f}{eb/GB:11.3f}{FIXED/GB:10.3f}"
               f"{(verify_bytes(k,ctx)+DRAFT_STEP)/GB:10.3f}")
 
     print(f"\n{'-'*78}\nProjected DFlash tok/s   (ctx={ctx}, block bytes incl. draft forward)\n{'-'*78}")

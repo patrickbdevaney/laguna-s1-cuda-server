@@ -354,3 +354,55 @@ See `OPTIMIZATION_LOG.md` M2.
 And: **zero-copy mapped weights cost 30 % of bandwidth** (160 vs 227 GB/s), so the repack
 cache must be read into `cudaMalloc` memory rather than `cudaHostRegister`'d in place. This
 is a loader-architecture decision made on measurement, before writing the loader.
+
+---
+
+## 10. MEASURED `E_frac` (2026-07-24) — replaces the §4 model, and it moves `k*`
+
+`DIRECTIVE.md` §7.3 requires the modelled expert union be replaced by a measurement. First
+pass done, from the golden run's captured router selections: distinct experts per MoE layer,
+averaged over **every contiguous k-token window × all 47 MoE layers** (54 tokens of real
+prompt). Data: `docs/golden/efrac_measured.json`; the roofline now consumes it directly.
+
+| k | U measured | U independent-model | ratio | `E_frac` measured | `E_frac` modelled | implied corr |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10.0 | 10.0 | 1.00 | 0.039 | 0.039 | — |
+| 3 | 22.9 | 28.8 | 0.79 | **0.089** | 0.113 | 0.32 |
+| 5 | 33.0 | 46.2 | 0.71 | **0.129** | 0.181 | 0.36 |
+| 7 | 42.0 | 62.3 | 0.67 | **0.164** | 0.243 | 0.39 |
+| 9 | 50.1 | 77.1 | 0.65 | 0.196 | 0.301 | 0.40 |
+| 15 | 71.4 | 115.2 | 0.62 | **0.279** | 0.450 | 0.42 |
+
+**Adjacent tokens route far more similarly than independence predicts** — the implied
+correlation is 0.28 at k=2 and rises to 0.42 by k=15, so the union grows sub-linearly where
+the model had it near-linear. Per-layer spread at k=5 is 28.5 / 32.7 / 42.6
+(min / median / max distinct experts), i.e. the effect is consistent across depth, not an
+artefact of one layer.
+
+Independently corroborated by the G6 kernel gate, which reported **44 active experts of 256**
+for 8 tokens × top-10 — against 70.5 from the independent model.
+
+### Consequence: speculation is more profitable than projected, and `k*` rises
+
+| workload | old `k*` (modelled) | **new `k*` (measured)** | tok/s @175 | tok/s @227 |
+|---|---:|---:|---:|---:|
+| HumanEval T=0 | 5 | **9** | 42.2 | **54.7** |
+| GSM8K T=0 | 5 | **7** | 39.0 | 50.6 |
+| MBPP T=0 | 3 | **5** | 31.8 | 41.3 |
+| MT-Bench T=0 | 3 | **5** | 31.1 | 40.4 |
+| code T=0.7 | 3 | **3** (flat to 5) | 26.8 | 34.8 |
+
+**`k*` is workload-dependent, not a constant**: 3 where acceptance is low (temp 0.7), 9 where
+it is high (HumanEval temp 0). The curve is flat near the optimum in every case — k=5 is
+within 6 % of best for every workload measured — so **`k*` = 5 is the right single default**,
+with `k` exposed per-request for callers that know their workload.
+
+This partially rehabilitates the draft card's `k=7` (near-optimal at temp 0) while still
+refuting the NVFP4 card's `k=15` (5–10 % off best everywhere, and worst at temp 0.7).
+
+**Caveat, and why this is a first pass:** these are *prompt* tokens under teacher forcing,
+not tokens proposed by the draft. Speculative tokens come from a 6-layer draft and may route
+differently — plausibly *more* correlated (the draft is a compressed model) but that is an
+assumption, not a measurement. Gate D1 must re-measure on real draft blocks before `k*` is
+frozen. Until then, treat the `k*` shift as directional and the tok/s figures as the
+optimistic end of the band.

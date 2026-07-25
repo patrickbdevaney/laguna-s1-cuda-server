@@ -187,5 +187,141 @@
     "head_dim": 128,
     "sliding_window": 512
   },
-  "seq_len": 54
+  "seq_len": 54,
+  "g5_q_full": {
+    "shape": [
+      24,
+      6144
+    ],
+    "dtype": "torch.float32",
+    "note": "queries [S,48*128] fp32",
+    "bytes": 589824
+  },
+  "g5_k_full": {
+    "shape": [
+      24,
+      1024
+    ],
+    "dtype": "torch.float32",
+    "note": "keys pre-quant fp32",
+    "bytes": 98304
+  },
+  "g5_v_full": {
+    "shape": [
+      24,
+      1024
+    ],
+    "dtype": "torch.float32",
+    "note": "values pre-quant fp32",
+    "bytes": 98304
+  },
+  "g5_out_full": {
+    "shape": [
+      24,
+      6144
+    ],
+    "dtype": "torch.float32",
+    "note": "expected attention out fp32",
+    "bytes": 589824
+  },
+  "g5_full": {
+    "nh": 48,
+    "nkv": 8,
+    "hd": 128,
+    "G": 6,
+    "window": 0,
+    "S": 24,
+    "k_scale": 0.031982421875,
+    "v_scale": 0.00119781494140625
+  },
+  "g5_q_slide": {
+    "shape": [
+      24,
+      9216
+    ],
+    "dtype": "torch.float32",
+    "note": "queries [S,72*128] fp32",
+    "bytes": 884736
+  },
+  "g5_k_slide": {
+    "shape": [
+      24,
+      1024
+    ],
+    "dtype": "torch.float32",
+    "note": "keys pre-quant fp32",
+    "bytes": 98304
+  },
+  "g5_v_slide": {
+    "shape": [
+      24,
+      1024
+    ],
+    "dtype": "torch.float32",
+    "note": "values pre-quant fp32",
+    "bytes": 98304
+  },
+  "g5_out_slide": {
+    "shape": [
+      24,
+      9216
+    ],
+    "dtype": "torch.float32",
+    "note": "expected attention out fp32",
+    "bytes": 884736
+  },
+  "g5_slide": {
+    "nh": 72,
+    "nkv": 8,
+    "hd": 128,
+    "G": 9,
+    "window": 512,
+    "S": 24,
+    "k_scale": 0.0174560546875,
+    "v_scale": 0.0017852783203125
+  },
+  "g6_x": {
+    "shape": [
+      8,
+      3072
+    ],
+    "dtype": "torch.float32",
+    "note": "bf16-rounded hidden [8,3072] fp32",
+    "bytes": 98304
+  },
+  "g6_sel": {
+    "shape": [
+      8,
+      10
+    ],
+    "dtype": "torch.int32",
+    "note": "top-10 expert ids [8,10] i32",
+    "bytes": 320
+  },
+  "g6_wts": {
+    "shape": [
+      8,
+      10
+    ],
+    "dtype": "torch.float32",
+    "note": "normalised routing weights [8,10] fp32",
+    "bytes": 320
+  },
+  "g6_out": {
+    "shape": [
+      8,
+      3072
+    ],
+    "dtype": "torch.float32",
+    "note": "expected routed-expert output (x2.5 scaling) [8,3072] fp32",
+    "bytes": 98304
+  },
+  "g6": {
+    "layer": 1,
+    "rows": 8,
+    "E": 256,
+    "topk": 10,
+    "MI": 1024,
+    "scaling": 2.5
+  }
 }

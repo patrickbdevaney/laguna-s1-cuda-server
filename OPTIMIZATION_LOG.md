@@ -58,6 +58,8 @@ back-to-back A/B/A.
 | 5 | MoE E4M3 scale rows staged in shared memory | 9.34 | 9.17 | **LOST, reverted** |
 | 6 | MoE token loop specialised TM=1 at decode (registers 127→50 / 80→40) | 9.35 | **9.73** | **WON +4.1 %** |
 | 7 | **Offline expert repack + thread-per-output MoE** | 9.71 | **16.57** | **WON +70.6 %** |
+| 8 | Same repack applied to the BF16 attention/dense GEMMs | 16.57 | 11.14 | **LOST −33 %, reverted** |
+| 9 | GEMM M-loop specialised at M=1 (registers 59→32) | 16.57 | 16.59 | NEUTRAL (kept: register headroom) |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
@@ -128,17 +130,55 @@ flight — that is the *point*, and it pays for itself 17×.
 **This also finally makes the repack cache worth building** (`OPTIMIZATION_LOG` L1 note): the
 repack is now a real host-side transform over 63.9 GB, not a memcpy.
 
+### #8 — the same repack on BF16 GEMMs LOST 33 %, and the reason is the useful part
+
+Having won 70 % on the MoE, applying the identical transform to the BF16 attention and dense
+weights looked like free money. It was correct (greedy still 8/8) and **33 % slower**.
+
+The repack trades **warp count for iterations per warp**. That is a win only when the
+row-major form is *iteration*-starved, and a loss when it is *warp*-starved:
+
+| GEMM | N | row-major warps | row-major iters/warp | repacked warps | repacked iters/warp |
+|---|---:|---:|---:|---:|---:|
+| MoE gate/up (per expert) | 1024 | 1024 | **3** | 32 | 96 |
+| `q_proj` sliding | 9216 | 9216 | 12 | 288 | 384 |
+| `k_proj` / shared expert | 1024 | 1024 | 12 | **32** | 384 |
+| router | 256 | 256 | 12 | **8** | 384 |
+
+The MoE at 3 iterations had no memory-level parallelism inside a warp and *needed* the trade.
+The BF16 GEMMs already had 12 iterations — enough to pipeline — and giving up 32× of their
+warps starved the machine, catastrophically so for the small-N ones (`k_proj`, `v_proj`,
+shared expert, router all drop to 8–32 warps for the entire GPU).
+
+**Rule extracted: repack when iterations-per-warp < ~8; keep row-major when N/32 would leave
+fewer than ~500 warps.** A hybrid (repacked *and* split over k, with a combine pass) could in
+principle get both, and is the obvious next experiment if the attention GEMMs stay hot.
+
+### #9 — GEMM M-loop specialisation (NEUTRAL, kept)
+Same trick that won on the MoE token loop: templating `MAXM` and dispatching `MM=1` at decode
+cut registers 59 → 32. Measured 16.57 → 16.59, i.e. nothing. The GEMM is evidently not
+register-limited. Kept only because the register headroom is free and may matter once CUDA
+graphs and the verify shapes raise pressure; **logged as neutral so it is not mistaken for a
+win.**
+
 ### Where the time actually goes (per-category profile, `LG_PROF=1`)
 
 | category | share of step |
 |---|---:|
-| **routed-expert MoE** | **81.5 %** ← *measured before #7; re-profile* |
-| attention q/k/v/o GEMMs | 11.6 % |
-| shared expert + dense | 2.7 % |
-| attention core | 1.3 % |
-| lm_head | 1.1 % |
-| router | 0.9 % |
-| norms + casts | 0.9 % |
+| category | before #7 | **after #7** |
+|---|---:|---:|
+| routed-expert MoE | 81.5 % | **37.1 %** |
+| attention q/k/v/o GEMMs | 11.6 % | **36.1 %** |
+| shared expert + dense | 2.7 % | 9.9 % |
+| attention core | 1.3 % | 5.3 % |
+| norms + casts | 0.9 % | 4.1 % |
+| router | 0.9 % | 4.0 % |
+| lm_head | 1.1 % | 3.5 % |
+
+The bottleneck moved, as it always does. MoE and the BF16 attention GEMMs are now roughly
+equal, so neither is a clear single target — which is itself the signal that the easy
+structural wins are spent and the next real multiplier is speculation (Gate D1), not another
+kernel rewrite.
 
 The MoE is the bottleneck by a wide margin and the next arc belongs to it. Note this
 *contradicts* `RESCOPE.md` §2's byte-based priority order, which put the attention path first

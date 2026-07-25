@@ -61,7 +61,7 @@ extern "C" void dequant_nvfp4(float* out, const uint8_t* packed, const uint8_t* 
 // ---------------------------------------------------------------------------------------
 #define MAXM 8
 
-template <int WARPS>
+template <int WARPS, int MM>
 __global__ __launch_bounds__(WARPS * 32)
 void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
                  const uint16_t* __restrict__ xb, int M, int N, int K) {
@@ -69,12 +69,12 @@ void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
     const int warp = threadIdx.x >> 5;
     int n = blockIdx.x * WARPS + warp;
     if (n >= N) return;
-    const int m0 = blockIdx.y * MAXM;
-    const int mn = min(MAXM, M - m0);
+    const int m0 = blockIdx.y * MM;
+    const int mn = min(MM, M - m0);
 
-    float acc[MAXM];
+    float acc[MM];
     #pragma unroll
-    for (int m = 0; m < MAXM; ++m) acc[m] = 0.f;
+    for (int m = 0; m < MM; ++m) acc[m] = 0.f;
 
     const uint4* wrow = (const uint4*)(W + (long)n * K);
     const int K8 = K / 8;                          // 8 bf16 per uint4
@@ -82,7 +82,7 @@ void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
         uint4 wv = __ldcs(wrow + c);
         const uint16_t* wh = (const uint16_t*)&wv;
         #pragma unroll
-        for (int m = 0; m < MAXM; ++m) {
+        for (int m = 0; m < MM; ++m) {
             if (m >= mn) break;
             const uint4 xv = *(const uint4*)(xb + (long)(m0 + m) * K + c * 8);
             const uint16_t* xh = (const uint16_t*)&xv;
@@ -93,7 +93,7 @@ void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
         }
     }
     #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
+    for (int m = 0; m < MM; ++m) {
         if (m >= mn) break;
         float v = warp_sum(acc[m]);
         if (lane == 0) out[(long)(m0 + m) * N + n] = v;
@@ -102,8 +102,12 @@ void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
 
 extern "C" void gemm_bf16(float* out, const uint16_t* W, const uint16_t* xb,
                           int M, int N, int K, cudaStream_t st) {
+    // Specialise the M-loop the way the MoE token loop was specialised (OPTIMIZATION_LOG #6):
+    // at decode M=1, and unrolling an 8-wide loop that only ever runs once burns registers
+    // and issue slots for nothing.
+    if (M == 1) { k_gemm_bf16<1, 1><<<dim3(N, 1), 32, 0, st>>>(out, W, xb, M, N, K); return; }
     dim3 g(N, (M + MAXM - 1) / MAXM);
-    k_gemm_bf16<1><<<g, 32, 0, st>>>(out, W, xb, M, N, K);
+    k_gemm_bf16<1, MAXM><<<g, 32, 0, st>>>(out, W, xb, M, N, K);
 }
 
 // fp32 activations -> bf16 staging (the GEMM's x input)

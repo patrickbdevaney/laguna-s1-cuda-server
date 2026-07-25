@@ -11,14 +11,14 @@ Reference, **read-only**: `~/gemma-cuda-hybrid`.
 | **R1 — roofline** | ✅ **PASS** | `ROOFLINE.md`, generator `tools/roofline.py`, raw `docs/roofline_ctx*.txt` |
 | **A1 — oracle + arch delta** | ✅ **PASS** | `MODEL_INVENTORY.md`, `ARCH_DELTA.md`, `oracle/`, golden tensors in `docs/golden/` → `LOOP_LOG.md` |
 | L1 — loader | ⏳ next | |
-| B1 — kernels G1–G9 | 🟡 **G1–G8 PASS** | `gate_kernels` 13/13; `gate_forward` 8/8 greedy exact; **16.57 tok/s decode / 166.5 GB/s / 73 % of ceiling**; G9 CUDA graph pending |
+| B1 — kernels G1–G9 | 🟡 **G1–G8 PASS** | `gate_kernels` 13/13; `gate_forward` 8/8 greedy exact; **16.59 tok/s decode / 166.7 GB/s / 73 % of ceiling**; G9 CUDA graph pending |
 | D1 — DFlash + k-sweep | ▫ | |
 | S1 — server | ▫ | |
 
 ## Current state
 
-Working pure-CUDA Laguna forward pass: **greedy-exact vs the oracle**, **16.57 tok/s median**
-decode at ctx 4096 (166.5 GB/s effective, **73 % of the 227 GB/s ceiling**), prefill 55.0 tok/s.
+Working pure-CUDA Laguna forward pass: **greedy-exact vs the oracle**, **16.59 tok/s median**
+decode at ctx 4096 (166.7 GB/s effective, **73 % of the 227 GB/s ceiling**), prefill 55.0 tok/s.
 For reference, poolside measured **13–14 tok/s** for this model on a DGX Spark (same bandwidth
 class) under vLLM — so the autoregressive path is already ahead of that, before speculation.
 Everything from the checkpoint on disk through to logits is C++/CUDA; Python exists only in
@@ -31,11 +31,9 @@ weight-resident MoE, and the full 48-layer forward.
 
 ## Immediate next actions (in priority order)
 
-1. **MoE grouped GEMM** — 81.5 % of the decode step, running at ~30 GB/s against a 227 GB/s
-   ceiling. This is where the next 2× lives. Untried: per-warp register prefetch of the 3
-   weight loads (they are currently serialised by the c-loop), multiple output rows per warp,
-   fusing the invert glue. Note gemma's ILP levers LOST on its MoE — check the register
-   budget before repeating them.
+1. **Gate D1 — DFlash.** Now the biggest remaining multiplier (1.6–1.9×) and a deliverable in
+   its own right. The kernel arc has spent its easy structural wins: MoE and the BF16
+   attention GEMMs are now ~37 % each, so no single kernel dominates.
 2. **G9 — whole-step CUDA graph.** ~1665 launches/step at 4.15 µs each.
 3. **Gate D1 — DFlash.** Load the 6-layer draft in BF16 (never quantize it), share the
    target's embed + `lm_head`, implement propose/verify with lossless sampling, then run the

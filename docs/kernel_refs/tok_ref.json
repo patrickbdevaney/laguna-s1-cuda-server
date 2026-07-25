@@ -1,0 +1,327 @@
+[
+ {
+  "text": "Hello, world!",
+  "ids": [
+   6352,
+   81,
+   3078,
+   70
+  ],
+  "decoded": "Hello, world!",
+  "roundtrip": true
+ },
+ {
+  "text": "def fib(n):\n    return n if n < 2 else fib(n-1)+fib(n-2)\n",
+  "ids": [
+   1172,
+   17925,
+   1915,
+   1117,
+   268,
+   341,
+   658,
+   376,
+   558,
+   376,
+   458,
+   290,
+   87,
+   1304,
+   17925,
+   1915,
+   82,
+   86,
+   6581,
+   51543,
+   1915,
+   82,
+   87,
+   78,
+   268
+  ],
+  "decoded": "def fib(n):\n    return n if n < 2 else fib(n-1)+fib(n-2)\n",
+  "roundtrip": true
+ },
+ {
+  "text": "  spaces   and\ttabs",
+  "ids": [
+   290,
+   6840,
+   328,
+   372,
+   9758,
+   3793
+  ],
+  "decoded": "  spaces   and\ttabs",
+  "roundtrip": true
+ },
+ {
+  "text": "\n\n\nleading newlines",
+  "ids": [
+   1434,
+   20454,
+   48299
+  ],
+  "decoded": "\n\n\nleading newlines",
+  "roundtrip": true
+ },
+ {
+  "text": "trailing newlines\n\n\n",
+  "ids": [
+   529,
+   12259,
+   48299,
+   1434
+  ],
+  "decoded": "trailing newlines\n\n\n",
+  "roundtrip": true
+ },
+ {
+  "text": "numbers 1234567890 and 3.14159",
+  "ids": [
+   18730,
+   290,
+   86,
+   87,
+   88,
+   89,
+   90,
+   91,
+   92,
+   93,
+   94,
+   85,
+   372,
+   290,
+   88,
+   83,
+   86,
+   89,
+   86,
+   90,
+   94
+  ],
+  "decoded": "numbers 1234567890 and 3.14159",
+  "roundtrip": true
+ },
+ {
+  "text": "it's don't we're they've I'm you'll he'd",
+  "ids": [
+   342,
+   604,
+   1691,
+   861,
+   646,
+   2264,
+   948,
+   2339,
+   397,
+   1919,
+   453,
+   3091,
+   637,
+   4186
+  ],
+  "decoded": "it's don't we're they've I'm you'll he'd",
+  "roundtrip": true
+ },
+ {
+  "text": "IT'S DON'T WE'RE",
+  "ids": [
+   1418,
+   27801,
+   62787,
+   28958,
+   42920,
+   76,
+   1113
+  ],
+  "decoded": "IT'S DON'T WE'RE",
+  "roundtrip": true
+ },
+ {
+  "text": "unicode: café naïve 日本語 emoji 🚀🔥 ",
+  "ids": [
+   38736,
+   95,
+   57493,
+   2097,
+   12627,
+   42488,
+   602,
+   290,
+   76211,
+   53336,
+   42163,
+   11010,
+   91202,
+   82150,
+   168,
+   290
+  ],
+  "decoded": "unicode: café naïve 日本語 emoji 🚀🔥 ",
+  "roundtrip": true
+ },
+ {
+  "text": "punctuation!!! ??? ...--- ***",
+  "ids": [
+   149,
+   55365,
+   14906,
+   44612,
+   2771,
+   1327,
+   18123
+  ],
+  "decoded": "punctuation!!! ??? ...--- ***",
+  "roundtrip": true
+ },
+ {
+  "text": "〈|EOS|〉<system>You are helpful.</system>\n<user>hi</user>\n<assistant><think>",
+  "ids": [
+   2,
+   97,
+   6453,
+   55620,
+   515,
+   6408,
+   4187,
+   6453,
+   99,
+   268,
+   97,
+   1437,
+   99,
+   9571,
+   532,
+   1437,
+   99,
+   268,
+   23,
+   18
+  ],
+  "decoded": "〈|EOS|〉<system>You are helpful.</system>\n<user>hi</user>\n<assistant><think>",
+  "roundtrip": true
+ },
+ {
+  "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+  "ids": [
+   25,
+   620,
+   90648,
+   97,
+   1143,
+   5432,
+   99,
+   15756,
+   532,
+   1143,
+   5432,
+   1170,
+   1143,
+   5518,
+   99,
+   71070,
+   532,
+   1143,
+   5518,
+   99,
+   26
+  ],
+  "decoded": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+  "roundtrip": true
+ },
+ {
+  "text": "mixed123abc456 CamelCaseWord snake_case_word",
+  "ids": [
+   52171,
+   86,
+   87,
+   88,
+   9873,
+   89,
+   90,
+   91,
+   39973,
+   4971,
+   8435,
+   34651,
+   26308,
+   14673
+  ],
+  "decoded": "mixed123abc456 CamelCaseWord snake_case_word",
+  "roundtrip": true
+ },
+ {
+  "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "ids": [
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   66133,
+   30624
+  ],
+  "decoded": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "roundtrip": true
+ },
+ {
+  "text": "\t\t  \n  \t",
+  "ids": [
+   12972,
+   268,
+   8581
+  ],
+  "decoded": "\t\t  \n  \t",
+  "roundtrip": true
+ },
+ {
+  "text": "x  ",
+  "ids": [
+   157,
+   328
+  ],
+  "decoded": "x  ",
+  "roundtrip": true
+ },
+ {
+  "text": "Ω≈ç√∫˜µ≤≥÷",
+  "ids": [
+   30221,
+   85084,
+   9596,
+   29046,
+   62454,
+   51999,
+   34063,
+   39267,
+   60927,
+   49523
+  ],
+  "decoded": "Ω≈ç√∫˜µ≤≥÷",
+  "roundtrip": true
+ },
+ {
+  "text": "```python\nprint('hi')\n```",
+  "ids": [
+   605,
+   2825,
+   268,
+   1533,
+   819,
+   9571,
+   1282,
+   268,
+   605
+  ],
+  "decoded": "```python\nprint('hi')\n```",
+  "roundtrip": true
+ }
+]

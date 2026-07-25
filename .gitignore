@@ -1,0 +1,6 @@
+models/
+build/
+*.safetensors
+*.o
+*.so
+cache/

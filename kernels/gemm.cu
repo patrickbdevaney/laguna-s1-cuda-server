@@ -182,3 +182,94 @@ extern "C" void gemm_fp4(float* out, const uint8_t* packed, const uint8_t* scale
     dim3 g(N, (M + MAXM - 1) / MAXM);
     k_gemm_fp4<1><<<g, 32, 0, st>>>(out, packed, scale, inv_gs, xb, M, N, K, G);
 }
+
+// ---------------------------------------------------------------------------------------
+// FP8 (e4m3) weight-only linear with a PER-OUTPUT-ROW scale.
+//   out[m][n] = scale[n] * Σ_k e4m3(q[n][k]) · x[m][k]
+// The row scale factors out of the dot product entirely, so it is applied ONCE at the end —
+// the inner loop is the bf16 loop with half the bytes and no extra math.
+//
+// Why per-row and not per-tensor: weight-only INT8/FP8 with per-channel scales is measured
+// lossless (llama.cpp Q8_0: ppl 7.32 -> 7.33), and per-row costs 4 bytes per output channel
+// (37 KB on the largest attention tensor) against 28 MB saved.
+// RESEARCH_FINDINGS.md: quantizing attention to 4 bits costs ~2.3 pts of recovery on a large
+// MoE; at 8 bits it is near-lossless. This is the stage-1 lever and deliberately not stage 3.
+// ---------------------------------------------------------------------------------------
+__global__ void k_quant_fp8_rows(uint8_t* __restrict__ q, float* __restrict__ scale,
+                                 const uint16_t* __restrict__ w, int N, int K) {
+    int n = blockIdx.x;
+    if (n >= N) return;
+    const uint16_t* row = w + (long)n * K;
+    float amax = 0.f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) amax = fmaxf(amax, fabsf(bf2f(row[k])));
+    amax = warp_max(amax);
+    __shared__ float red[32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) red[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < (blockDim.x + 31) / 32) ? red[lane] : 0.f;
+        v = warp_max(v);
+        if (lane == 0) red[0] = (v > 0.f) ? v / 448.f : 1.f;   // 448 = e4m3 max finite
+    }
+    __syncthreads();
+    float s = red[0], inv = 1.f / s;
+    if (threadIdx.x == 0) scale[n] = s;
+    for (int k = threadIdx.x; k < K; k += blockDim.x)
+        q[(long)n * K + k] = f2e4m3(bf2f(row[k]) * inv);
+}
+extern "C" void quant_fp8_rows(uint8_t* q, float* scale, const uint16_t* w, int N, int K,
+                               cudaStream_t st) {
+    k_quant_fp8_rows<<<N, 256, 0, st>>>(q, scale, w, N, K);
+}
+
+template <int WARPS, int MM>
+__global__ __launch_bounds__(WARPS * 32)
+void k_gemm_fp8(float* __restrict__ out, const uint8_t* __restrict__ W,
+                const float* __restrict__ rs, const uint16_t* __restrict__ xb,
+                int M, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    int n = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    if (n >= N) return;
+    const int m0 = blockIdx.y * MM;
+    const int mn = min(MM, M - m0);
+
+    float acc[MM];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) acc[m] = 0.f;
+
+    // 8-byte (uint2) loads, NOT 16. One byte per weight means a 16-byte load covers 16
+    // weights, which at K=3072 leaves only K/16/32 = 6 iterations per lane — half what the
+    // BF16 kernel gets, and squarely in the latency-bound regime. Measured: 16-byte loads
+    // gave 125 GB/s on this path against the BF16 kernel's 256. uint2 restores 12
+    // iterations per lane and keeps 32x8 = 256 contiguous bytes per warp step.
+    const uint2* wrow = (const uint2*)(W + (long)n * K);
+    const int C = K / 8;                                   // 8 fp8 per uint2
+    for (int c = lane; c < C; c += 32) {
+        uint2 wv = __ldcs(wrow + c);
+        const uint8_t* wb = (const uint8_t*)&wv;
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) {
+            if (m >= mn) break;
+            const uint16_t* xh = xb + (long)(m0 + m) * K + c * 8;
+            float s = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) s = fmaf(e4m3f(wb[j]), bf2f(xh[j]), s);
+            acc[m] += s;
+        }
+    }
+    const float sc = rs[n];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) {
+        if (m >= mn) break;
+        float v = warp_sum(acc[m]);
+        if (lane == 0) out[(long)(m0 + m) * N + n] = v * sc;   // row scale applied once
+    }
+}
+
+extern "C" void gemm_fp8(float* out, const uint8_t* W, const float* rs, const uint16_t* xb,
+                         int M, int N, int K, cudaStream_t st) {
+    if (M == 1) { k_gemm_fp8<1, 1><<<dim3(N, 1), 32, 0, st>>>(out, W, rs, xb, M, N, K); return; }
+    dim3 g(N, (M + MAXM - 1) / MAXM);
+    k_gemm_fp8<1, MAXM><<<g, 32, 0, st>>>(out, W, rs, xb, M, N, K);
+}

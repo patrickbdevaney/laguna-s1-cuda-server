@@ -37,6 +37,8 @@
 #include "laguna_config.h"
 #include "third_party/json.hpp"
 
+extern "C" void quant_fp8_rows(uint8_t*, float*, const uint16_t*, int, int, cudaStream_t);
+
 namespace laguna {
 
 // ---------------------------------------------------------------------------------------
@@ -103,6 +105,11 @@ struct LayerW {
     //   down   packed [E][H][MI/2]     scale [E][H][MI/group]
     const uint8_t *e_gate_p = nullptr, *e_up_p = nullptr, *e_down_p = nullptr;
     const uint8_t *e_gate_s = nullptr, *e_up_s = nullptr, *e_down_s = nullptr;
+    // FP8 (e4m3) attention weights + per-output-row scales, when LG_FP8ATTN is on.
+    // RESEARCH_FINDINGS.md stage 1: near-lossless, 1.39x on B_tok, no calibration needed.
+    const uint8_t *q8 = nullptr, *k8 = nullptr, *v8 = nullptr, *o8 = nullptr, *g8 = nullptr;
+    const float *q8s = nullptr, *k8s = nullptr, *v8s = nullptr, *o8s = nullptr, *g8s = nullptr;
+
     // 1/weight_global_scale, PRE-INVERTED at load. LOOP_LOG A1.2: the checkpoint stores a
     // reciprocal (2688/amax) so dequant must divide; inverting once here lets every kernel
     // multiply instead.
@@ -111,6 +118,7 @@ struct LayerW {
 
 struct Weights {
     Config cfg;
+    bool fp8_attn = false;
     void*  arena = nullptr;
     size_t arena_bytes = 0;
     const uint16_t *embed = nullptr, *lm_head = nullptr, *final_norm = nullptr;
@@ -177,14 +185,15 @@ private:
 // ---------------------------------------------------------------- loader
 class Loader {
 public:
-    Loader(std::string model_dir, Config cfg)
-        : dir_(std::move(model_dir)), cfg_(std::move(cfg)) {}
+    Loader(std::string model_dir, Config cfg, bool fp8_attn = false)
+        : dir_(std::move(model_dir)), cfg_(std::move(cfg)), fp8_attn_(fp8_attn) {}
 
     // cache_path: if present and matching, take the fast path; otherwise cold-load and write
     // it. Pass "" to disable the cache.
     Weights load(const std::string& cache_path = "", bool verbose = true) {
         double t0 = wall_now();
         W_.cfg = cfg_;
+        W_.fp8_attn = fp8_attn_;
         W_.L.resize(cfg_.n_layers);
         read_index();
         reserve();
@@ -213,7 +222,8 @@ private:
     // rp: 0 = plain copy, 1 = repack packed codes, 2 = repack e4m3 scales.
     // rows/K describe the ORIGINAL [rows][K] logical shape of that projection.
     struct Slot { void* dst; size_t bytes; const char* dtype; float* host_scalar;
-                  int rp = 0, rows = 0, K = 0; };
+                  int rp = 0, rows = 0, K = 0;
+                  bool q8 = false; void* scale = nullptr; };
 
     template <class T>
     void reserve1(const T*& field, size_t bytes) {
@@ -241,9 +251,19 @@ private:
         for (int L = 0; L < c.n_layers; ++L) {
             auto& w = W_.L[L];
             size_t qd = c.q_dim(L), kvd = (size_t)c.n_kv_heads * c.head_dim;
-            reserve1(w.q, qd * H * 2);   reserve1(w.k, kvd * H * 2);
-            reserve1(w.v, kvd * H * 2);  reserve1(w.o, H * qd * 2);
-            reserve1(w.g, (size_t)c.heads[L] * H * 2);
+            if (fp8_attn_) {
+                // one byte per weight plus one fp32 scale per output row
+                reserve1(w.q8, qd * H);      reserve1(w.q8s, qd * 4);
+                reserve1(w.k8, kvd * H);     reserve1(w.k8s, kvd * 4);
+                reserve1(w.v8, kvd * H);     reserve1(w.v8s, kvd * 4);
+                reserve1(w.o8, H * qd);      reserve1(w.o8s, H * 4);
+                reserve1(w.g8, (size_t)c.heads[L] * H);
+                reserve1(w.g8s, (size_t)c.heads[L] * 4);
+            } else {
+                reserve1(w.q, qd * H * 2);   reserve1(w.k, kvd * H * 2);
+                reserve1(w.v, kvd * H * 2);  reserve1(w.o, H * qd * 2);
+                reserve1(w.g, (size_t)c.heads[L] * H * 2);
+            }
             reserve1(w.in_ln, H * 2);            reserve1(w.post_ln, H * 2);
             reserve1(w.q_norm, c.head_dim * 2);  reserve1(w.k_norm, c.head_dim * 2);
             if (c.is_dense(L)) {
@@ -278,6 +298,12 @@ private:
     void put_scalar(const std::string& n, float* h) {
         slots_[n] = Slot{nullptr, 2, "BF16", h, 0, 0, 0};
     }
+    // BF16 in the checkpoint -> fp8 e4m3 + per-row fp32 scale in the arena
+    void put_q8(const std::string& n, const uint8_t* dst, const float* sc, int rows, int K) {
+        Slot s{(void*)dst, (size_t)rows * K * 2, "BF16", nullptr, 0, rows, K};
+        s.q8 = true; s.scale = (void*)sc;
+        slots_[n] = s;
+    }
 
     void plan() {
         const auto& c = cfg_;
@@ -290,11 +316,19 @@ private:
             auto& w = W_.L[L];
             std::string p = "model.layers." + std::to_string(L) + ".";
             size_t qd = c.q_dim(L), kvd = (size_t)c.n_kv_heads * c.head_dim;
-            put(p + "self_attn.q_proj.weight", w.q, qd * H * 2, "BF16");
-            put(p + "self_attn.k_proj.weight", w.k, kvd * H * 2, "BF16");
-            put(p + "self_attn.v_proj.weight", w.v, kvd * H * 2, "BF16");
-            put(p + "self_attn.o_proj.weight", w.o, H * qd * 2, "BF16");
-            put(p + "self_attn.g_proj.weight", w.g, (size_t)c.heads[L] * H * 2, "BF16");
+            if (fp8_attn_) {
+                put_q8(p + "self_attn.q_proj.weight", w.q8, w.q8s, (int)qd,  (int)H);
+                put_q8(p + "self_attn.k_proj.weight", w.k8, w.k8s, (int)kvd, (int)H);
+                put_q8(p + "self_attn.v_proj.weight", w.v8, w.v8s, (int)kvd, (int)H);
+                put_q8(p + "self_attn.o_proj.weight", w.o8, w.o8s, (int)H,   (int)qd);
+                put_q8(p + "self_attn.g_proj.weight", w.g8, w.g8s, (int)c.heads[L], (int)H);
+            } else {
+                put(p + "self_attn.q_proj.weight", w.q, qd * H * 2, "BF16");
+                put(p + "self_attn.k_proj.weight", w.k, kvd * H * 2, "BF16");
+                put(p + "self_attn.v_proj.weight", w.v, kvd * H * 2, "BF16");
+                put(p + "self_attn.o_proj.weight", w.o, H * qd * 2, "BF16");
+                put(p + "self_attn.g_proj.weight", w.g, (size_t)c.heads[L] * H * 2, "BF16");
+            }
             put(p + "input_layernorm.weight",  w.in_ln, H * 2, "BF16");
             put(p + "post_attention_layernorm.weight", w.post_ln, H * 2, "BF16");
             put(p + "self_attn.q_norm.weight", w.q_norm, c.head_dim * 2, "BF16");
@@ -375,6 +409,19 @@ private:
                     *s.host_scalar = fv; filled_.insert(name); ++done; continue;
                 }
                 if (v.n != s.bytes) throw std::runtime_error("size mismatch " + name);
+                if (s.q8) {
+                    size_t need = (size_t)s.rows * s.K * 2;
+                    if (need > q8_scratch_bytes_) {
+                        cudaFree(q8_scratch_);
+                        CUDA_CHECK(cudaMalloc(&q8_scratch_, need));
+                        q8_scratch_bytes_ = need;
+                    }
+                    CUDA_CHECK(cudaMemcpy(q8_scratch_, v.p, need, cudaMemcpyHostToDevice));
+                    quant_fp8_rows((uint8_t*)s.dst, (float*)s.scale,
+                                   (const uint16_t*)q8_scratch_, s.rows, s.K, 0);
+                    CUDA_CHECK(cudaGetLastError());
+                    filled_.insert(name); ++done; continue;
+                }
                 if (s.rp) {
                     if (rp_buf_.size() < s.bytes) rp_buf_.resize(s.bytes);
                     if (s.rp == 1) repack_packed(rp_buf_.data(), (const uint8_t*)v.p, s.rows, s.K);
@@ -490,6 +537,8 @@ private:
     std::set<std::string> filled_;
     std::vector<Fix> fixups_;
     std::vector<uint8_t> rp_buf_;
+    void* q8_scratch_ = nullptr; size_t q8_scratch_bytes_ = 0;
+    bool fp8_attn_ = false;
     size_t arena_bytes_ = 0, unmapped_ = 0;
 };
 

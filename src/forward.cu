@@ -22,6 +22,7 @@
 extern "C" {
 void dequant_nvfp4(float*, const uint8_t*, const uint8_t*, float, int, int, int, cudaStream_t);
 void gemm_bf16(float*, const uint16_t*, const uint16_t*, int, int, int, cudaStream_t);
+void gemm_fp8(float*, const uint8_t*, const float*, const uint16_t*, int, int, int, cudaStream_t);
 void gemm_fp4(float*, const uint8_t*, const uint8_t*, float, const uint16_t*, int, int, int, int, cudaStream_t);
 void f32_to_bf16(uint16_t*, const float*, long, cudaStream_t);
 void rmsnorm(float*, const float*, const uint16_t*, int, int, float, cudaStream_t);
@@ -47,6 +48,10 @@ void moe_gateup_rp(float*, const uint8_t*, const uint8_t*, const float*, const u
 void moe_down_rp(float*, const uint8_t*, const uint8_t*, const float*, const uint16_t*, const int*,
               const int*, const int*, const int*, const int*, int, int, int, int, int, cudaStream_t);
 void moe_finalize(float*, const float*, const float*, const int*, int, int, int, float, cudaStream_t);
+void moe_gateup_split(float*, float*, uint16_t*, const uint8_t*, const uint8_t*, const float*,
+                      const uint8_t*, const uint8_t*, const float*, const uint16_t*, const int*,
+                      const int*, const int*, const int*, const int*, int, int, int, int, int,
+                      int, long, cudaStream_t);
 }
 
 namespace laguna {
@@ -59,11 +64,18 @@ struct Session {
     int pos = 0;
     size_t bytes = 0;
 
-    void alloc(const Config& c, int ctx) {
+    void alloc(const Config& c, int ctx, int max_tok = 64) {
         Kc.resize(c.n_layers); Vc.resize(c.n_layers); cap.resize(c.n_layers);
         size_t per = (size_t)c.n_kv_heads * c.head_dim;
         for (int L = 0; L < c.n_layers; ++L) {
-            cap[L] = c.is_sliding(L) ? c.sliding_window : ctx;
+            // CORRECTNESS: the ring must be LARGER than the window. With cap == window the
+            // read arc [p-window+1, p] covers all `cap` slots, so any token written later in
+            // the SAME batch aliases into it: at base=1000, M=64, query m=0 reads j=489 and
+            // gets position 1001's K/V. 63 of 64 tokens collide. Decode (M=1) is immune
+            // because 512 consecutive positions map to 512 distinct slots; this only bites
+            // multi-token forwards (prefill, and speculative verify) past position `window`.
+            // cap = window + MAXTOK makes the read arc and the look-ahead arc disjoint.
+            cap[L] = c.is_sliding(L) ? (c.sliding_window + max_tok) : ctx;
             size_t n = per * cap[L];
             CUDA_CHECK(cudaMalloc(&Kc[L], n));
             CUDA_CHECK(cudaMalloc(&Vc[L], n));
@@ -86,6 +98,8 @@ struct Engine {
     int *sel, *ecount, *eoff, *elist, *cursor, *active, *nactive;
     float *cos_f, *sin_f, *cos_s, *sin_s, *inv_f, *inv_s;
     float *pacc, *pml;                 // split-attention partials
+    float *moe_u = nullptr;            // second gate/up accumulator for the split-warp path
+    bool  moe_split = false;   // LOST end-to-end: see OPTIMIZATION_LOG #14
     int   *dbase = nullptr;            // decode position, device-side (graph-safe)
     static const int MAXSPLIT = 32;
 
@@ -121,6 +135,7 @@ struct Engine {
         A((void**)&mlp_b, (size_t)MAXTOK * c.intermediate * 4);
         A((void**)&moe_h, (size_t)MAXTOK * TK * MI * 4);
         A((void**)&moe_hb,(size_t)MAXTOK * TK * MI * 2);
+        A((void**)&moe_u, (size_t)MAXTOK * TK * MI * 4);
         A((void**)&dpart, (size_t)MAXTOK * TK * H * 4);
         A((void**)&rlogit,(size_t)MAXTOK * E * 4);
         A((void**)&rwts,  (size_t)MAXTOK * TK * 4);
@@ -198,10 +213,17 @@ struct Engine {
             mark();
             add_rms_cast(hb, h, nullptr, w.in_ln, M, H, (float)c.rms_eps, 0, st);
             acc(1); mark();
-            gemm_bf16(q,  w.q, hb, M, qd,  H, st);
-            gemm_bf16(kk, w.k, hb, M, kvd, H, st);
-            gemm_bf16(vv, w.v, hb, M, kvd, H, st);
-            gemm_bf16(gp, w.g, hb, M, nh,  H, st);        // gate from the NORMED input
+            if (W.fp8_attn) {
+                gemm_fp8(q,  w.q8, w.q8s, hb, M, qd,  H, st);
+                gemm_fp8(kk, w.k8, w.k8s, hb, M, kvd, H, st);
+                gemm_fp8(vv, w.v8, w.v8s, hb, M, kvd, H, st);
+                gemm_fp8(gp, w.g8, w.g8s, hb, M, nh,  H, st);   // gate from the NORMED input
+            } else {
+                gemm_bf16(q,  w.q, hb, M, qd,  H, st);
+                gemm_bf16(kk, w.k, hb, M, kvd, H, st);
+                gemm_bf16(vv, w.v, hb, M, kvd, H, st);
+                gemm_bf16(gp, w.g, hb, M, nh,  H, st);
+            }
             acc(2); mark();
             rmsnorm_heads(q,  q,  w.q_norm, M, nh,          hd, (float)c.rms_eps, st);
             rmsnorm_heads(kk, kk, w.k_norm, M, c.n_kv_heads, hd, (float)c.rms_eps, st);
@@ -223,7 +245,8 @@ struct Engine {
             gate_softplus(att, gp, M, nh, hd, st);
             acc(3); mark();
             f32_to_bf16(attb, att, (long)M * qd, st);
-            gemm_bf16(hn, w.o, attb, M, H, qd, st);
+            if (W.fp8_attn) gemm_fp8(hn, w.o8, w.o8s, attb, M, H, qd, st);
+            else            gemm_bf16(hn, w.o, attb, M, H, qd, st);
             acc(2); mark();
 
             // ---- MLP / MoE.  The attention residual add is folded into this norm.
@@ -259,10 +282,21 @@ struct Engine {
                 // M=1 there are at most 10 active experts, and launching 256 x (MI/4) blocks
                 // means 96 % of them exist only to read *nactive and exit.
                 int nact = std::min(E, M * TK);
-                moe_gateup_rp(moe_h, w.e_gate_p, w.e_gate_s, w.e_gate_inv,
-                           w.e_up_p, w.e_up_s, w.e_up_inv, hb, elist, eoff, ecount,
-                           active, nactive, nact, H, MI, TK, c.nvfp4_group, (M == 1 ? 1 : 4), st);
-                f32_to_bf16(moe_hb, moe_h, (long)M * TK * MI, st);
+                if (moe_split) {
+                    // gate and up on separate warps: 320 -> 640 warps. The kernel is
+                    // warp-starved, not bandwidth-limited (measured 159.6 -> 195.6 GB/s),
+                    // because moe_intermediate 1024 is 3x smaller than hidden 3072.
+                    moe_gateup_split(moe_h, moe_u, moe_hb,
+                                     w.e_gate_p, w.e_gate_s, w.e_gate_inv,
+                                     w.e_up_p, w.e_up_s, w.e_up_inv, hb, elist, eoff, ecount,
+                                     active, nactive, nact, H, MI, TK, c.nvfp4_group,
+                                     (M == 1 ? 1 : 4), (long)M * TK * MI, st);
+                } else {
+                    moe_gateup_rp(moe_h, w.e_gate_p, w.e_gate_s, w.e_gate_inv,
+                               w.e_up_p, w.e_up_s, w.e_up_inv, hb, elist, eoff, ecount,
+                               active, nactive, nact, H, MI, TK, c.nvfp4_group, (M == 1 ? 1 : 4), st);
+                    f32_to_bf16(moe_hb, moe_h, (long)M * TK * MI, st);
+                }
                 moe_down_rp(dpart, w.e_down_p, w.e_down_s, w.e_down_inv, moe_hb, elist, eoff,
                          ecount, active, nactive, nact, H, MI, c.nvfp4_group, (M == 1 ? 1 : 4), st);
                 moe_finalize(hn, dpart, rwts, sel, M, H, TK, (float)c.routed_scaling, st);

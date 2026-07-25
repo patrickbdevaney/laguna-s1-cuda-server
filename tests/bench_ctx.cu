@@ -11,7 +11,7 @@ int main(){
     Config c=load_config(md+"/config.json");
     Loader ld(md,c); Weights W=ld.load("",false);
     Engine E; E.c=c; E.W=W; E.init(256);
-    Session S; S.alloc(c,CTX);
+    Session S; S.alloc(c,CTX,E.MAXTOK);
     printf("KV alloc %.3f GB for CTX=%d\n",S.bytes/1e9,CTX);
 
     std::vector<int> pad(256,1000);

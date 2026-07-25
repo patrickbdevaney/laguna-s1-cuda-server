@@ -22,7 +22,7 @@ int main(int argc,char**argv){
     Loader ld(md,c); Weights W = ld.load("",false);
     Engine E; E.c=c; E.W=W; E.init(std::max(64,(int)ids.size()));
     E.prof = getenv("LG_PROF")!=nullptr;
-    Session S; S.alloc(c,CTX);
+    Session S; S.alloc(c,CTX,E.MAXTOK);
     printf("[G8] KV %.3f GB for ctx=%d  (12 global full + 36 sliding rings of %d)\n",
            S.bytes/1e9,CTX,c.sliding_window);
 

@@ -11,10 +11,13 @@ int main(int argc,char**argv){
     int N=getenv("N")?atoi(getenv("N")):40;
     int PRE=getenv("PRE")?atoi(getenv("PRE")):0;     // synthetic prefill length
     Config c=load_config(md+"/config.json");
-    Loader ld(md,c); Weights W=ld.load("",false);
+    bool FP8A = getenv("LG_FP8ATTN")!=nullptr;
+    Loader ld(md,c,FP8A); Weights W=ld.load("",false);
+    if(FP8A) printf("FP8 attention ON: arena %.3f GB\n", W.arena_bytes/1e9);
     Engine E; E.c=c; E.W=W; E.init(64);
-    Session S; S.alloc(c,CTX);
+    Session S; S.alloc(c,CTX,E.MAXTOK);
     E.prof = getenv("LG_PROF")!=nullptr;
+    E.moe_split = getenv("LG_SPLIT")!=nullptr;
 
     std::ifstream mf("docs/golden/meta_primes.json"); nlohmann::json M; mf>>M;
     std::vector<int> ids; for(auto&x:M["ids"]) ids.push_back(x.get<int>());

@@ -517,3 +517,134 @@ extern "C" void moe_down_rp(float* dpart, const uint8_t* dp, const uint8_t* ds, 
         k_moe_down_rp<TMAX><<<grd, blk, 0, st>>>(dpart, dp, ds, dinv, hb, elist, eoff, ecount,
                                                  active, nactive, H, MI, GRP);
 }
+
+// =======================================================================================
+// gate/up with gate and up on SEPARATE warps.
+//
+// Measured on this box: the MoE gate/up kernel is warp-STARVED, not bandwidth-limited.
+// `k_moe_down_rp` has an identical inner loop and differs only in warp count:
+//     gate/up (both streams per warp)   320 warps, 33 % occ -> 159.6 GB/s
+//     gate/up (this kernel, split)      640 warps, 67 % occ -> 195.6 GB/s
+//     down    (control, same inner loop) 960 warps, 100 % occ -> 222.3 GB/s
+// Monotone in warp count with the same instruction mix. The cause is structural:
+// `moe_intermediate` (1024) is 3x smaller than `hidden` (3072), so gate/up has a third of
+// down's output rows to spread over 20 SMs (48 warp slots each = 960 resident warps).
+//
+// Splitting the two weight streams onto different warps doubles the warp count and leaves
+// each lane streaming ONE matrix over all K/32 chunks — the per-lane accumulation order is
+// byte-for-byte what it was, so this is BIT-EXACT.
+// =======================================================================================
+template <int TM>
+__global__ void k_moe_gu_split(float* __restrict__ gbuf, float* __restrict__ ubuf,
+                               const uint8_t* __restrict__ gp, const uint8_t* __restrict__ gs,
+                               const float* __restrict__ ginv,
+                               const uint8_t* __restrict__ up, const uint8_t* __restrict__ us,
+                               const float* __restrict__ uinv,
+                               const uint16_t* __restrict__ xb,
+                               const int* __restrict__ elist, const int* __restrict__ eoff,
+                               const int* __restrict__ ecount, const int* __restrict__ active,
+                               const int* __restrict__ nactive,
+                               int H, int MI, int topk, int GRP) {
+    const int slot = blockIdx.x;
+    if (slot >= *nactive) return;
+    const int e = active[slot];
+    const int cnt = ecount[e], base = eoff[e];
+    const int lane = threadIdx.x;
+    const int nblocks = MI / RPNB;
+
+    const int flat = blockIdx.y * blockDim.y + threadIdx.y;
+    if (flat >= 2 * nblocks) return;
+    const int which = (flat >= nblocks);            // 0 = gate, 1 = up
+    const int nb = flat - which * nblocks;
+    const int n = nb * RPNB + lane;
+
+    const uint8_t* wp = which ? up : gp;
+    const uint8_t* ws = which ? us : gs;
+    const float    wi = which ? uinv[e] : ginv[e];
+    float* out = which ? ubuf : gbuf;
+
+    const int C = H / 32, NG = H / GRP;
+    const size_t eb = (size_t)e * nblocks;
+    const uint8_t* wbase = wp + ((eb + nb) * C) * RPNB * 16;
+    const uint8_t* sbase = ws + ((eb + nb) * NG) * RPNB;
+
+  for (int t0 = 0; t0 < cnt; t0 += TM) {
+    const int nt = min(TM, cnt - t0);
+    float acc[TM];
+    const uint16_t* xrow[TM];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        acc[i] = 0.f;
+        xrow[i] = xb + (long)(((i < nt) ? elist[base + t0 + i] : 0) / topk) * H;
+    }
+    for (int c0 = 0; c0 < C; c0 += RPU) {
+        uint4 wv[RPU]; float sc[RPU][2];
+        #pragma unroll
+        for (int u = 0; u < RPU; ++u) {
+            const int c = c0 + u;
+            if (c < C) {
+                wv[u] = __ldcs((const uint4*)(wbase + ((size_t)c * RPNB + lane) * 16));
+                const int g0 = (c * 32) / GRP, g1 = (c * 32 + 16) / GRP;
+                sc[u][0] = e4m3f(sbase[(size_t)g0 * RPNB + lane]) * wi;
+                sc[u][1] = e4m3f(sbase[(size_t)g1 * RPNB + lane]) * wi;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < RPU; ++u) {
+            const int c = c0 + u;
+            if (c >= C) break;
+            const uint8_t* wb = (const uint8_t*)&wv[u];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                if (i >= nt) break;
+                const uint16_t* xh = xrow[i] + c * 32;
+                float h0 = 0.f, h1 = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    float2 w = fp4x2_f2(wb[j]);
+                    h0 = fmaf(w.x, bf2f(xh[2 * j]), h0);
+                    h0 = fmaf(w.y, bf2f(xh[2 * j + 1]), h0);
+                }
+                #pragma unroll
+                for (int j = 8; j < 16; ++j) {
+                    float2 w = fp4x2_f2(wb[j]);
+                    h1 = fmaf(w.x, bf2f(xh[2 * j]), h1);
+                    h1 = fmaf(w.y, bf2f(xh[2 * j + 1]), h1);
+                }
+                acc[i] += h0 * sc[u][0] + h1 * sc[u][1];
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        if (i >= nt) break;
+        out[(long)elist[base + t0 + i] * MI + n] = acc[i];
+    }
+  }
+}
+
+// SwiGLU + f32->bf16 in one pass, replacing the standalone cast that used to follow gate/up.
+__global__ void k_swiglu_cast(uint16_t* __restrict__ o, const float* __restrict__ g,
+                              const float* __restrict__ u, long n) {
+    long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    if (t < n) o[t] = f2bf(silu(g[t]) * u[t]);
+}
+
+extern "C" void moe_gateup_split(float* gbuf, float* ubuf, uint16_t* hbf,
+                                 const uint8_t* gp, const uint8_t* gs, const float* ginv,
+                                 const uint8_t* up, const uint8_t* us, const float* uinv,
+                                 const uint16_t* xb, const int* elist, const int* eoff,
+                                 const int* ecount, const int* active, const int* nactive,
+                                 int nact_max, int H, int MI, int topk, int GRP, int maxtok,
+                                 long hbf_n, cudaStream_t st) {
+    const int WY = 4;
+    dim3 blk(RPNB, WY), grd(nact_max, (2 * (MI / RPNB) + WY - 1) / WY);
+    if (maxtok <= 1)
+        k_moe_gu_split<1><<<grd, blk, 0, st>>>(gbuf, ubuf, gp, gs, ginv, up, us, uinv, xb,
+                                               elist, eoff, ecount, active, nactive, H, MI, topk, GRP);
+    else
+        k_moe_gu_split<TMAX><<<grd, blk, 0, st>>>(gbuf, ubuf, gp, gs, ginv, up, us, uinv, xb,
+                                                  elist, eoff, ecount, active, nactive, H, MI, topk, GRP);
+    int T = 256;
+    k_swiglu_cast<<<(int)((hbf_n + T - 1) / T), T, 0, st>>>(hbf, gbuf, ubuf, hbf_n);
+}

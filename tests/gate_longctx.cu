@@ -27,7 +27,8 @@ int main(int argc, char** argv) {
     Config c = load_config(md + "/config.json");
     bool FP8A = getenv("LG_FP8ATTN") != nullptr;
     Loader ld(md, c, FP8A); Weights W = ld.load("", false);
-    Engine E; E.c = c; E.W = W; E.init(64);
+    int MT = getenv("MAXTOK") ? atoi(getenv("MAXTOK")) : 64;
+    Engine E; E.c = c; E.W = W; E.init(MT);
     printf("[longctx] window=%d  MAXTOK=%d\n", c.sliding_window, E.MAXTOK);
 
     // deterministic pseudo-random token stream

@@ -46,11 +46,18 @@ extern "C" void dequant_nvfp4(float* out, const uint8_t* packed, const uint8_t* 
 //     out[M][N] = x[M][K] @ W[N][K]^T
 // One warp owns one output column n and streams W[n][:] with 16-byte (uint4 = 8 bf16)
 // loads through __ldcs (evict-first: weights are read once, activations are reused).
-// x is staged in shared memory as bf16 so the M-loop costs no extra global traffic.
+//
+// x is read straight from global, NOT staged in shared. Two reasons, one measured and one
+// structural: gemma measured "no-shared-A, read direct from L2-cached global x" at +3 %
+// (every block reads the same x, so it is hot in L2 and shared adds a pointless hop); and
+// staging does not scale — at prefill M=54 a [M,K] bf16 tile is 324 KB, over the 228 KB
+// limit, so the launch simply fails. This cost one failed gate to learn.
 //
 // WARPS_PER_BLOCK=1 maximises grid fill on a 20-SM part — gemma measured +3 % for this over
 // wider blocks, because block-level parallelism is what hides the weight-load latency here
 // (and is also why cp.async lost there; see OPTIMIZATION_LOG "Dead on arrival").
+//
+// M is tiled by MAXM so any M works: grid.y = ceil(M/MAXM).
 // ---------------------------------------------------------------------------------------
 #define MAXM 8
 
@@ -58,15 +65,12 @@ template <int WARPS>
 __global__ __launch_bounds__(WARPS * 32)
 void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
                  const uint16_t* __restrict__ xb, int M, int N, int K) {
-    extern __shared__ uint16_t sx[];              // [M][K] bf16
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-
-    for (int i = threadIdx.x; i < M * K; i += WARPS * 32) sx[i] = xb[i];
-    __syncthreads();
-
     int n = blockIdx.x * WARPS + warp;
     if (n >= N) return;
+    const int m0 = blockIdx.y * MAXM;
+    const int mn = min(MAXM, M - m0);
 
     float acc[MAXM];
     #pragma unroll
@@ -79,8 +83,9 @@ void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
         const uint16_t* wh = (const uint16_t*)&wv;
         #pragma unroll
         for (int m = 0; m < MAXM; ++m) {
-            if (m >= M) break;
-            const uint16_t* xh = sx + (long)m * K + c * 8;
+            if (m >= mn) break;
+            const uint4 xv = *(const uint4*)(xb + (long)(m0 + m) * K + c * 8);
+            const uint16_t* xh = (const uint16_t*)&xv;
             float s = 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) s = fmaf(bf2f(wh[j]), bf2f(xh[j]), s);
@@ -89,16 +94,16 @@ void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
     }
     #pragma unroll
     for (int m = 0; m < MAXM; ++m) {
-        if (m >= M) break;
+        if (m >= mn) break;
         float v = warp_sum(acc[m]);
-        if (lane == 0) out[(long)m * N + n] = v;
+        if (lane == 0) out[(long)(m0 + m) * N + n] = v;
     }
 }
 
 extern "C" void gemm_bf16(float* out, const uint16_t* W, const uint16_t* xb,
                           int M, int N, int K, cudaStream_t st) {
-    size_t smem = (size_t)M * K * 2;
-    k_gemm_bf16<1><<<N, 32, smem, st>>>(out, W, xb, M, N, K);
+    dim3 g(N, (M + MAXM - 1) / MAXM);
+    k_gemm_bf16<1><<<g, 32, 0, st>>>(out, W, xb, M, N, K);
 }
 
 // fp32 activations -> bf16 staging (the GEMM's x input)
@@ -119,14 +124,12 @@ __global__ __launch_bounds__(WARPS * 32)
 void k_gemm_fp4(float* __restrict__ out,
                 const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scale,
                 float inv_gs, const uint16_t* __restrict__ xb, int M, int N, int K, int G) {
-    extern __shared__ uint16_t sx[];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    for (int i = threadIdx.x; i < M * K; i += WARPS * 32) sx[i] = xb[i];
-    __syncthreads();
-
     int n = blockIdx.x * WARPS + warp;
     if (n >= N) return;
+    const int m0 = blockIdx.y * MAXM;
+    const int mn = min(MAXM, M - m0);
 
     float acc[MAXM];
     #pragma unroll
@@ -143,8 +146,8 @@ void k_gemm_fp4(float* __restrict__ out,
         float s1 = e4m3f(srow[(c * 32 + 16) / G]) * inv_gs;
         #pragma unroll
         for (int m = 0; m < MAXM; ++m) {
-            if (m >= M) break;
-            const uint16_t* xh = sx + (long)m * K + c * 32;
+            if (m >= mn) break;
+            const uint16_t* xh = xb + (long)(m0 + m) * K + c * 32;
             float h0 = 0.f, h1 = 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {            // first group of 16 = bytes 0..7
@@ -163,15 +166,15 @@ void k_gemm_fp4(float* __restrict__ out,
     }
     #pragma unroll
     for (int m = 0; m < MAXM; ++m) {
-        if (m >= M) break;
+        if (m >= mn) break;
         float v = warp_sum(acc[m]);
-        if (lane == 0) out[(long)m * N + n] = v;
+        if (lane == 0) out[(long)(m0 + m) * N + n] = v;
     }
 }
 
 extern "C" void gemm_fp4(float* out, const uint8_t* packed, const uint8_t* scale,
                          float inv_gs, const uint16_t* xb, int M, int N, int K, int G,
                          cudaStream_t st) {
-    size_t smem = (size_t)M * K * 2;
-    k_gemm_fp4<1><<<N, 32, smem, st>>>(out, packed, scale, inv_gs, xb, M, N, K, G);
+    dim3 g(N, (M + MAXM - 1) / MAXM);
+    k_gemm_fp4<1><<<g, 32, 0, st>>>(out, packed, scale, inv_gs, xb, M, N, K, G);
 }

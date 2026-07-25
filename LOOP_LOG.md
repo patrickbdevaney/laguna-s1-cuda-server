@@ -216,3 +216,66 @@ path itself.**
 52.07 GB free after weights, before the 2.23 GB draft. That is *more* headroom than
 `RESCOPE.md` §4 assumed (36.87 GB), so the KV capacity figure there is conservative;
 it will be restated once the draft and activation buffers are real.
+
+---
+
+## Gate B1 (in progress) — kernels
+
+Harness: `tests/gate_kernels.cu` against references dumped from the validated oracle by
+`oracle/dump_kernel_refs.py` (real checkpoint weights, real hidden states from the golden run).
+
+### G1 — NVFP4 dequant · **PASS, BIT-EXACT**
+
+`kernels/gemm.cu:k_dequant_nvfp4` vs `oracle/ref_laguna.py:dequant_nvfp4` on
+`model.layers.1.mlp.experts.0.gate_proj` [1024, 3072]:
+**0 mismatching elements out of 3 145 728.** Both sides are exact products of exactly
+representable values (E2M1 code × E4M3 scale × fp32 reciprocal), so bit-exactness is
+attainable here and is the right bar.
+
+### G2 — dense linear, BF16 weights · **PASS** (maxrel 7.3e-07)
+### G2b — dense linear, NVFP4 weights · **PASS** (maxrel 1.5e-06)
+### G3a — RMSNorm · **PASS** (maxrel 1.4e-07)
+### G3b — rope tables, both layer types · **PASS** (maxrel ≤ 6.7e-06)
+
+`__cosf`/`__sinf` fast-math intrinsics account for the 1e-6-class residual; tolerance 3e-5.
+
+### G4 — sigmoid router, selection-only bias, top-10 · **PASS, INDEX-EXACT**
+
+**0 mismatching indices out of 540**; normalised weights maxrel 7.4e-07.
+
+Two failures on the way, both worth recording.
+
+**Failure 1 — shared-memory staging does not scale (535/540 wrong).** The first GEMM staged
+`x` as a `[M,K]` bf16 tile in shared memory. At the verify shape M=6 that is 36 KB and works;
+at prefill M=54 it is **324 KB**, over the 228 KB limit, so the launch silently failed and the
+router consumed garbage logits. Fixed by removing the staging entirely and reading `x` from
+global — which is also what gemma independently measured as *faster* (+3 %: every block reads
+the same small `x`, so it is hot in L2 and the shared hop is pure overhead). M is now tiled by
+`MAXM=8` via `grid.y`, so any M works.
+
+**Failure 2 — the precision contract, and it is not a tolerance question.** With the launch
+fixed, 15 of 540 selections still differed. Cause: this oracle runs **fp32 activations
+everywhere**, while the deployed model is **bf16** (`config.torch_dtype`). Measured directly:
+
+| | |
+|---|---|
+| selection flips, fp32-act vs bf16-act reference | **15 / 540** — exactly what the kernel showed |
+| tokens affected | 7 / 54 |
+| router-score gap between rank-10 and rank-11 | **min 1.03e-05**, median 3.9e-03 |
+| max resulting routing-weight delta | 3.5e-04 |
+
+So the kernel was already reproducing the *correct* (bf16-activation) reference bit-for-bit;
+the oracle was more precise than the model, not more right. The flips are between experts
+whose router scores are tied to 1e-5 — numerically meaningless, but they would have looked
+like a correctness bug forever.
+
+**Contract adopted:** kernel gates compare against a **bf16-activation, fp32-accumulate**
+reference, because that is what the checkpoint is and what poolside serves. The fp32 oracle
+remains the *math* reference (it is what validated the transcription against the shipped
+`modeling_laguna.py`). Carried forward to G8: the full-forward gate needs a bf16 golden run,
+not the fp32 one, or a stated tolerance that accounts for exactly this effect.
+
+**Standing note on router sensitivity:** with 256 experts and top-10, near-ties at the
+selection boundary are common (min gap 1e-5 on a 54-token sample). Any future change to
+activation precision on the router path — including the §5 self-quantisation lever — must
+re-measure selection agreement, not just output norms.

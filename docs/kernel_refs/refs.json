@@ -1,0 +1,191 @@
+{
+  "g1_packed": {
+    "shape": [
+      1024,
+      1536
+    ],
+    "dtype": "torch.uint8",
+    "note": "L1 e0 gate_proj weight_packed [1024,1536] u8",
+    "bytes": 1572864
+  },
+  "g1_scale": {
+    "shape": [
+      1024,
+      192
+    ],
+    "dtype": "torch.uint8",
+    "note": "weight_scale e4m3 as u8 [1024,192]",
+    "bytes": 196608
+  },
+  "g1_out": {
+    "shape": [
+      1024,
+      3072
+    ],
+    "dtype": "torch.float32",
+    "note": "expected dequant [1024,3072] fp32",
+    "bytes": 12582912
+  },
+  "g1_inv_gs": 8.680555555555556e-05,
+  "g1_gs": 11520.0,
+  "g2_w": {
+    "shape": [
+      512,
+      3072
+    ],
+    "dtype": "torch.uint16",
+    "note": "L1 q_proj[:512] bf16-as-u16 [512,3072]",
+    "bytes": 3145728
+  },
+  "g2_x": {
+    "shape": [
+      6,
+      3072
+    ],
+    "dtype": "torch.uint16",
+    "note": "activations bf16-as-u16 [6,3072]",
+    "bytes": 36864
+  },
+  "g2_out": {
+    "shape": [
+      6,
+      512
+    ],
+    "dtype": "torch.float32",
+    "note": "expected [6,512] fp32",
+    "bytes": 12288
+  },
+  "g2b_x": {
+    "shape": [
+      6,
+      3072
+    ],
+    "dtype": "torch.uint16",
+    "note": "activations bf16-as-u16 [6,3072]",
+    "bytes": 36864
+  },
+  "g2b_out": {
+    "shape": [
+      6,
+      1024
+    ],
+    "dtype": "torch.float32",
+    "note": "expected [6,1024] fp32",
+    "bytes": 24576
+  },
+  "g3a_x": {
+    "shape": [
+      54,
+      3072
+    ],
+    "dtype": "torch.float32",
+    "note": "layer-0 output hidden [S,3072] fp32",
+    "bytes": 663552
+  },
+  "g3a_w": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.uint16",
+    "note": "L1 input_layernorm bf16-as-u16 [3072]",
+    "bytes": 6144
+  },
+  "g3a_out": {
+    "shape": [
+      54,
+      3072
+    ],
+    "dtype": "torch.float32",
+    "note": "expected [S,3072] fp32",
+    "bytes": 663552
+  },
+  "g3b_cos_full": {
+    "shape": [
+      54,
+      64
+    ],
+    "dtype": "torch.float32",
+    "note": "full_attention cos [S,rot]",
+    "bytes": 13824
+  },
+  "g3b_sin_full": {
+    "shape": [
+      54,
+      64
+    ],
+    "dtype": "torch.float32",
+    "note": "full_attention sin [S,rot]",
+    "bytes": 13824
+  },
+  "g3b_cos_slide": {
+    "shape": [
+      54,
+      128
+    ],
+    "dtype": "torch.float32",
+    "note": "sliding_attention cos [S,rot]",
+    "bytes": 27648
+  },
+  "g3b_sin_slide": {
+    "shape": [
+      54,
+      128
+    ],
+    "dtype": "torch.float32",
+    "note": "sliding_attention sin [S,rot]",
+    "bytes": 27648
+  },
+  "g4_x": {
+    "shape": [
+      54,
+      3072
+    ],
+    "dtype": "torch.float32",
+    "note": "post-attn normed hidden [S,3072] fp32",
+    "bytes": 663552
+  },
+  "g4_w": {
+    "shape": [
+      256,
+      3072
+    ],
+    "dtype": "torch.uint16",
+    "note": "router bf16-as-u16 [256,3072]",
+    "bytes": 1572864
+  },
+  "g4_bias": {
+    "shape": [
+      256
+    ],
+    "dtype": "torch.float32",
+    "note": "e_score_correction_bias [256] fp32",
+    "bytes": 1024
+  },
+  "g4_sel": {
+    "shape": [
+      54,
+      10
+    ],
+    "dtype": "torch.int32",
+    "note": "expected top-10 indices [S,10] i32",
+    "bytes": 2160
+  },
+  "g4_wts": {
+    "shape": [
+      54,
+      10
+    ],
+    "dtype": "torch.float32",
+    "note": "expected normalised weights [S,10] fp32",
+    "bytes": 2160
+  },
+  "config": {
+    "hidden_size": 3072,
+    "num_experts": 256,
+    "num_experts_per_tok": 10,
+    "rms_norm_eps": 1e-06,
+    "head_dim": 128,
+    "sliding_window": 512
+  },
+  "seq_len": 54
+}

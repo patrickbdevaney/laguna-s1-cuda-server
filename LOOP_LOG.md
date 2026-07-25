@@ -543,3 +543,70 @@ speculation, because every extra speculative token widens the expert set the ver
 read. Recorded in the backlog: N-blocking the dense GEMM at M>1 (amortise the x loads over 2–4
 output rows per warp) is the concrete ~+12 % lever, and capturing the verify forward in its own
 CUDA graph is worth the ~8 % the decode graph is already measured to give.
+
+---
+
+## Gate S1 — server layer · **PASS** · 2026-07-25
+
+`src/server.cu` (`lgserve`), `tools/lgchat.cc`, `include/webui.h`. One process, no Python on
+any path.
+
+| surface | state |
+|---|---|
+| `POST /v1/chat/completions` | streaming SSE and non-streaming |
+| `GET /v1/models`, `GET /healthz` | ✅ |
+| WebUI at `/` | 6.8 KB, self-contained, light/dark |
+| reasoning separation | `reasoning_content` deltas until `</think>`, then `content` |
+| tool calling | verified end to end: `finish_reason: tool_calls`, OpenAI-shaped |
+| prefix cache | 2nd turn of a conversation: 0.79 s vs 19.8 s cold |
+| terminal client | `lgchat`, same SSE stream, reasoning dimmed |
+| context | `CTX=262144` → KV 6.48 GB, process 78 GB of 122 |
+
+### Adaptive speculation — the part that took the measurements to get right
+
+D1 established that a verify forward costs ~3× a decode step, so speculation needs τ > ~3 to
+pay. τ is content-dependent — 3.06 on a math prompt, **2.26 on open prose** — so a fixed k is
+wrong in both directions. At k=3 on prose the server ran **20.7 tok/s against 27.4 for plain
+decode: a 25 % loss**, while the same k on code was a 1.3× win.
+
+So the mode is chosen by measurement. A bandit over {ar, k=2, k=3, k=5} keeps an EWMA of each
+arm's achieved tokens/second.
+
+Three iterations, each fixing something the previous one exposed:
+
+1. **Per-step ranking thrashed.** A speculative step yields 1…k+1 tokens, so a single sample
+   spans the entire acceptance distribution. Ranking on it cost 12 % on exactly the workload
+   where speculation wins (code: 33.3 → 29.5 tok/s). Fixed by holding each arm for a **block
+   of 32 steps** and ranking on the block average.
+2. **Exploration was too expensive.** A block on a bad arm costs ~30 % of its tokens. Probes
+   went from every 6 blocks to every 10, gated on the arm being within 0.65× of the best.
+3. **Acceptance is non-stationary *within* a generation** — the same k=5 arm measured 37.4 then
+   22.6 tok/s as one code answer drifted into prose. So a gated probe alone would strand a
+   recovered arm; a full sweep of every arm runs every 50 blocks.
+
+Measured, served, 500-token generations:
+
+| workload | tok/s | vs AR floor |
+|---|---:|---:|
+| code (red-black tree) | **33.6** | 1.28× |
+| prose (technical explanation) | 28.3 – 32.0 | 1.02 – 1.16× |
+| AR arm alone | 26.1 – 28.1 | 1.00 |
+
+### The autoregressive arm had to be graphed, and that needed a kernel change
+
+The bandit picks AR on prose, so AR *is* the chat path. It was running ungraphed at 24.0 tok/s
+where `bench_decode` gets 27.4. The blocker was `tap_store`, which took the position as a host
+`int`: a host int is frozen into a CUDA graph at capture, so every DFlash tap would have landed
+in the captured position's ring slot forever. Changed to a device pointer, exactly as
+`store_kv` already did. **24.0 → 26.1 tok/s, +8.5 %.** `base` is now unused inside `forward()`
+— every position-dependent kernel reads `dbase`.
+
+### Two things deliberately not done
+
+* **Speculation under sampling.** Longest-prefix acceptance is only valid against an argmax
+  target; the correct rule under temperature is the rejection sampler, which needs the draft's
+  own distribution. Rather than silently change the output distribution, sampled requests
+  decode autoregressively.
+* **Concurrency.** One session at a time, on a mutex. Decode is bandwidth-bound at batch 1 on
+  a 69 GB weight set; a second concurrent sequence would not add throughput, it would halve
+  both sequences' latency. Requests queue.

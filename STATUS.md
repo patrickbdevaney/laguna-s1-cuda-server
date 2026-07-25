@@ -17,41 +17,34 @@ Reference, **read-only**: `~/gemma-cuda-hybrid`.
 
 ## Current state
 
-- Metadata for both repos downloaded and read: `config.json`, `generation_config.json`,
-  tokenizer, `chat_template.jinja`, `modeling_laguna.py`, `configuration_laguna.py`, draft
-  `config.py`.
-- All 145 153 target tensor headers + 69 draft tensor headers captured to `tools/hdr_*.json`
-  (fetched by HTTP range before the shards finished). Byte sum reproduces the index
-  `total_size` = 71 898 733 760 exactly.
-- **Weight download running in background** (74.1 GB total). Logs:
-  `$SCRATCH/dl_target.log`, `$SCRATCH/dl_draft.log`; sentinel `$SCRATCH/dl_done`.
-  Resume with the same `hf download ... --local-dir models/<repo>` command — it is idempotent.
+Working pure-CUDA Laguna forward pass: **greedy-exact vs the oracle**, **9.23 tok/s median**
+decode at ctx 4096 (92.7 GB/s effective, 41 % of the 227 GB/s ceiling), prefill 15.4 tok/s.
+Everything from the checkpoint on disk through to logits is C++/CUDA; Python exists only in
+`oracle/` for validation and never on the serving path.
 
-## Headline numbers established (all from disk, none invented)
+Built and gated so far: config parser, arena loader, NVFP4 dequant, BF16 and FP4 dense GEMMs,
+RMSNorm, QK-norm, two rope tables with partial rotary, sigmoid router with selection-only
+bias, per-head softplus gating, head-packed GQA with FP8 KV and SWA rings, grouped
+weight-resident MoE, and the full 48-layer forward.
 
-- `B_tok` = **10.04 GB/token** at ctx 4096 — attention is **5.61 GB (56 %)** and BF16;
-  routed experts only 2.50 GB (25 %). **Laguna is attention-bound at bs = 1.**
-- **AR wall = 19.9 tok/s** at 200 GB/s. Poolside's GB10 13–14 tok/s ⇒ ~135 GB/s effective,
-  i.e. vLLM is already near-roofline; the "1.5–2× on the floor" premise is refuted.
-- `k*` prior = **4** (5 at temp 0, 3 at temp 0.7). Both model cards' values (7, 15) are
-  datacenter settings and are wrong for this hardware.
-- `E_frac(k)` ≤ 0.45 even at k = 15 — no expert-union blow-up.
-- KV: 24 576 B/token (global layers only) + 37.7 MB/seq constant ⇒ **~1.66 M KV tokens**, ~2×
-  poolside's reported capacity, thanks to the 512-token SWA rings.
-- Expected band: **25–40 tok/s** stock, **32–48 tok/s** with self-quantized attention.
+## Immediate next actions (in priority order)
 
-## Immediate next actions
-
-1. Wait out the download; verify shard checksums.
-2. Write `MODEL_INVENTORY.md` (tensor/shape/dtype/scale-layout dump — material already in
-   `tools/hdr_target.json`) and `ARCH_DELTA.md` (gemma-4 vs Laguna per subsystem).
-3. Stand up the correctness oracle in a venv outside the build (Transformers +
-   `trust_remote_code`, pinned); capture golden per-layer hidden states + logits at temp 0.
-   **Pin and record versions** — DFlash upstream is in flux (vLLM #46853, SGLang #29446).
-4. Confirm the DFlash propose loop is one forward per block (affects `ROOFLINE.md` §4).
+1. **MoE grouped GEMM** — 81.5 % of the decode step, running at ~30 GB/s against a 227 GB/s
+   ceiling. This is where the next 2× lives. Untried: per-warp register prefetch of the 3
+   weight loads (they are currently serialised by the c-loop), multiple output rows per warp,
+   fusing the invert glue. Note gemma's ILP levers LOST on its MoE — check the register
+   budget before repeating them.
+2. **G9 — whole-step CUDA graph.** ~1665 launches/step at 4.15 µs each.
+3. **Gate D1 — DFlash.** Load the 6-layer draft in BF16 (never quantize it), share the
+   target's embed + `lm_head`, implement propose/verify with lossless sampling, then run the
+   k-sweep and re-measure `E_frac` on real draft blocks (the current measurement is from
+   prompt tokens — `ROOFLINE.md` §10 caveat).
+4. **Gate S1 — server layer.** Tokenizer (ByteLevel BPE, 2-stage Unicode pre-tokenizer),
+   poolside_v1 chat/tool/reasoning grammar with preserved thinking, prefix cache, SSE.
+5. **The §5 self-quantization lever** — the largest single win available (+39 % to +113 % on
+   `B_tok`), but quality-gated and correctly sequenced after the bit-exact path is banked.
 
 ## Standing corrections to the directive (carry forward)
-
 1. `B_tok` ≈ 10.04 GB, not 4.5 → AR wall 20 tok/s, not 44.
 2. Only routed experts are NVFP4; attention/shared/router/`lm_head`/layer-0 MLP are BF16.
 3. `vocab_size` = 100 352, not 262 144. `tie_word_embeddings` = **false** — G7's premise

@@ -87,6 +87,39 @@ struct Session {
     void free_() { for (auto p : Kc) cudaFree(p); for (auto p : Vc) cudaFree(p); Kc.clear(); Vc.clear(); }
 };
 
+// Bytes a decode step at position `pos` MUST read, from the checkpoint layout actually in
+// use. This is the denominator of every effective-bandwidth number in the logs. It used to be
+// a hardcoded 10.044 GB — the stock BF16 figure — which quietly kept crediting us with the
+// attention bytes that FP8 attention had already removed, and so reported 83 % of roofline
+// where the truth was 66 %. Never hardcode a byte budget that a build flag can change.
+inline double bytes_per_token(const Config& c, bool fp8_attn, int pos) {
+    const double H = c.hidden, V = c.vocab;
+    const double aw = fp8_attn ? 1.0 : 2.0;                   // attention weight element
+    double b = H * 2;                                          // one embedding row
+    b += H * 2 + V * H * 2;                                    // final norm + lm_head
+    for (int L = 0; L < c.n_layers; ++L) {
+        const double qd = c.q_dim(L), kvd = (double)c.n_kv_heads * c.head_dim, nh = c.heads[L];
+        b += 2.0 * H * 2;                                      // in_ln + post_ln
+        b += (qd * H + 2.0 * kvd * H + H * qd + nh * H) * aw;   // q, k, v, o, g
+        if (fp8_attn) b += (qd + 2.0 * kvd + H + nh) * 4;       // one fp32 scale per out row
+        b += 2.0 * c.head_dim * 2;                             // q_norm + k_norm
+        const int klen = c.is_sliding(L) ? std::min(pos + 1, c.sliding_window) : pos + 1;
+        b += (double)klen * kvd * 2;                           // FP8 K and V
+        if (c.is_dense(L)) {
+            b += 3.0 * c.intermediate * H * 2;
+        } else {
+            b += 3.0 * c.shared_intermediate * H * 2;
+            b += (double)c.n_experts * H * 2 + c.n_experts * 4; // router + selection bias
+            const double ew = 3.0 * c.moe_intermediate * H;     // gate + up + down elements
+            b += c.top_k * (ew * 0.5 + ew / c.nvfp4_group);     // FP4 codes + E4M3 scales
+        }
+    }
+    return b;
+}
+
+// Measured streaming ceiling for cudaMalloc'd memory on this part (OPTIMIZATION_LOG M1).
+static const double THOR_BW_CEILING = 227.4e9;
+
 struct Engine {
     Config c;
     Weights W;
@@ -199,6 +232,10 @@ struct Engine {
     inline void acc(int i) {
         if (prof) { cudaDeviceSynchronize(); cat_ms[i] += (wall_now() - t_mark) * 1e3; ++cat_n[i]; }
     }
+    // Zero the counters. The profile is per-DECODE-step; if the synthetic prefill is left in
+    // it dominates completely (2048 tokens at M=64 vs 39 tokens at M=1) and the percentages
+    // describe prefill's bottleneck, not decode's.
+    void prof_reset() { for (int i = 0; i < NCAT; ++i) { cat_ms[i] = 0; cat_n[i] = 0; } }
     void prof_report(int steps) {
         if (!prof) return;
         double tot = 0; for (int i = 0; i < NCAT; ++i) tot += cat_ms[i];

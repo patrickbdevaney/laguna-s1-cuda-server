@@ -9,6 +9,7 @@
 // reused across all M rows, which is where gemma measured +21.8 % on its batched lm_head.
 #include "laguna_kernels.cuh"
 #include <cstdio>
+#include <cstdlib>
 
 using namespace lgk;
 
@@ -100,14 +101,41 @@ void k_gemm_bf16(float* __restrict__ out, const uint16_t* __restrict__ W,
     }
 }
 
+// Warps per block. One warp owns one whole output row, so this changes NOTHING about the
+// arithmetic — it is bit-exact at any value — but it changes occupancy: this part allows 24
+// CTAs and 48 warps per SM, so 1-warp blocks leave HALF the warp slots unusable. These
+// GEMVs are issue/latency-bound, not bandwidth-bound (measured: the FP8 and BF16 kernels run
+// the same instruction stream at the same rate, and FP8 therefore reaches exactly half the
+// GB/s), so resident warps are the throughput knob. Overridable for sweeps.
+static int gemm_warps() {
+    static int w = -1;
+    if (w < 0) {
+        const char* e = getenv("LG_GEMM_WARPS");
+        w = e ? atoi(e) : 4;
+        if (w != 1 && w != 2 && w != 4 && w != 8) w = 4;
+    }
+    return w;
+}
+
+#define GEMM_DISPATCH(KERN, MMV, ...)                                                       \
+    do {                                                                                    \
+        const int WPB = gemm_warps();                                                       \
+        dim3 g_((N + WPB - 1) / WPB, (M + (MMV) - 1) / (MMV));                              \
+        switch (WPB) {                                                                      \
+        case 8: KERN<8, MMV><<<g_, 8 * 32, 0, st>>>(__VA_ARGS__); break;                    \
+        case 4: KERN<4, MMV><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__); break;                    \
+        case 2: KERN<2, MMV><<<g_, 2 * 32, 0, st>>>(__VA_ARGS__); break;                    \
+        default: KERN<1, MMV><<<g_, 32, 0, st>>>(__VA_ARGS__); break;                       \
+        }                                                                                   \
+    } while (0)
+
 extern "C" void gemm_bf16(float* out, const uint16_t* W, const uint16_t* xb,
                           int M, int N, int K, cudaStream_t st) {
     // Specialise the M-loop the way the MoE token loop was specialised (OPTIMIZATION_LOG #6):
     // at decode M=1, and unrolling an 8-wide loop that only ever runs once burns registers
     // and issue slots for nothing.
-    if (M == 1) { k_gemm_bf16<1, 1><<<dim3(N, 1), 32, 0, st>>>(out, W, xb, M, N, K); return; }
-    dim3 g(N, (M + MAXM - 1) / MAXM);
-    k_gemm_bf16<1, MAXM><<<g, 32, 0, st>>>(out, W, xb, M, N, K);
+    if (M == 1) { GEMM_DISPATCH(k_gemm_bf16, 1, out, W, xb, M, N, K); return; }
+    GEMM_DISPATCH(k_gemm_bf16, MAXM, out, W, xb, M, N, K);
 }
 
 // fp32 activations -> bf16 staging (the GEMM's x input)
@@ -251,7 +279,14 @@ void k_gemm_fp8(float* __restrict__ out, const uint8_t* __restrict__ W,
         #pragma unroll
         for (int m = 0; m < MM; ++m) {
             if (m >= mn) break;
-            const uint16_t* xh = xb + (long)(m0 + m) * K + c * 8;
+            // One 16-byte vector load, exactly as the BF16 kernel does. Indexing
+            // `xb + ...` as a uint16_t* here instead compiled to EIGHT scalar 2-byte loads
+            // per row, so at MM=8 the inner loop issued 64 loads where 8 would do: measured
+            // 0.809 ms vs 0.146 at M=1 on the same weights, and it would have shown up as
+            // "speculation does not help" rather than as a GEMM bug. (K and c*8 are both
+            // multiples of 8, so the address is 16-byte aligned.)
+            const uint4 xv = *(const uint4*)(xb + (long)(m0 + m) * K + c * 8);
+            const uint16_t* xh = (const uint16_t*)&xv;
             float s = 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) s = fmaf(e4m3f(wb[j]), bf2f(xh[j]), s);
@@ -269,7 +304,6 @@ void k_gemm_fp8(float* __restrict__ out, const uint8_t* __restrict__ W,
 
 extern "C" void gemm_fp8(float* out, const uint8_t* W, const float* rs, const uint16_t* xb,
                          int M, int N, int K, cudaStream_t st) {
-    if (M == 1) { k_gemm_fp8<1, 1><<<dim3(N, 1), 32, 0, st>>>(out, W, rs, xb, M, N, K); return; }
-    dim3 g(N, (M + MAXM - 1) / MAXM);
-    k_gemm_fp8<1, MAXM><<<g, 32, 0, st>>>(out, W, rs, xb, M, N, K);
+    if (M == 1) { GEMM_DISPATCH(k_gemm_fp8, 1, out, W, rs, xb, M, N, K); return; }
+    GEMM_DISPATCH(k_gemm_fp8, MAXM, out, W, rs, xb, M, N, K);
 }

@@ -39,7 +39,8 @@ int main(int argc,char**argv){
     std::vector<float> lg(c.vocab);
     auto amax=[&](int M_){ CUDA_CHECK(cudaMemcpy(lg.data(),E.logits+(size_t)(M_-1)*c.vocab,c.vocab*4,cudaMemcpyDeviceToHost));
         int b=0; float bv=lg[0]; for(int i=1;i<c.vocab;++i) if(lg[i]>bv){bv=lg[i];b=i;} return b; };
-    bool USEG = getenv("LG_NOGRAPH")==nullptr;
+    E.prof_reset();                       // profile the decode steps, not the prefill
+    bool USEG = getenv("LG_NOGRAPH")==nullptr && !E.prof;  // capture() bails under prof
     if(USEG) E.capture(S,d,pos);
     int nxt=amax((int)ids.size());
     std::vector<int> got{nxt};
@@ -57,10 +58,14 @@ int main(int argc,char**argv){
     double med=ts[ts.size()/2], best=ts.front();
     size_t ncmp=std::min(got.size(),want.size());
     int match=0; for(size_t i=0;i<ncmp;++i){ if(got[i]==want[i]) ++match; else break; }
-    double Btok=10.0444e9;
+    double Btok=bytes_per_token(c,FP8A,pos);
     printf("ctx=%d pre=%d  prefill %zu tok %.2fs (%.1f tok/s)\n",CTX,PRE,ids.size(),tpre,ids.size()/tpre);
     printf("DECODE median %.2f tok/s   best %.2f   (n=%zu, ctx@end=%d)\n",1.0/med,1.0/best,ts.size(),pos);
-    printf("effective BW (median) = %.1f GB/s = %.0f%% of 250\n",Btok/med/1e9,Btok/med/1e9/250*100);
+    printf("B_tok = %.3f GB at pos %d (%s attention)\n",Btok/1e9,pos,FP8A?"FP8":"BF16");
+    printf("effective BW (median) = %.1f GB/s = %.0f%% of the measured %.0f GB/s ceiling\n",
+           Btok/med/1e9, Btok/med/THOR_BW_CEILING*100, THOR_BW_CEILING/1e9);
+    printf("wall at this B_tok = %.2f tok/s ; headroom x%.2f\n",
+           THOR_BW_CEILING/Btok, (THOR_BW_CEILING/Btok)*med);
     printf("greedy match %d/%zu %s\n",match,ncmp,(size_t)match==ncmp?"OK":"MISMATCH");
     E.prof_report((int)ts.size());
     return 0;

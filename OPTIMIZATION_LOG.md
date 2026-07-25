@@ -68,6 +68,63 @@ back-to-back A/B/A.
 | 15 | **FP8 e4m3 attention weights, per-output-row scale** | 18.94 | **20.44** | **WON +8.1 %** |
 | 16 | Attention kernel: template `G`, Q in registers (stack 224 B → **0**) | 20.79 | 20.75 / 21.16 | NEUTRAL at short ctx, **kept** — see below |
 | 17 | `attend_nsplit` no longer depends on `M` (split sized by key length alone) | — | — | **CORRECTNESS FIX**, decode shape unchanged |
+| 18 | **FP8 GEMM: load `x` as one `uint4` instead of 8 scalar 2-byte loads** | 0.809 ms | **0.292 ms** | **WON 2.8x at M=6**, 1.5x at M=1 |
+| 19 | **GEMM warps per block 1 → 4** (occupancy, bit-exact) | 21.65/21.70 | **24.59/24.50** | **WON +13.4 %** |
+
+### #18/#19 — the dense GEMMs were issue-bound, and half the warp slots were unreachable
+
+Found by making `bench_decode`'s byte budget honest. It had `B_tok` hardcoded at 10.044 GB —
+the *stock BF16* figure — so it kept crediting us with the attention bytes FP8 had already
+removed and reported 83 % of roofline where the truth was 66 %. **Never hardcode a byte budget
+a build flag can change.**
+
+With the real denominator, a decode-only profile (the old one silently included the 2048-token
+prefill, which dominates it) gave achieved bandwidth per category:
+
+| category | GB/tok | % bytes | % time | GB/s | % of ceiling |
+|---|---:|---:|---:|---:|---:|
+| attn q/k/v/o/g GEMM | 2.806 | 39.0 | 37.1 | 124.1 | 55 % |
+| MoE experts | 2.495 | 34.7 | 27.8 | 147.0 | 65 % |
+| shared+dense | 1.114 | 15.5 | 12.1 | 151.4 | 67 % |
+| lm_head | 0.617 | 8.6 | 4.1 | **245.3** | 108 % |
+| attn_core + router + norms | 0.165 | 2.3 | **18.9** | ~19 | latency, not bytes |
+
+`lm_head` and `q_proj` run the **same kernel** on the **same K**. 245 vs 124 GB/s is exactly
+2×, and FP8 reads exactly half the bytes per instruction — so the kernel was issue-bound, not
+bandwidth-bound, and the only difference was how many bytes each instruction happened to move.
+
+Two independent causes, both invisible in the byte model:
+
+**(a) `WARPS=1` made half the machine unreachable.** This part allows 24 CTAs *and* 48 warps
+per SM. One warp per block hits the CTA limit at 24 warps — **half the warp slots cannot be
+filled at any grid size.** The comment justifying it ("maximises grid fill on a 20-SM part")
+was inherited from gemma and is simply wrong here: at N=9216 the grid is 100× the machine
+either way, so grid fill was never the binding constraint; resident warps were. One warp still
+owns one whole output row, so this is **bit-exact at any value** — greedy stayed 8/8.
+
+| warps/block | q_proj BF16 | q_proj FP8 | end-to-end |
+|---:|---:|---:|---:|
+| 1 | 140.4 GB/s | 155.0 | 21.65 / 21.70 tok/s |
+| 2 | 253.6 | 231.3 | 24.59 / 24.50 |
+| **4** | 253.6 | 229.0 | **24.52 / 24.59** |
+| 8 | 229.7 | 193.4 | — |
+
+**(b) The FP8 kernel loaded `x` with eight scalar 2-byte loads** where the BF16 kernel used one
+`uint4`. At MM=8 the inner loop issued 64 loads where 8 would do. It cost 2.8× **at M=6** —
+the speculative-verify shape — and would have surfaced as "DFlash does not help on this box"
+rather than as a GEMM bug. Worth stating generally: **a microbenchmark that only covers the
+decode shape cannot see a defect that only bites the verify shape.** Add M=k+1 rows to every
+kernel bench.
+
+Note both microbench corrections that made this measurable: the harness reused a single weight
+buffer, so anything under the 32 MB L2 (which is *every* attention tensor once FP8 halves it)
+was measuring L2, not DRAM; and the tail crashed on a stale `attend` declaration that passed
+an `int` where the kernel now takes `const int*`.
+
+Also: `q_proj` reaches **253.6 GB/s**, above the 227.4 GB/s that `bw_probe` reported as the
+streaming ceiling. The probe was a low sample; the real achievable figure is ~254 GB/s
+(93 % of the 273 GB/s spec peak), and every "% of roofline" before this entry is correspondingly
+optimistic.
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler

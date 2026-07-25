@@ -146,6 +146,24 @@ struct Engine {
     int    tap_cap = 0;                    // ring length in positions
     std::vector<int> tap_of;               // tap_of[L] = slot, or -1
 
+    // Tell L2 the weight arena is streaming. Weights are read exactly once per token and
+    // never reused, so every line they install evicts KV and activations that ARE reused. The
+    // arithmetic says this is small -- 24 MB of persisting cache against 6.25 GB of read-once
+    // traffic caps the win at ~0.4 % -- but it is one API call and cannot change any result.
+    void l2_streaming_hint(cudaStream_t st = 0) {
+        if (!W.arena || getenv("LG_NO_L2HINT")) return;
+        int maxwin = 0;
+        cudaDeviceGetAttribute(&maxwin, cudaDevAttrMaxAccessPolicyWindowSize, 0);
+        if (maxwin <= 0) return;
+        cudaStreamAttrValue av = {};
+        av.accessPolicyWindow.base_ptr  = W.arena;
+        av.accessPolicyWindow.num_bytes = std::min((size_t)maxwin, W.arena_bytes);
+        av.accessPolicyWindow.hitRatio  = 0.0f;                        // none of it is hot
+        av.accessPolicyWindow.hitProp   = cudaAccessPropertyStreaming;
+        av.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(st, cudaStreamAttributeAccessPolicyWindow, &av);
+    }
+
     void init(int maxtok) {
         MAXTOK = maxtok;
         int H = c.hidden, V = c.vocab, E = c.n_experts, TK = c.top_k, MI = c.moe_intermediate;

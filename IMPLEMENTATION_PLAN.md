@@ -4,7 +4,7 @@ Derived from `RESEARCH_FINDINGS_V2.md`. Ranked by expected value ÷ cost. Items 
 were implemented and measured during the pass itself.
 
 Baseline at the start of the pass: **27.4 tok/s** base decode, 33.6 tok/s served on code.
-Baseline now: **29.4–30.8 tok/s** base decode.
+**Now: 33.0 tok/s base decode, ~40 tok/s served on code.**
 
 ---
 
@@ -17,7 +17,12 @@ Baseline now: **29.4–30.8 tok/s** base decode.
 | 3 | Draft `rope_theta` ambiguity settled by measurement | config's 1e4 beats the siblings' 5e5 (τ 3.12 vs 2.91) — keep config |
 | 4 | All 38 `extern "C"` kernel decls consolidated into one header | closes a silent-miscall class of bug |
 | 5 | `bench_moe` DVFS spin-up + arena warmup + production activation loads | makes every future microbenchmark here trustworthy |
-| 6 | **`lm_head` BF16 → FP8** (N1, first step) | **29.5 → 30.6 tok/s (+3.6 %)**, `B_tok` 7.115 → 6.807 GB, greedy 8/8 |
+| 6 | **`lm_head` BF16 → FP8** (N1) | **29.5 → 30.6 tok/s (+3.6 %)**, `B_tok` 7.115 → 6.807 GB, greedy 8/8 |
+| 7 | **Shared experts + layer-0 dense BF16 → FP8** (N1 complete) | **30.6 → 33.0 tok/s (+7.8 %)**, `B_tok` → 6.251 GB, greedy 8/8 |
+| 8 | Draft follows the target to an FP8 `lm_head` | halves the largest term in the draft's cost; was a null-pointer crash D1 caught |
+| 9 | L2 `cudaAccessPropertyStreaming` on the weight arena | **NEUTRAL** (31.2 vs 31.3) — exactly the ≤0.4 % the arithmetic predicted |
+
+**Served, after N1:** ~40 tok/s on code, 33.4 on prose (was 33.6 / 28–32).
 
 ## MEASURED AND REJECTED
 
@@ -33,7 +38,7 @@ Baseline now: **29.4–30.8 tok/s** base decode.
 
 ## NEXT — ranked
 
-### N1. FP8 the BF16 remainder — **+13.6 %, reuses machinery already gated**
+### ~~N1. FP8 the BF16 remainder~~ — **DONE, +20.5 % (21.65 → 33.0 cumulative, +52 %)**
 `lm_head` (0.617 GB), shared experts (0.887 GB) and the layer-0 dense MLP (0.227 GB) are still
 BF16. All three can go through the **existing** FP8 W8A16 per-output-row kernel — the one that
 already gave +8.1 % on attention and is covered by Gate B1.

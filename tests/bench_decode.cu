@@ -16,7 +16,7 @@ int main(int argc,char**argv){
     bool FP8D = getenv("LG_FP8DENSE")!=nullptr;
     Loader ld(md,c,FP8A,FP8L,FP8D); Weights W=ld.load("",false);
     if(FP8A) printf("FP8 attention ON: arena %.3f GB\n", W.arena_bytes/1e9);
-    Engine E; E.c=c; E.W=W; E.init(64);
+    Engine E; E.c=c; E.W=W; E.init(64); E.l2_streaming_hint();
     Session S; S.alloc(c,CTX,E.MAXTOK);
     E.prof = getenv("LG_PROF")!=nullptr;
     E.moe_split = getenv("LG_SPLIT")!=nullptr;

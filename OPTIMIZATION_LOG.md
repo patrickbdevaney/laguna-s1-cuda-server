@@ -81,6 +81,7 @@ back-to-back A/B/A.
 | 28 | **DFlash context K/V: add the per-layer `input_layernorm`** | τ 3.06 / 3.30 | **τ 3.12 / 3.37** | **CORRECTNESS FIX** (k=3 / k=4) |
 | 29 | **`lm_head` BF16 → FP8 W8A16, per-output-row scale** | 29.55/29.42 | **30.61/30.57** | **WON +3.6 %**, greedy 8/8 |
 | 30 | **Shared experts + layer-0 dense BF16 → FP8** | 30.63/30.52 | **33.01/32.87** | **WON +7.8 %**, greedy 8/8 |
+| 31 | L2 `cudaAccessPropertyStreaming` hint on the weight arena | 31.35/31.17 | 31.23/31.15 | **NEUTRAL**, kept (free, and it documents the reasoning) |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 

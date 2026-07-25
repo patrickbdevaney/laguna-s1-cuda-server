@@ -175,14 +175,15 @@ struct Server {
 
     std::vector<float> logits_host;
 
-    void boot(const std::string& md, const std::string& dd, bool fp8a, int ctx, int k) {
+    void boot(const std::string& md, const std::string& dd, bool fp8a, int ctx, int k,
+              bool fp8l, bool fp8d) {
         CTX = ctx; SPEC_K = k;
         c  = load_config(md + "/config.json");
         dc = load_draft_config(dd + "/config.json");
         use_spec = SPEC_K > 0;
         if (SPEC_K > dc.block_size - 1) SPEC_K = dc.block_size - 1;
 
-        Loader ld(md, c, fp8a);
+        Loader ld(md, c, fp8a, fp8l, fp8d);
         W = ld.load("", false);
         E.c = c; E.W = W; E.init(dc.block_size);
         S.alloc(c, CTX, dc.block_size);
@@ -342,7 +343,7 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
             CUDA_CHECK(cudaDeviceSynchronize());
             s.draft_ctx_current = true;
         }
-        s.D.propose(next, s.pos, k, s.W.embed, s.W.lm_head, draft.data());
+        s.D.propose(next, s.pos, k, s.W.embed, s.W.lm_head, s.W.lm_head8, s.W.lm_head8s, draft.data());
         blk[0] = next;
         for (int i = 0; i < k; ++i) blk[1 + i] = draft[i];
         CUDA_CHECK(cudaMemcpy(s.d_tok, blk.data(), (k + 1) * 4, cudaMemcpyHostToDevice));
@@ -407,11 +408,18 @@ int main(int argc, char** argv) {
     int port = getenv("PORT") ? atoi(getenv("PORT")) : 8080;
     int ctx  = getenv("CTX")  ? atoi(getenv("CTX"))  : 262144;
     int k    = getenv("SPEC_K") ? atoi(getenv("SPEC_K")) : 3;
-    bool fp8a = getenv("LG_BF16ATTN") == nullptr;      // FP8 attention on by default
+    // Everything the FP8 W8A16 path covers is ON by default: attention, lm_head, the shared
+    // experts and the layer-0 dense MLP. Together they take B_tok 10.04 -> 6.25 GB. Each was
+    // A/B'd with greedy output held 8/8 against the oracle, and each has a shipping NVIDIA
+    // precedent (Nemotron-3 for lm_head and shared experts, Mistral-Medium for edge dense
+    // layers). The routed experts stay NVFP4 as shipped, and q/k/v NEVER go below FP8.
+    bool fp8a = getenv("LG_BF16ATTN") == nullptr;
+    bool fp8l = getenv("LG_BF16LMHEAD") == nullptr;
+    bool fp8d = getenv("LG_BF16DENSE") == nullptr;
     std::string host = getenv("HOST") ? getenv("HOST") : "0.0.0.0";
 
     Server s; g = &s;
-    s.boot(md, dd, fp8a, ctx, k);
+    s.boot(md, dd, fp8a, ctx, k, fp8l, fp8d);
     s.alloc_io();
 
     httplib::Server http;

@@ -60,7 +60,7 @@ struct Session {
 // attention bytes that FP8 attention had already removed, and so reported 83 % of roofline
 // where the truth was 66 %. Never hardcode a byte budget that a build flag can change.
 inline double bytes_per_token(const Config& c, bool fp8_attn, int pos,
-                              bool fp8_lmhead = false) {
+                              bool fp8_lmhead = false, bool fp8_dense = false) {
     const double H = c.hidden, V = c.vocab;
     const double aw = fp8_attn ? 1.0 : 2.0;                   // attention weight element
     double b = H * 2;                                          // one embedding row
@@ -73,10 +73,13 @@ inline double bytes_per_token(const Config& c, bool fp8_attn, int pos,
         b += 2.0 * c.head_dim * 2;                             // q_norm + k_norm
         const int klen = c.is_sliding(L) ? std::min(pos + 1, c.sliding_window) : pos + 1;
         b += (double)klen * kvd * 2;                           // FP8 K and V
+        const double dw = fp8_dense ? 1.0 : 2.0;   // dense-MLP / shared-expert element
         if (c.is_dense(L)) {
-            b += 3.0 * c.intermediate * H * 2;
+            b += 3.0 * c.intermediate * H * dw;
+            if (fp8_dense) b += (2.0 * c.intermediate + H) * 4;
         } else {
-            b += 3.0 * c.shared_intermediate * H * 2;
+            b += 3.0 * c.shared_intermediate * H * dw;
+            if (fp8_dense) b += (2.0 * c.shared_intermediate + H) * 4;
             b += (double)c.n_experts * H * 2 + c.n_experts * 4; // router + selection bias
             const double ew = 3.0 * c.moe_intermediate * H;     // gate + up + down elements
             b += c.top_k * (ew * 0.5 + ew / c.nvfp4_group);     // FP4 codes + E4M3 scales
@@ -307,20 +310,24 @@ struct Engine {
             if (c.is_dense(L)) {
                 int I = c.intermediate;
                 { float* o2[2] = {mlp_a, mlp_b}; int n2[2] = {I, I};
-                  gemm_bf16_seg(o2, n2, 2, w.mlp_gate, hb, M, H, st); }
+                  if (W.fp8_dense) gemm_fp8_seg(o2, n2, 2, w.mlp_gate8, w.mlp_gate8s, hb, M, H, st);
+                  else             gemm_bf16_seg(o2, n2, 2, w.mlp_gate, hb, M, H, st); }
                 swiglu(mlp_a, mlp_a, mlp_b, (long)M * I, st);
                 f32_to_bf16(attb, mlp_a, (long)M * I, st);
-                gemm_bf16(hn, w.mlp_down, attb, M, H, I, st);
+                if (W.fp8_dense) gemm_fp8(hn, w.mlp_down8, w.mlp_down8s, attb, M, H, I, st);
+                else             gemm_bf16(hn, w.mlp_down, attb, M, H, I, st);
                 add_inplace(h, hn, (long)M * H, st);
                 acc(4);
             } else {
                 // shared expert
                 int SI = c.shared_intermediate;
                 { float* o2[2] = {mlp_a, mlp_b}; int n2[2] = {SI, SI};
-                  gemm_bf16_seg(o2, n2, 2, w.sh_gate, hb, M, H, st); }
+                  if (W.fp8_dense) gemm_fp8_seg(o2, n2, 2, w.sh_gate8, w.sh_gate8s, hb, M, H, st);
+                  else             gemm_bf16_seg(o2, n2, 2, w.sh_gate, hb, M, H, st); }
                 swiglu(mlp_a, mlp_a, mlp_b, (long)M * SI, st);
                 f32_to_bf16(attb, mlp_a, (long)M * SI, st);
-                gemm_bf16(hn, w.sh_down, attb, M, H, SI, st);
+                if (W.fp8_dense) gemm_fp8(hn, w.sh_down8, w.sh_down8s, attb, M, H, SI, st);
+                else             gemm_bf16(hn, w.sh_down, attb, M, H, SI, st);
                 add_inplace(h, hn, (long)M * H, st);      // shared expert added first
                 acc(4); mark();
 

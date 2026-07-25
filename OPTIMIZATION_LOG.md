@@ -80,6 +80,7 @@ back-to-back A/B/A.
 | 27 | **NVFP4 scale layout `[grp][lane]` → `[grp/8][lane][8]`** (bit-exact) | 27.30/27.49 | **30.80/29.54** | **WON +11 %** |
 | 28 | **DFlash context K/V: add the per-layer `input_layernorm`** | τ 3.06 / 3.30 | **τ 3.12 / 3.37** | **CORRECTNESS FIX** (k=3 / k=4) |
 | 29 | **`lm_head` BF16 → FP8 W8A16, per-output-row scale** | 29.55/29.42 | **30.61/30.57** | **WON +3.6 %**, greedy 8/8 |
+| 30 | **Shared experts + layer-0 dense BF16 → FP8** | 30.63/30.52 | **33.01/32.87** | **WON +7.8 %**, greedy 8/8 |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 
@@ -585,6 +586,33 @@ Only helps M=1; at verify M=k+1 the active-expert count already fills the grid.
 Second-order: `o_proj` runs at 228 GB/s against `q_proj`'s 236 for identical bytes — N=3072
 with K=9216 gives 36 iterations per lane where q gives 12. Worth one sweep of the load width
 for that shape specifically.
+
+### 1. ~~Self-quantize the BF16 remainder~~ — **DONE. B_tok 10.044 → 6.251 GB, +52 % cumulative.**
+
+Staged exactly as the evidence supported, each step A/B'd with greedy held 8/8 against the
+oracle:
+
+| stage | `B_tok` | tok/s | precedent |
+|---|---:|---:|---|
+| stock BF16 | 10.044 | 21.65 | — |
+| + FP8 attention (#15) | 7.115 | 29.5 | NVIDIA's written recommendation for this case |
+| + FP8 `lm_head` (#29) | 6.807 | 30.6 | Nemotron-3-Nano-4B ships it |
+| + FP8 shared experts & layer-0 dense (#30) | **6.251** | **33.0** | Nemotron-3-Super/Ultra, Mistral-Medium-3.5 |
+
+The routed experts stay NVFP4 as shipped. **q/k/v never go below FP8** and `g_proj` is never
+quantized at all — five 2026 production MoE recipes exclude attention from 4-bit, the damage
+scales *down* with active parameters (Laguna is 8.5 B active, the risky end), and gate
+projections are the worst outlier class in the NVFP4 literature.
+
+Two second-order effects worth recording:
+
+* **The draft reads the target's `lm_head` once per propose**, so following the target to FP8
+  halves the largest single term in the draft's cost. Missing this was a null-pointer crash,
+  not a silent slowdown — the FP8 path leaves the BF16 pointer unset, and Gate D1 caught it.
+* **Making base decode 52 % faster RAISED speculation's break-even.** At 33.0 tok/s AR, the
+  best speculative arm on prose is 32.9 — speculation now has to clear a much higher bar. This
+  is not a regression; it is what the adaptive controller exists to handle, and it is why a
+  fixed `num_speculative_tokens` would now be actively harmful.
 
 ### 2. Self-quantize the BF16 remainder — **the largest lever, now evidence-staged**
 Poolside quantized only the routed experts; 7.41 GB of every decode step is BF16.

@@ -187,7 +187,11 @@ struct Drafter {
     // Query branch: one forward over `block_size` positions starting at P0, then read the
     // argmax at the mask slots. Returns k ids on the host.
     // ---------------------------------------------------------------------------------
+    // `lm_head8` non-null selects the target's FP8 head. This is not just plumbing: the draft
+    // reads the whole head once per propose (0.617 GB BF16), so following the target to FP8
+    // halves the largest single term in the draft's cost.
     void propose(int next_token, int P0, int k, const uint16_t* embed, const uint16_t* lm_head,
+                 const uint8_t* lm_head8, const float* lm_head8s,
                  int* out_ids, cudaStream_t st = 0) {
         const int H = d.hidden, I = d.intermediate, BLK = d.block_size;
         const int M = k + 1;                       // bonus + k masks; never more than BLK
@@ -237,7 +241,8 @@ struct Drafter {
         add_rms_cast(hb, h, nullptr, W.final_norm, M, H, (float)d.rms_eps, 0, st);
         // Only the k MASK slots produce draft tokens; slot 0 is the bonus token, already
         // known. Skipping it saves a full lm_head row-block per propose.
-        gemm_bf16(logits, lm_head, hb + (size_t)H, k, d.vocab, H, st);
+        if (lm_head8) gemm_fp8(logits, lm_head8, lm_head8s, hb + (size_t)H, k, d.vocab, H, st);
+        else          gemm_bf16(logits, lm_head, hb + (size_t)H, k, d.vocab, H, st);
         CUDA_CHECK(cudaStreamSynchronize(st));
 
         std::vector<float> lg((size_t)k * d.vocab);

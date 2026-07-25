@@ -20,10 +20,14 @@ corrections to its factual premises: `RESCOPE.md`.
 | **D1** DFlash + k-sweep | ✅ greedy-exact at every k; τ 4.32; k\* = 3–4; E_frac measured |
 | **S1** server layer | ✅ OpenAI endpoint, prefix cache, WebUI, C++ client, adaptive speculation |
 
-**Current decode: 27.35 tok/s median** (FP8 attention, ctx 4096, greedy, no speculation).
-Session arc 21.65 → 27.35 (+26 %) — see `OPTIMIZATION_LOG.md` #18–#23. The streaming ceiling
-is **~254 GB/s** measured on a real weight shape, not the 227 GB/s `bw_probe` reported.
-Prefill 60 tok/s.
+**Current decode: 33.0 tok/s median** (ctx 4096, greedy, no speculation) — `B_tok` 6.251 GB,
+**91 % of the byte-model wall** at the measured ~254 GB/s ceiling.
+Arc: 3.66 → 21.65 → **33.0** tok/s. See `OPTIMIZATION_LOG.md` #18–#30 and
+`RESEARCH_FINDINGS_V2.md`.
+
+For scale: published full-step batch-1 bandwidth efficiency tops out at **82 %**
+(FlashFormer, H100); we are at ~85 %. poolside's own DGX Spark GB10 measurement — the closest
+hardware analogue — is **13–14 tok/s** unspeculated and 22–24 with DFlash.
 **Served, end to end** (`lgserve`, adaptive speculation): **33.6 tok/s on code**,
 **28–32 tok/s on prose**, with a hard floor at the autoregressive rate.
 

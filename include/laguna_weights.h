@@ -112,11 +112,17 @@ struct LayerW {
 
     // dense MLP (layer 0 only)
     const uint16_t *mlp_gate = nullptr, *mlp_up = nullptr, *mlp_down = nullptr;
+    // FP8 forms of the dense MLP and the shared expert. gate|up stay contiguous, and so do
+    // their scale vectors, because both are issued as ONE segmented GEMM (entry #23).
+    const uint8_t *mlp_gate8 = nullptr, *mlp_up8 = nullptr, *mlp_down8 = nullptr;
+    const float   *mlp_gate8s = nullptr, *mlp_up8s = nullptr, *mlp_down8s = nullptr;
 
     // MoE
     const uint16_t *router = nullptr;        // [E, H]
     const float   *router_bias = nullptr;    // [E]  e_score_correction_bias (SELECTION only)
     const uint16_t *sh_gate = nullptr, *sh_up = nullptr, *sh_down = nullptr;
+    const uint8_t *sh_gate8 = nullptr, *sh_up8 = nullptr, *sh_down8 = nullptr;
+    const float   *sh_gate8s = nullptr, *sh_up8s = nullptr, *sh_down8s = nullptr;
 
     // routed experts, contiguous over E:
     //   gate/up packed [E][MI][H/2]    scale [E][MI][H/group]
@@ -138,6 +144,7 @@ struct Weights {
     Config cfg;
     bool fp8_attn = false;
     bool fp8_lmhead = false;
+    bool fp8_dense = false;
     void*  arena = nullptr;
     size_t arena_bytes = 0;
     const uint16_t *embed = nullptr, *lm_head = nullptr, *final_norm = nullptr;
@@ -213,9 +220,10 @@ private:
 // ---------------------------------------------------------------- loader
 class Loader {
 public:
-    Loader(std::string model_dir, Config cfg, bool fp8_attn = false, bool fp8_lmhead = false)
+    Loader(std::string model_dir, Config cfg, bool fp8_attn = false, bool fp8_lmhead = false,
+           bool fp8_dense = false)
         : dir_(std::move(model_dir)), cfg_(std::move(cfg)), fp8_attn_(fp8_attn),
-          fp8_lmhead_(fp8_lmhead) {}
+          fp8_lmhead_(fp8_lmhead), fp8_dense_(fp8_dense) {}
 
     // cache_path: if present and matching, take the fast path; otherwise cold-load and write
     // it. Pass "" to disable the cache.
@@ -224,6 +232,7 @@ public:
         W_.cfg = cfg_;
         W_.fp8_attn = fp8_attn_;
         W_.fp8_lmhead = fp8_lmhead_;
+        W_.fp8_dense = fp8_dense_;
         W_.L.resize(cfg_.n_layers);
         read_index();
         reserve();
@@ -311,13 +320,25 @@ private:
             reserve1(w.q_norm, c.head_dim * 2);  reserve1(w.k_norm, c.head_dim * 2);
             if (c.is_dense(L)) {
                 size_t I = c.intermediate;
-                reserve1(w.mlp_gate, I * H * 2); reserve1(w.mlp_up, I * H * 2);
-                reserve1(w.mlp_down, H * I * 2);
+                if (fp8_dense_) {
+                    reserve1(w.mlp_gate8, I * H);   reserve1(w.mlp_up8, I * H);
+                    reserve1(w.mlp_gate8s, I * 4);  reserve1(w.mlp_up8s, I * 4);
+                    reserve1(w.mlp_down8, H * I);   reserve1(w.mlp_down8s, H * 4);
+                } else {
+                    reserve1(w.mlp_gate, I * H * 2); reserve1(w.mlp_up, I * H * 2);
+                    reserve1(w.mlp_down, H * I * 2);
+                }
             } else {
                 size_t SI = c.shared_intermediate;
                 reserve1(w.router, E * H * 2);   reserve1(w.router_bias, E * 4);
-                reserve1(w.sh_gate, SI * H * 2); reserve1(w.sh_up, SI * H * 2);
-                reserve1(w.sh_down, H * SI * 2);
+                if (fp8_dense_) {
+                    reserve1(w.sh_gate8, SI * H);   reserve1(w.sh_up8, SI * H);
+                    reserve1(w.sh_gate8s, SI * 4);  reserve1(w.sh_up8s, SI * 4);
+                    reserve1(w.sh_down8, H * SI);   reserve1(w.sh_down8s, H * 4);
+                } else {
+                    reserve1(w.sh_gate, SI * H * 2); reserve1(w.sh_up, SI * H * 2);
+                    reserve1(w.sh_down, H * SI * 2);
+                }
                 reserve1(w.e_gate_p, E * MI * (H / 2));
                 reserve1(w.e_up_p,   E * MI * (H / 2));
                 reserve1(w.e_down_p, E * H * (MI / 2));
@@ -381,16 +402,28 @@ private:
             put_scalar(p + "self_attn.v_scale", &w.v_scale);
             if (c.is_dense(L)) {
                 size_t I = c.intermediate;
-                put(p + "mlp.gate_proj.weight", w.mlp_gate, I * H * 2, "BF16");
-                put(p + "mlp.up_proj.weight",   w.mlp_up,   I * H * 2, "BF16");
-                put(p + "mlp.down_proj.weight", w.mlp_down, H * I * 2, "BF16");
+                if (fp8_dense_) {
+                    put_q8(p + "mlp.gate_proj.weight", w.mlp_gate8, w.mlp_gate8s, (int)I, (int)H);
+                    put_q8(p + "mlp.up_proj.weight",   w.mlp_up8,   w.mlp_up8s,   (int)I, (int)H);
+                    put_q8(p + "mlp.down_proj.weight", w.mlp_down8, w.mlp_down8s, (int)H, (int)I);
+                } else {
+                    put(p + "mlp.gate_proj.weight", w.mlp_gate, I * H * 2, "BF16");
+                    put(p + "mlp.up_proj.weight",   w.mlp_up,   I * H * 2, "BF16");
+                    put(p + "mlp.down_proj.weight", w.mlp_down, H * I * 2, "BF16");
+                }
             } else {
                 size_t SI = c.shared_intermediate;
                 put(p + "mlp.gate.weight", w.router, E * H * 2, "BF16");
                 put(p + "mlp.experts.e_score_correction_bias", w.router_bias, E * 4, "F32");
-                put(p + "mlp.shared_expert.gate_proj.weight", w.sh_gate, SI * H * 2, "BF16");
-                put(p + "mlp.shared_expert.up_proj.weight",   w.sh_up,   SI * H * 2, "BF16");
-                put(p + "mlp.shared_expert.down_proj.weight", w.sh_down, H * SI * 2, "BF16");
+                if (fp8_dense_) {
+                    put_q8(p + "mlp.shared_expert.gate_proj.weight", w.sh_gate8, w.sh_gate8s, (int)SI, (int)H);
+                    put_q8(p + "mlp.shared_expert.up_proj.weight",   w.sh_up8,   w.sh_up8s,   (int)SI, (int)H);
+                    put_q8(p + "mlp.shared_expert.down_proj.weight", w.sh_down8, w.sh_down8s, (int)H, (int)SI);
+                } else {
+                    put(p + "mlp.shared_expert.gate_proj.weight", w.sh_gate, SI * H * 2, "BF16");
+                    put(p + "mlp.shared_expert.up_proj.weight",   w.sh_up,   SI * H * 2, "BF16");
+                    put(p + "mlp.shared_expert.down_proj.weight", w.sh_down, H * SI * 2, "BF16");
+                }
                 for (size_t e = 0; e < E; ++e) {
                     std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
                     put_rp(ep + "gate_proj.weight_packed", w.e_gate_p + e * MI * (H / 2),  MI * (H / 2), "U8", 1, (int)MI, (int)H);
@@ -584,6 +617,7 @@ private:
     void* q8_scratch_ = nullptr; size_t q8_scratch_bytes_ = 0;
     bool fp8_attn_ = false;
     bool fp8_lmhead_ = false;
+    bool fp8_dense_ = false;
     size_t arena_bytes_ = 0, unmapped_ = 0;
 };
 

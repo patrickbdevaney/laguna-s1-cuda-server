@@ -45,7 +45,8 @@ int main(int argc, char** argv) {
     for (int k : KS)
         if (k < 1 || k > BLK - 1) { printf("k=%d outside [1,%d]\n", k, BLK - 1); return 1; }
 
-    Loader ld(md, c, FP8A); Weights W = ld.load("", false);
+    bool FP8L = getenv("LG_FP8LMHEAD") != nullptr, FP8D = getenv("LG_FP8DENSE") != nullptr;
+    Loader ld(md, c, FP8A, FP8L, FP8D); Weights W = ld.load("", false);
     DraftLoader dld(dd, dc); DraftWeights DW = dld.load(true);
 
     Engine E; E.c = c; E.W = W; E.init(BLK);
@@ -116,7 +117,7 @@ int main(int argc, char** argv) {
         double t0 = wall_now();
         while ((int)got.size() < NGEN) {
             // propose k tokens conditioned on the committed token `next` at position `pos`
-            D.propose(next, pos, k, W.embed, W.lm_head, draft.data());
+            D.propose(next, pos, k, W.embed, W.lm_head, W.lm_head8, W.lm_head8s, draft.data());
 
             // verify: one target forward over [next, draft...] at positions pos..pos+k
             blk[0] = next;
@@ -172,7 +173,7 @@ int main(int argc, char** argv) {
         double tau = (double)accepted_total / (double)target_fwd;
         // Bytes per accepted token, from the same accounting bench_decode uses, plus the
         // expert term at the MEASURED activation fraction and the draft's own weights.
-        double dense = bytes_per_token(c, FP8A, pos) - c.top_k * 47.0 *
+        double dense = bytes_per_token(c, FP8A, pos, FP8L, FP8D) - c.top_k * 47.0 *
                        (3.0 * c.moe_intermediate * c.hidden) * (0.5 + 1.0 / c.nvfp4_group);
         double experts = (ef * c.n_experts) * 47.0 *
                          (3.0 * c.moe_intermediate * c.hidden) * (0.5 + 1.0 / c.nvfp4_group);

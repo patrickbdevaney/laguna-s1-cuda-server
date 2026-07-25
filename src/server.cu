@@ -161,6 +161,13 @@ struct Server {
     bool use_spec = true;
 
     SpecBandit bandit;
+    // Is the draft's context K/V current for `pos`? While the bandit sits on the
+    // autoregressive arm the draft is not consulted, and projecting context K/V for every
+    // committed token costs an fc GEMM (113 MB) plus six layers of k/v (75 MB) -- about
+    // 1 ms per token, ~2.6 % of an AR step, spent maintaining state nothing reads. The TAPS
+    // still have to be written (they are part of the target forward and free), so switching
+    // back only needs one rebuild over the draft's 512-wide window.
+    bool draft_ctx_current = false;
 
     // prefix cache
     std::vector<int> cached;        // token ids currently represented in S's KV
@@ -282,12 +289,9 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
     int last_row = s.prefill(ids, reused);
     int next = s.sample_row(last_row, o.temperature, o.top_p, rng);
 
-    // Draft context for everything still inside the draft's 512-wide window.
-    if (s.use_spec) {
-        int c0 = std::max(0, s.pos - s.dc.sliding_window);
-        s.D.context_kv(s.E.taps, s.E.tap_cap, c0, s.pos - c0);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
+    // The prefix cache means the draft's context may be stale for an arbitrary rewind, so it
+    // is rebuilt lazily on the first speculative step rather than eagerly here.
+    s.draft_ctx_current = false;
 
     if (stats) { stats->prefill_s = wall_now() - tp0; stats->prompt = (int)ids.size(); }
     const double td0 = wall_now();
@@ -326,12 +330,18 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
             CUDA_CHECK(cudaDeviceSynchronize());
             s.pos += 1;
             next = s.sample_row(0, o.temperature, o.top_p, rng);
-            if (s.use_spec) s.D.context_kv(s.E.taps, s.E.tap_cap, s.pos - 1, 1);
+            s.draft_ctx_current = false;          // taps stay fresh; the projection lapses
             s.bandit.update(arm, 1, wall_now() - ts0);
             if (stats) ++stats->steps;
             continue;
         }
 
+        if (!s.draft_ctx_current) {
+            const int c0 = std::max(0, s.pos - s.dc.sliding_window);
+            s.D.context_kv(s.E.taps, s.E.tap_cap, c0, s.pos - c0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            s.draft_ctx_current = true;
+        }
         s.D.propose(next, s.pos, k, s.W.embed, s.W.lm_head, draft.data());
         blk[0] = next;
         for (int i = 0; i < k; ++i) blk[1 + i] = draft[i];
@@ -353,6 +363,7 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         s.pos += nacc + 1;
         next = tout[nacc];
         s.D.context_kv(s.E.taps, s.E.tap_cap, s.pos - (nacc + 1), nacc + 1);
+        s.draft_ctx_current = true;
         s.bandit.update(arm, nacc + 1, wall_now() - ts0);
         if (stats) ++stats->steps;
     }

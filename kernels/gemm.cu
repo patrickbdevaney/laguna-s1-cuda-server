@@ -129,6 +129,18 @@ static int gemm_warps() {
         }                                                                                   \
     } while (0)
 
+#define GEMM_DISPATCH_V(KERN, MMV, VECV, ...)                                               \
+    do {                                                                                    \
+        const int WPB = gemm_warps();                                                       \
+        dim3 g_((N + WPB - 1) / WPB, (M + (MMV) - 1) / (MMV));                              \
+        switch (WPB) {                                                                      \
+        case 8: KERN<8, MMV, VECV><<<g_, 8 * 32, 0, st>>>(__VA_ARGS__); break;               \
+        case 4: KERN<4, MMV, VECV><<<g_, 4 * 32, 0, st>>>(__VA_ARGS__); break;               \
+        case 2: KERN<2, MMV, VECV><<<g_, 2 * 32, 0, st>>>(__VA_ARGS__); break;               \
+        default: KERN<1, MMV, VECV><<<g_, 32, 0, st>>>(__VA_ARGS__); break;                  \
+        }                                                                                   \
+    } while (0)
+
 extern "C" void gemm_bf16(float* out, const uint16_t* W, const uint16_t* xb,
                           int M, int N, int K, cudaStream_t st) {
     // Specialise the M-loop the way the MoE token loop was specialised (OPTIMIZATION_LOG #6):
@@ -251,7 +263,11 @@ extern "C" void quant_fp8_rows(uint8_t* q, float* scale, const uint16_t* w, int 
     k_quant_fp8_rows<<<N, 256, 0, st>>>(q, scale, w, N, K);
 }
 
-template <int WARPS, int MM>
+template <int V> struct WVec;
+template <> struct WVec<8>  { typedef uint2 T; };
+template <> struct WVec<16> { typedef uint4 T; };
+
+template <int WARPS, int MM, int VEC>
 __global__ __launch_bounds__(WARPS * 32)
 void k_gemm_fp8(float* __restrict__ out, const uint8_t* __restrict__ W,
                 const float* __restrict__ rs, const uint16_t* __restrict__ xb,
@@ -271,25 +287,33 @@ void k_gemm_fp8(float* __restrict__ out, const uint8_t* __restrict__ W,
     // BF16 kernel gets, and squarely in the latency-bound regime. Measured: 16-byte loads
     // gave 125 GB/s on this path against the BF16 kernel's 256. uint2 restores 12
     // iterations per lane and keeps 32x8 = 256 contiguous bytes per warp step.
-    const uint2* wrow = (const uint2*)(W + (long)n * K);
-    const int C = K / 8;                                   // 8 fp8 per uint2
+    // VEC = bytes per lane per step. 8 (uint2) was chosen when this kernel ran one warp per
+    // block, where 16-byte loads left only K/16/32 = 6 iterations and it was latency-bound.
+    // With 4 warps resident that trade-off may have moved, so it is a knob, not a constant.
+    const int C = K / VEC;
+    typedef typename WVec<VEC>::T wvec_t;
+    const wvec_t* wrow = (const wvec_t*)(W + (long)n * K);
     for (int c = lane; c < C; c += 32) {
-        uint2 wv = __ldcs(wrow + c);
+        wvec_t wv = __ldcs(wrow + c);
         const uint8_t* wb = (const uint8_t*)&wv;
         #pragma unroll
         for (int m = 0; m < MM; ++m) {
             if (m >= mn) break;
-            // One 16-byte vector load, exactly as the BF16 kernel does. Indexing
-            // `xb + ...` as a uint16_t* here instead compiled to EIGHT scalar 2-byte loads
-            // per row, so at MM=8 the inner loop issued 64 loads where 8 would do: measured
+            // Vector loads on x too, exactly as the BF16 kernel does. Indexing
+            // `xb + ...` as a uint16_t* here instead compiled to one scalar 2-byte load per
+            // element, so at MM=8 the inner loop issued 64 loads where 8 would do: measured
             // 0.809 ms vs 0.146 at M=1 on the same weights, and it would have shown up as
-            // "speculation does not help" rather than as a GEMM bug. (K and c*8 are both
+            // "speculation does not help" rather than as a GEMM bug. (K and c*VEC are both
             // multiples of 8, so the address is 16-byte aligned.)
-            const uint4 xv = *(const uint4*)(xb + (long)(m0 + m) * K + c * 8);
-            const uint16_t* xh = (const uint16_t*)&xv;
+            const uint16_t* xp = xb + (long)(m0 + m) * K + c * VEC;
             float s = 0.f;
             #pragma unroll
-            for (int j = 0; j < 8; ++j) s = fmaf(e4m3f(wb[j]), bf2f(xh[j]), s);
+            for (int v = 0; v < VEC / 8; ++v) {
+                const uint4 xv = *(const uint4*)(xp + v * 8);
+                const uint16_t* xh = (const uint16_t*)&xv;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) s = fmaf(e4m3f(wb[v * 8 + j]), bf2f(xh[j]), s);
+            }
             acc[m] += s;
         }
     }
@@ -304,6 +328,14 @@ void k_gemm_fp8(float* __restrict__ out, const uint8_t* __restrict__ W,
 
 extern "C" void gemm_fp8(float* out, const uint8_t* W, const float* rs, const uint16_t* xb,
                          int M, int N, int K, cudaStream_t st) {
-    if (M == 1) { GEMM_DISPATCH(k_gemm_fp8, 1, out, W, rs, xb, M, N, K); return; }
-    GEMM_DISPATCH(k_gemm_fp8, MAXM, out, W, rs, xb, M, N, K);
+    static int VEC = -1;
+    if (VEC < 0) { const char* e = getenv("LG_FP8_VEC"); VEC = e ? atoi(e) : 16;
+                   if (VEC != 8 && VEC != 16) VEC = 8; }
+    if (VEC == 16) {
+        if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8, 1, 16, out, W, rs, xb, M, N, K); return; }
+        GEMM_DISPATCH_V(k_gemm_fp8, MAXM, 16, out, W, rs, xb, M, N, K);
+    } else {
+        if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8, 1, 8, out, W, rs, xb, M, N, K); return; }
+        GEMM_DISPATCH_V(k_gemm_fp8, MAXM, 8, out, W, rs, xb, M, N, K);
+    }
 }

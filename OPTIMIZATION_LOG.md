@@ -72,6 +72,34 @@ back-to-back A/B/A.
 | 19 | **GEMM warps per block 1 → 4** (occupancy, bit-exact) | 21.65/21.70 | **24.59/24.50** | **WON +13.4 %** |
 | 20 | **MoE: activation row as `uint4`, not 32 scalar 2-byte loads** (bit-exact) | 24.55 | **25.62/25.51** | **WON, with #21** |
 | 21 | **Router top-k on a warp, not on `threadIdx.x == 0`** | — | — | (folded into #20's measurement) |
+| 22 | **FP8 GEMM weight loads 8 B → 16 B**, now that 4 warps hide the latency | 25.63 | **26.59/26.66** | **WON +4.0 %** |
+
+### #22 — a correct decision that expired
+
+`k_gemm_fp8` deliberately used 8-byte weight loads, with a comment explaining why: 16-byte
+loads leave only K/16/32 = 6 iterations per lane, which measured 125 GB/s against the BF16
+kernel's 256. That reasoning was right **at one warp per block**. Once #19 put four warps on
+each SM there are enough warps to hide the longer-latency, fewer-iteration form, and the
+decision inverts:
+
+| shape | 8 B | 16 B |
+|---|---:|---:|
+| q_proj sliding [9216,3072] | 230.5 | 235.7 |
+| o_proj sliding [3072,9216] | 193.4 | **227.6** |
+| q_proj global [6144,3072] | 225.4 | **244.4** |
+| k/v_proj [1024,3072] | 138.9 | **168.3** |
+| end to end | 25.63 | **26.59 / 26.66** |
+
+Unlike #19 and #20 this one is **not bit-exact** — it repartitions K across lanes, so the
+dot product sums in a different order. It is applied identically at every M, so decode,
+prefill and verify still agree with each other (Gate B1c's invariant), and greedy stayed 8/8
+against the oracle on both the FP8 and BF16 paths. Kept as a knob (`LG_FP8_VEC`) rather than
+hardcoded, because the next occupancy change could invert it again.
+
+**The general lesson is the one this entry is really for:** a tuning constant justified by a
+measurement is only valid under the conditions of that measurement. When #19 changed
+occupancy it silently invalidated #15's load-width choice, and nothing in the code said so.
+Re-run the width/unroll sweeps after any occupancy change.
 
 ### #20/#21 — the same scalar-load defect, and a "negligible" kernel that was 3.2 %
 

@@ -368,3 +368,94 @@ blocks existed only to read `*nactive` and exit.
 champion path achieved (91 GB/s), and 40 % of the 227 GB/s ceiling — so ~2.5× of headroom
 remains. The gap is no longer "unreconciled": it is the MoE FP4 GEMM (27 GB/s = 12 %), the
 BF16 GEMM (136 GB/s = 60 %), and ~1665 kernel launches per step with no CUDA graph yet.
+
+---
+
+## Gate B1c — batched prefill ≡ sequential decode · **PASS** · 2026-07-25
+
+`tests/gate_longctx.cu` prefills P tokens in batches of `MAXTOK`, then feeds the *same* P
+tokens one at a time, and requires the last logits to agree. Single-token decode is a
+trustworthy oracle here with no Python and no golden tensors: 512 consecutive positions map
+to 512 distinct sliding-ring slots, so M=1 is provably free of the aliasing the batched path
+can suffer.
+
+It failed, and the failure was instructive.
+
+| P | MAXTOK | last-logit maxabs | argmax batched / sequential |
+|---:|---:|---:|---|
+| 2 | 2 | 0.0000e+00 | 66721 / 66721 |
+| 4 | 4 | 8.5791e-01 | **57413 / 29046** |
+| 8 | 8 | 5.6977e+00 | 56869 / 56869 |
+
+Ruled out first, each by direct measurement rather than argument:
+
+* **The two attention kernels.** `gate_attn_split` compares `attend` against `attend_split`
+  bit-exactly across G ∈ {6,9}, len ∈ {64,200,512,900}, NSP ∈ {2,4,8,16} — 0.000e+00.
+* **The sliding-window ring.** P=300 is entirely below the 512 window and still failed.
+* **The `attb` overflow** (sized `MAXTOK·maxq`, used for the layer-0 dense intermediate).
+  Real bug, fixed, gate still failed.
+
+A per-layer capture of the hidden state for the *same* token then localised it:
+
+```
+layer        maxabs          rel
+0        7.4506e-09   1.0912e-08  <-- diverges
+```
+
+**7.45e-09 at layer 0 is fp32 rounding, not an index error.** An indexing bug produces O(1)
+garbage. What the table above actually shows is a 1-ulp seed amplified by the residual stream
+at roughly 1.4× per layer — 1.4^48 ≈ 4e7, which takes 1e-8 to 1e-1 by the time it reaches the
+logits, and flips a knife-edge argmax.
+
+### Root cause
+
+`attend_nsplit(M, nkv, len)` sized the key split as `ceil(80/(M·nkv))` — targeting ~80 blocks
+for the *current* shape. So the same token was computed with **10 key splits at decode M=1 and
+3 at a batched M=4**. The split count chooses the partition of the key axis, and the
+flash-decoding combine is a chain of fp32 online-softmax rescales, which is not associative:
+a different partition is a different rounding of identical inputs. (P=2 passed by luck — 5
+splits happened to round the same way.)
+
+Confirmed by pinning it, which is the cleanest possible A/B:
+
+| forced NSP | layers 0–47 | last logits | argmax |
+|---|---|---|---|
+| 1 | all 0.0000e+00 | 0.0000e+00 | 350 / 350 |
+| 8 | all 0.0000e+00 | 0.0000e+00 | 29046 / 29046 |
+
+**Verdict: no bug in the batched path.** It was arithmetically correct the whole time; the two
+paths were simply given different reduction orders to compare.
+
+### Fix
+
+`attend_nsplit` now ignores `M` and sizes the split from the key length alone
+(`clamp(ceil(80/nkv), 1, ceil(len/64), 32)`), which is exactly the old value at the decode
+shape — so decode numerics and decode speed are untouched — and makes every other shape match
+it. Decode, batched prefill and speculative verify are now the same arithmetic.
+
+This matters well beyond the gate: **a DFlash acceptance rate is only meaningful if the verify
+pass at M=k+1 reproduces the decode pass at M=1 exactly.** Otherwise the speculative path and
+the autoregressive path are different models and τ measures their disagreement as much as the
+draft's quality.
+
+### Result — 10/10 bit-exact
+
+| MAXTOK | P | verdict |
+|---:|---|---|
+| 4 | 4, 8, 300, 700 | 0.0000e+00 ×4 |
+| 16 (DFlash verify shape) | 17, 300, 700 | 0.0000e+00 ×3 |
+| 64 (bulk prefill) | 300, 700, 1200 | 0.0000e+00 ×3 |
+
+700 and 1200 sit above the 512 sliding window, so the `cap = window + MAXTOK` ring fix is
+exercised at all three batch widths.
+
+### Second finding, recorded because it constrains how every later gate is written
+
+On **uniform-random token IDs** this model amplifies 1 ulp into an argmax flip. That is not a
+defect: random IDs are maximally off-distribution, the 256-way sigmoid router sits near
+uniform, and the top-10 selection is then a coin toss between experts whose scores differ in
+the last bits. It does mean a bit-exactness gate on random tokens is the *strictest possible*
+form of the test — which is why it is worth keeping — and that any future gate comparing two
+numerically-different-but-both-valid paths must compare against the oracle, never against each
+other. `LG_TEXT=tests/data/sample.txt` switches the same gate to real prose for the
+in-distribution case.

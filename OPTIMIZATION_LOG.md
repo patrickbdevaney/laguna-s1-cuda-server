@@ -67,6 +67,7 @@ back-to-back A/B/A.
 | 14 | MoE gate/up on separate warps (320→640 warps) | 18.90 | 18.62/18.68 | **LOST −1.3 %, default off** |
 | 15 | **FP8 e4m3 attention weights, per-output-row scale** | 18.94 | **20.44** | **WON +8.1 %** |
 | 16 | Attention kernel: template `G`, Q in registers (stack 224 B → **0**) | 20.79 | 20.75 / 21.16 | NEUTRAL at short ctx, **kept** — see below |
+| 17 | `attend_nsplit` no longer depends on `M` (split sized by key length alone) | — | — | **CORRECTNESS FIX**, decode shape unchanged |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler

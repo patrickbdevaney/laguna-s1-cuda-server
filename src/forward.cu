@@ -103,6 +103,18 @@ struct Engine {
     int   *dbase = nullptr;            // decode position, device-side (graph-safe)
     static const int MAXSPLIT = 32;
 
+    // --- optional per-layer capture, for localising a prefill/decode divergence
+    bool dbg = false; int dbg_row = 0;
+    std::vector<std::vector<float>> dbg_h;
+    void dbg_grab(int M) {
+        if (!dbg) return;
+        std::vector<float> row(c.hidden);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(row.data(), h + (size_t)std::min(dbg_row, M - 1) * c.hidden,
+                              c.hidden * 4, cudaMemcpyDeviceToHost));
+        dbg_h.push_back(row);
+    }
+
     // --- CUDA graph for the M=1 decode step
     cudaGraphExec_t g_exec = nullptr;
     bool graph_ready = false;
@@ -111,6 +123,10 @@ struct Engine {
     // full KV capacity would launch 10 splits per global layer from token one; instead we
     // capture against a doubling bound and re-capture when the conversation outgrows it.
     int  split_ctx = 0;
+    // Diagnostic/determinism override. attend_nsplit() sizes the key split from M, so a
+    // batched forward and a single-token decode of the SAME token combine their partials in
+    // different orders. Pinning it makes the two paths bit-comparable.
+    int  nsp_force = 0;
 
     void init(int maxtok) {
         MAXTOK = maxtok;
@@ -243,7 +259,7 @@ struct Engine {
             // exit immediately and contribute a -inf partial that the combine ignores.
             int klen = slide ? c.sliding_window
                              : std::min(split_ctx > 0 ? split_ctx : S.cap[L], S.cap[L]);
-            int nsp = attend_nsplit(M, c.n_kv_heads, klen);
+            int nsp = nsp_force ? nsp_force : attend_nsplit(M, c.n_kv_heads, klen);
             if (nsp > MAXSPLIT) nsp = MAXSPLIT;
             attend_split(att, pacc, pml, q, S.Kc[L], S.Vc[L], w.k_scale, w.v_scale, M,
                          c.n_kv_heads, G, S.cap[L], slide ? c.sliding_window : 0, dbase,
@@ -309,6 +325,7 @@ struct Engine {
                 add_inplace(h, hn, (long)M * H, st);
                 acc(6);
             }
+            dbg_grab(M);
         }
         mark();
         add_rms_cast(hb, h, nullptr, W.final_norm, M, H, (float)c.rms_eps, 0, st);

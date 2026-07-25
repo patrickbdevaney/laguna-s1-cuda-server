@@ -1,0 +1,23 @@
+The bandwidth of a memory system is the rate at which it can move bytes between the
+storage array and the compute units that consume them. For a decoder-only transformer
+running one token at a time, every parameter that participates in the step must be read
+at least once, so the time per token has a hard lower bound: the number of bytes touched
+divided by the achievable bandwidth. Arithmetic throughput almost never matters at batch
+size one. This is why quantization helps so much, and why a mixture-of-experts model with
+ten active experts out of two hundred and fifty-six behaves, from the memory system's
+point of view, like a much smaller dense model.
+
+Speculative decoding attacks the same bound from a different direction. Instead of reading
+the weights once per token, a small draft proposes several tokens and the large model
+verifies them in a single forward pass. The weights are read once for the whole block, so
+the cost per accepted token falls by roughly the acceptance length. The draft must be
+cheap enough that its own cost does not eat the saving, and accurate enough that the
+acceptance length is worth having. In practice these two requirements pull in opposite
+directions, and the useful designs sit in a narrow band between them.
+
+Caching the keys and values is the other half of the story. A sliding-window layer keeps a
+fixed number of positions no matter how long the conversation runs, so its cost is constant.
+A global layer keeps everything, and its cost grows linearly with context. When three
+quarters of the layers slide, the cache grows four times more slowly than it otherwise
+would, which is what makes a very long agentic context affordable on a machine with a
+single pool of unified memory shared between the model weights and everything else.

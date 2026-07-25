@@ -16,6 +16,7 @@ corrections to its factual premises: `RESCOPE.md`.
 | **A1** oracle + arch delta | ✅ bit-exact vs shipped `modeling_laguna.py`; golden tensors from real weights |
 | **L1** loader | ✅ 71.899 GB in one arena, 44.6 s cold, 4.92 GB peak RSS |
 | **B1** kernels G1–G9 | ✅ 13/13 kernel gates; full forward **greedy-exact**; CUDA graph capture |
+| **B1c** batched ≡ sequential | ✅ 10/10 **bit-exact** (MAXTOK 4/16/64 × P 4…1200, above and below the window) |
 | **D1** DFlash + k-sweep | ⏳ |
 | **S1** server layer | ⏳ |
 
@@ -94,7 +95,17 @@ Each of these cost a failed gate or a measurement to establish; details in `LOOP
 11. **Repack trades warp count for iterations-per-warp.** It won +70 % on the MoE (3
     iterations/warp) and LOST 33 % on the BF16 GEMMs (12 iterations/warp, and small-N ones
     collapse to 8–32 warps for the whole GPU).
-12. **`__device__` globals are per-module without `-rdc=true`.** An `extern __device__` in a
+12. **The attention split count must not depend on `M`.** It chooses the partition of the
+    key axis, and the flash-decoding combine is a non-associative chain of fp32 rescales — so
+    a decode step and a prefill step of the same token got different roundings. 1 ulp at
+    layer 0, amplified ~1.4× per layer, flips the argmax by layer 48. Sizing the split from
+    key length alone makes decode, prefill and speculative verify bit-identical, which is what
+    lets a DFlash acceptance rate mean anything.
+13. **On uniform-random token IDs this model turns 1 ulp into a different token.** The 256-way
+    sigmoid router is near-uniform off-distribution, so top-10 is a coin toss. Gates on random
+    IDs are the strictest form of the test; two paths that merely round differently must be
+    compared against the oracle, never against each other.
+14. **`__device__` globals are per-module without `-rdc=true`.** An `extern __device__` in a
     second translation unit silently becomes its own copy; nvcc's warning `#20044-D` is the
     only sign. Pass device state by pointer instead.
 

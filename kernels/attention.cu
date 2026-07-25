@@ -289,8 +289,23 @@ extern "C" void attend(float* out, const float* Q, const uint8_t* Kc, const uint
 }
 
 // Choose the split so the grid lands at ~4 blocks/SM (20 SMs), capped by the key range.
+//
+// CORRECTNESS: this must NOT depend on M. The split count selects the partition of the key
+// axis, and the flash-decoding combine is a chain of fp32 online-softmax rescales, so a
+// different partition is a different rounding of the SAME token. The earlier form used
+// ceil(80/(M*nkv)) and therefore gave 10 splits at decode M=1 but 3 at a batched M=4 — the
+// two paths disagreed by ~1 ulp at layer 0 (7.4e-09), the residual stream amplified it about
+// 1.4x per layer, and by layer 48 the argmax had flipped (LOOP_LOG B1c). Sizing the split
+// from `len` alone makes decode, batched prefill and speculative verify bit-identical, which
+// is what makes a DFlash acceptance rate mean anything: the verify pass at M=k+1 must
+// reproduce the decode pass at M=1 exactly, or it is not verifying the same model.
+//
+// The target is the decode shape: ~80 blocks = 4 waves of 20 SMs at M=1. Larger M simply
+// gets a larger grid, which costs a bigger partial buffer and a wider combine but no extra
+// K/V traffic — the key range is partitioned, not replicated.
 extern "C" int attend_nsplit(int M, int nkv, int len) {
-    int want = (80 + M * nkv - 1) / (M * nkv);
+    (void)M;
+    int want = (80 + nkv - 1) / nkv;
     int by_len = (len + 63) / 64;               // >=64 keys per block, else it is all overhead
     int n = want < by_len ? want : by_len;
     if (n < 1) n = 1;

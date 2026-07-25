@@ -56,6 +56,7 @@ back-to-back A/B/A.
 | — | *(1+2+3 combined, end to end)* | **3.66 tok/s** | **9.23 tok/s** | **+152 %** |
 | 4 | MoE accumulators templated on a compile-time token bound | 9.00 | 9.31 | marginal (+3 %, within noise) |
 | 5 | MoE E4M3 scale rows staged in shared memory | 9.34 | 9.17 | **LOST, reverted** |
+| 6 | MoE token loop specialised TM=1 at decode (registers 127→50 / 80→40) | 9.35 | **9.73** | **WON +4.1 %** |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
@@ -83,6 +84,16 @@ amplification is evidently already absorbed by L2 (a 192-byte scale row is one o
 and is reused by all 32 lanes), and the `__syncwarp` plus shared round-trip costs more than it
 saves. **Reverted.** Recorded so it is not retried: on this shape, scale reads are not the
 problem.
+
+### #6 — the token-unroll was a register wall (WON, +4.1 %)
+`-Xptxas -v` said `k_moe_gateup<4>` used **127 registers**. At 128 threads/block that is 16 K
+of the SM's 64 K register file, capping occupancy at **4 blocks/SM**. The cause is the
+`#pragma unroll` over the 4-token loop: it replicates every temporary. At decode each expert
+receives exactly one token, so dispatching a `TM=1` instantiation drops it to **50 registers**
+(and `k_moe_down` 80 → 40). Experts with more tokens than `TM` just loop and re-read.
+
+Also hoisted the `elist` load and `/topk` division out of the k-loop, where they were being
+redone every iteration.
 
 ### Where the time actually goes (per-category profile, `LG_PROF=1`)
 

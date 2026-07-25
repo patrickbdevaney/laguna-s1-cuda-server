@@ -40,9 +40,9 @@ void attend_split(float*, float*, float*, const float*, const uint8_t*, const ui
 void moe_invert(int*, int*, int*, int*, int*, int*, const int*, int, int, int, cudaStream_t);
 void moe_gateup(float*, const uint8_t*, const uint8_t*, const float*, const uint8_t*, const uint8_t*,
                 const float*, const uint16_t*, const int*, const int*, const int*, const int*,
-                const int*, int, int, int, int, int, cudaStream_t);
+                const int*, int, int, int, int, int, int, cudaStream_t);
 void moe_down(float*, const uint8_t*, const uint8_t*, const float*, const uint16_t*, const int*,
-              const int*, const int*, const int*, const int*, int, int, int, int, cudaStream_t);
+              const int*, const int*, const int*, const int*, int, int, int, int, int, cudaStream_t);
 void moe_finalize(float*, const float*, const float*, const int*, int, int, int, float, cudaStream_t);
 }
 
@@ -244,10 +244,10 @@ struct Engine {
                 int nact = std::min(E, M * TK);
                 moe_gateup(moe_h, w.e_gate_p, w.e_gate_s, w.e_gate_inv,
                            w.e_up_p, w.e_up_s, w.e_up_inv, hb, elist, eoff, ecount,
-                           active, nactive, nact, H, MI, TK, c.nvfp4_group, st);
+                           active, nactive, nact, H, MI, TK, c.nvfp4_group, (M == 1 ? 1 : 4), st);
                 f32_to_bf16(moe_hb, moe_h, (long)M * TK * MI, st);
                 moe_down(dpart, w.e_down_p, w.e_down_s, w.e_down_inv, moe_hb, elist, eoff,
-                         ecount, active, nactive, nact, H, MI, c.nvfp4_group, st);
+                         ecount, active, nactive, nact, H, MI, c.nvfp4_group, (M == 1 ? 1 : 4), st);
                 moe_finalize(hn, dpart, rwts, sel, M, H, TK, (float)c.routed_scaling, st);
                 add_inplace(h, hn, (long)M * H, st);
                 acc(6);

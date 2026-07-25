@@ -122,8 +122,14 @@ __global__ void k_moe_gateup(float* __restrict__ hbuf,
   for (int t0 = 0; t0 < cnt; t0 += TM) {
     const int nt = min(TM, cnt - t0);
     float accg[TM], accu[TM];
+    const uint16_t* xrow[TM];
     #pragma unroll
-    for (int i = 0; i < TM; ++i) { accg[i] = 0.f; accu[i] = 0.f; }
+    for (int i = 0; i < TM; ++i) {
+        accg[i] = 0.f; accu[i] = 0.f;
+        // hoisted: the elist load and the /topk division were being redone every c-iteration
+        int a = (i < nt) ? elist[base + t0 + i] : 0;
+        xrow[i] = xb + (long)(a / topk) * H;
+    }
 
     for (int c = lane; c < C; c += 32) {
         uint4 gv = __ldcs(grow + c), uv = __ldcs(urow + c);
@@ -134,8 +140,7 @@ __global__ void k_moe_gateup(float* __restrict__ hbuf,
         #pragma unroll
         for (int i = 0; i < TM; ++i) {
             if (i >= nt) break;
-            int a = elist[base + t0 + i];
-            const uint16_t* xh = xb + (long)(a / topk) * H + c * 32;
+            const uint16_t* xh = xrow[i] + c * 32;
             float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -192,8 +197,12 @@ __global__ void k_moe_down(float* __restrict__ dpart,
   for (int t0 = 0; t0 < cnt; t0 += TM) {
     const int nt = min(TM, cnt - t0);
     float acc[TM];
+    const uint16_t* hrow[TM];
     #pragma unroll
-    for (int i = 0; i < TM; ++i) acc[i] = 0.f;
+    for (int i = 0; i < TM; ++i) {
+        acc[i] = 0.f;
+        hrow[i] = hb + (long)((i < nt) ? elist[base + t0 + i] : 0) * MI;
+    }
 
     for (int c = lane; c < C; c += 32) {
         uint4 dv = __ldcs(drow + c);
@@ -202,7 +211,7 @@ __global__ void k_moe_down(float* __restrict__ dpart,
         #pragma unroll
         for (int i = 0; i < TM; ++i) {
             if (i >= nt) break;
-            const uint16_t* hh = hb + (long)elist[base + t0 + i] * MI + c * 32;
+            const uint16_t* hh = hrow[i] + c * 32;
             float h0 = 0.f, h1 = 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -262,18 +271,31 @@ extern "C" void moe_gateup(float* hbuf, const uint8_t* gp, const uint8_t* gs, co
                            const uint8_t* up, const uint8_t* us, const float* uinv,
                            const uint16_t* xb, const int* elist, const int* eoff,
                            const int* ecount, const int* active, const int* nactive,
-                           int nact_max, int H, int MI, int topk, int GRP, cudaStream_t st) {
+                           int nact_max, int H, int MI, int topk, int GRP, int maxtok,
+                           cudaStream_t st) {
     dim3 blk(32, 4), grd(nact_max, (MI + 3) / 4);
-    k_moe_gateup<TMAX><<<grd, blk, 0, st>>>(hbuf, gp, gs, ginv, up, us, uinv, xb, elist, eoff,
+    // Unrolling the token loop replicates every temporary: TM=4 compiles to 128 registers,
+    // which caps occupancy at 4 blocks/SM (128 threads x 128 regs = 16K of the SM's 64K).
+    // At decode every expert receives exactly one token, so TM=1 is both correct and far
+    // cheaper. Experts with more tokens than TM simply loop and re-read that weight.
+    if (maxtok <= 1)
+        k_moe_gateup<1><<<grd, blk, 0, st>>>(hbuf, gp, gs, ginv, up, us, uinv, xb, elist, eoff,
                                              ecount, active, nactive, H, MI, topk, GRP);
+    else
+        k_moe_gateup<TMAX><<<grd, blk, 0, st>>>(hbuf, gp, gs, ginv, up, us, uinv, xb, elist, eoff,
+                                                ecount, active, nactive, H, MI, topk, GRP);
 }
 extern "C" void moe_down(float* dpart, const uint8_t* dp, const uint8_t* ds, const float* dinv,
                          const uint16_t* hb, const int* elist, const int* eoff,
                          const int* ecount, const int* active, const int* nactive,
-                         int nact_max, int H, int MI, int GRP, cudaStream_t st) {
+                         int nact_max, int H, int MI, int GRP, int maxtok, cudaStream_t st) {
     dim3 blk(32, 4), grd(nact_max, (H + 3) / 4);
-    k_moe_down<TMAX><<<grd, blk, 0, st>>>(dpart, dp, ds, dinv, hb, elist, eoff, ecount, active,
+    if (maxtok <= 1)
+        k_moe_down<1><<<grd, blk, 0, st>>>(dpart, dp, ds, dinv, hb, elist, eoff, ecount, active,
                                            nactive, H, MI, GRP);
+    else
+        k_moe_down<TMAX><<<grd, blk, 0, st>>>(dpart, dp, ds, dinv, hb, elist, eoff, ecount, active,
+                                              nactive, H, MI, GRP);
 }
 extern "C" void moe_finalize(float* out, const float* dpart, const float* wts, const int* sel,
                              int rows, int H, int topk, float scaling, cudaStream_t st) {

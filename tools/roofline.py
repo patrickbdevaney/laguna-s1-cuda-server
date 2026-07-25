@@ -116,11 +116,11 @@ def main():
     print(f"  draft: {DRAFT_W/GB:.4f} GB weights + {lmhead/GB:.4f} GB shared lm_head = {DRAFT_STEP/GB:.4f} GB/block")
 
     print(f"\n{'-'*78}\nB_tok and AR ceiling vs context\n{'-'*78}")
-    print(f"  {'ctx':>9s}{'KV GB':>10s}{'B_tok GB':>11s}{'@91':>8s}{'@135':>8s}{'@200':>8s}  tok/s")
+    print(f"  {'ctx':>9s}{'KV GB':>10s}{'B_tok GB':>11s}{'@91':>8s}{'@135':>8s}{'@227':>8s}  tok/s")
     for c in (2048, 4096, 8192, 32768, 131072, 262144):
         b = FIXED + AR_EXPERTS + kv_read(c)
         print(f"  {c:>9d}{kv_read(c)/GB:10.4f}{b/GB:11.4f}"
-              f"{91e9/b:8.2f}{135e9/b:8.2f}{200e9/b:8.2f}")
+              f"{91e9/b:8.2f}{135e9/b:8.2f}{227e9/b:8.2f}")
 
     print(f"\n{'-'*78}\nExpert union / E_frac (independent-uniform upper bound)\n{'-'*78}")
     print(f"  {'k':>3s}{'U(k)/256':>10s}{'E_frac':>9s}{'expert GB':>11s}{'fixed GB':>10s}{'block GB':>10s}")
@@ -137,7 +137,7 @@ def main():
             ("MT-Bench   T=0   (tau 4.017 @k=15)", fit_alpha(15, 4.017)),
             ("code       T=0.7 (tau 3.0  @k=7 )", fit_alpha(7, 3.0)),
             ("code       T=0.7 (tau 3.0  @k=15)", fit_alpha(15, 3.0))]
-    for bw in (91, 135, 200):
+    for bw in (91, 135, 175, 227):
         print(f"\n  --- effective BW = {bw} GB/s ---   AR baseline = {bw*1e9/B_tok:.2f} tok/s")
         print(f"  {'workload':36s}{'alpha':>7s}" + "".join(f"{'k='+str(k):>8s}" for k in KS) + f"{'k*':>5s}")
         for nm, a in WORK:
@@ -171,8 +171,8 @@ def main():
         fx = norms + embed_row + sum(b*ov.get(k,1.0) for k,b in parts.items())
         bt = fx + AR_EXPERTS + kv_read(ctx)
         best135 = max(tau(k,aH)*135e9/(fx + union(k)*EXPERT_B*len(MOE_L) + kv_read(ctx) + DRAFT_STEP) for k in KS)
-        best200 = max(tau(k,aH)*200e9/(fx + union(k)*EXPERT_B*len(MOE_L) + kv_read(ctx) + DRAFT_STEP) for k in KS)
-        print(f"  {nm:30s}{fx/GB:10.3f}{bt/GB:10.3f}{135e9/bt:8.1f}{200e9/bt:8.1f}{best135:10.1f}{best200:10.1f}")
+        best200 = max(tau(k,aH)*227e9/(fx + union(k)*EXPERT_B*len(MOE_L) + kv_read(ctx) + DRAFT_STEP) for k in KS)
+        print(f"  {nm:30s}{fx/GB:10.3f}{bt/GB:10.3f}{135e9/bt:8.1f}{227e9/bt:8.1f}{best135:10.1f}{best200:10.1f}")
 
     print(f"\n{'-'*78}\nKV capacity (SWA layers = fixed {SW}-entry ring)\n{'-'*78}")
     perTok = kv_capacity_bytes_per_token()

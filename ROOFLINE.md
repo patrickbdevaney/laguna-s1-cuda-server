@@ -322,3 +322,35 @@ sequence with room to spare.
 | τ at temp 0.7 ≈ 3.0 | measure τ on a code workload at 0.7 (Gate D1) | §4 |
 | effective BW 135–175 GB/s | measure achieved BW per kernel (Gate B1) | §3 |
 | `k*` = 4 prior | the k-sweep (Gate D1) | §4 |
+
+---
+
+## 9. MEASURED UPDATE (2026-07-24, `tests/bw_probe.cu`) — the ceiling is 227 GB/s
+
+The 200 GB/s "achievable streaming bandwidth" inherited from the gemma constitution was
+never measured on this box for this access pattern. It is now: **`cudaMalloc` + `__ldcs`
+uint4 streaming reaches 227.4 GB/s (83 % of the 273 GB/s peak)**, best-of-5 over 4 GB.
+Every "hard ceiling" figure above is therefore **12 % pessimistic**. Corrected:
+
+| | @91 (gemma-equal) | @135 (poolside-equivalent) | @175 (target) | **@227 (ceiling)** |
+|---|---:|---:|---:|---:|
+| AR decode, ctx 4 K | 9.1 | 13.4 | 17.4 | **22.6** |
+| DFlash HumanEval T=0 at k\*=5 | 17.6 | 26.1 | 33.8 | **43.8** |
+| DFlash MT-Bench T=0 at k\*=3 | 14.2 | 21.1 | 27.3 | **35.5** |
+| DFlash code T=0.7 at k\*=3 | 12.8 | 18.9 | 24.5 | **31.8** |
+
+`k*` is unchanged by this (it depends on the byte *ratios*, not the absolute bandwidth).
+
+**Revised band: 26–42 tok/s on the stock checkpoint** for code, centred near 32; with the §5
+self-quantization lever, **34–52**. The directive's original 32–52 band turns out to be
+right after all — but only because two of its errors (`B_tok` 2.2× too low, ceiling 12 % too
+low) pointed in opposite directions, and it is reachable via a lever the directive never
+named rather than via the MoE work it prioritised.
+
+Also measured: **L2 = 32 MB**, `persistingL2CacheMaxSize` = 24 MB. A sliding layer's entire
+512-token KV window is **1.05 MB** — it fits in L2 with three orders of magnitude to spare.
+See `OPTIMIZATION_LOG.md` M2.
+
+And: **zero-copy mapped weights cost 30 % of bandwidth** (160 vs 227 GB/s), so the repack
+cache must be read into `cudaMalloc` memory rather than `cudaHostRegister`'d in place. This
+is a loader-architecture decision made on measurement, before writing the loader.

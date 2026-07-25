@@ -266,9 +266,11 @@ so the comparison has a fixed reference. Also frees ~10 GB of resident memory.
 Both model cards recommend k=7/15; the byte model says k*=3–5 on this hardware and k=15 is
 worst at every temperature. Costs one sweep (Gate D1). **Gain +15–30 % vs shipping k=15.**
 
-### 3. Whole-step CUDA graph
-48 layers × ~14 kernels on 20 SMs. Gemma measured +11 % for graphing the M=1 chain at 30
-layers; Laguna has 1.6× the layers. **Gain +10–20 %, P high, cost low-medium.**
+### 3. ~~Whole-step CUDA graph~~ — **DONE, measured +7.8 % (not the +10–20 % predicted)**
+Implemented as #10/#11. The prediction was too generous: of the 4.15 µs per launch, only
+~2.6 µs was recoverable and ~1.5 µs is irreducible null-kernel execution. Residual in-graph
+launch cost is ~0.7 µs × 1665 ≈ 1.2 ms = **2.1 % of the step**, which is the hard ceiling on
+every remaining launch-count lever.
 
 ### 4. SWA KV residency in L2 (`cudaAccessPolicyWindow`)
 See M2. 1.05 MB per layer against a 32 MB L2. Bounded by the sliding layers' share of KV
@@ -288,14 +290,24 @@ a flag. **Gain +15 % at 256 K, 0 % at 4 K. P medium, cost medium.**
 (`[48|72, 3072]`, ~0.4 MB/layer). Fusing removes 48 kernel launches per step. **Gain
 low-single-digit %, P high, cost low.** Bit-exact.
 
-### 7. FlashNorm fold
-Laguna uses plain RMSNorm (`g · x̂`), not gemma's zero-centred `(1+g)` — so folding the norm
-weight into the following GEMM's rows is a direct scale, simpler than gemma's case. Removes
-a kernel and an activation round-trip per norm, ~4 norms/layer × 48. **Bit-exact, +1–3 %.**
+### 7. ~~FlashNorm fold~~ — **NOT bit-exact, and superseded. Do not build.**
+I claimed this was bit-exact. It is not. Proposition 1 of arXiv:2407.09577 (`W*_ij = g_i·W_ij`)
+is exact *in real arithmetic*; in our pipeline the GEMM today computes
+`Σ bf2f(W)·bf2f(f2bf(bf2f(g)·x·inv))` and folded it computes
+`Σ bf2f(f2bf(g·W))·bf2f(f2bf(x·inv))` — rounding `g·W` to bf16 offline is a real precision
+change across 5.6 GB of attention weights. It also buys almost nothing: it removes a 6 KB
+weight read from a kernel that is latency-bound, not bandwidth-bound. **Superseded by #12**,
+which took the same sites and is genuinely bit-exact.
 
-### 8. Fused add+RMSNorm and fused gate+up SwiGLU
-~35 % MLP traffic cut per arXiv:2602.11808. Match the reduction dtype to hold τ.
-**+3–6 %, P medium.**
+Proposition 2 (deferring the `1/RMS` scalar past the matmul) *is* exact but targets hardware
+where the norm blocks the matrix unit — irrelevant on a CUDA-core GEMV. Proposition 3
+(dropping the first RMSNorm because QK-norm follows) does **not** apply: the same normed
+hidden also feeds `v_proj` (no downstream norm) and `g_proj` (nonlinear softplus), so the
+scalar cannot cancel.
+
+### 8. ~~Fused add+RMSNorm~~ — **DONE as #12, +2.4 %.** Remaining in this family: fuse the
+`swiglu`+cast pair, have `k_moe_gateup_rp` write bf16 directly, and fuse `moe_finalize`+`add`.
+Each is bit-exact and worth a few tenths of a percent; ~+0.3 % combined.
 
 ### 9. Routing-aware draft truncation
 Only if measured `E_frac(k*)` > 0.6. The model says 0.18 at k=5, so this is almost certainly

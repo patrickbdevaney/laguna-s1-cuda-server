@@ -79,6 +79,7 @@ back-to-back A/B/A.
 | 26 | MoE gate/up K-split (grid.z over the K axis + deterministic combine) | 27.30/27.49 | 26.9/26.7 (KS=2), 27.41/27.47 (KS=3) | **NEUTRAL, default off** |
 | 27 | **NVFP4 scale layout `[grp][lane]` → `[grp/8][lane][8]`** (bit-exact) | 27.30/27.49 | **30.80/29.54** | **WON +11 %** |
 | 28 | **DFlash context K/V: add the per-layer `input_layernorm`** | τ 3.06 / 3.30 | **τ 3.12 / 3.37** | **CORRECTNESS FIX** (k=3 / k=4) |
+| 29 | **`lm_head` BF16 → FP8 W8A16, per-output-row scale** | 29.55/29.42 | **30.61/30.57** | **WON +3.6 %**, greedy 8/8 |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 

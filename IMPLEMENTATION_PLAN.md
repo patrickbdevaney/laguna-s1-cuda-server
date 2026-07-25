@@ -17,6 +17,7 @@ Baseline now: **29.4–30.8 tok/s** base decode.
 | 3 | Draft `rope_theta` ambiguity settled by measurement | config's 1e4 beats the siblings' 5e5 (τ 3.12 vs 2.91) — keep config |
 | 4 | All 38 `extern "C"` kernel decls consolidated into one header | closes a silent-miscall class of bug |
 | 5 | `bench_moe` DVFS spin-up + arena warmup + production activation loads | makes every future microbenchmark here trustworthy |
+| 6 | **`lm_head` BF16 → FP8** (N1, first step) | **29.5 → 30.6 tok/s (+3.6 %)**, `B_tok` 7.115 → 6.807 GB, greedy 8/8 |
 
 ## MEASURED AND REJECTED
 

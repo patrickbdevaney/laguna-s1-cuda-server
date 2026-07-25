@@ -137,9 +137,19 @@ struct LayerW {
 struct Weights {
     Config cfg;
     bool fp8_attn = false;
+    bool fp8_lmhead = false;
     void*  arena = nullptr;
     size_t arena_bytes = 0;
     const uint16_t *embed = nullptr, *lm_head = nullptr, *final_norm = nullptr;
+    // FP8 lm_head. 0.617 GB of every decode token -- 8.6 % of the byte budget -- and it goes
+    // through the SAME per-output-row W8A16 kernel that already carries attention, so this
+    // adds bytes saved without adding numerics to validate. NVIDIA ship exactly this on
+    // Nemotron-3-Nano-4B; llama.cpp keeps output.weight at Q6_K and Unsloth at 6-bit, so FP8
+    // is the conservative point of a wide consensus. 4-bit here has one production precedent
+    // and no published measurement at ~100K vocab, and this is the one tensor whose error
+    // lands directly on the sampled token -- so FP8, not NVFP4.
+    const uint8_t *lm_head8 = nullptr;
+    const float   *lm_head8s = nullptr;
     std::vector<LayerW> L;
     double load_seconds = 0.0;
     size_t peak_rss_kb = 0;
@@ -203,8 +213,9 @@ private:
 // ---------------------------------------------------------------- loader
 class Loader {
 public:
-    Loader(std::string model_dir, Config cfg, bool fp8_attn = false)
-        : dir_(std::move(model_dir)), cfg_(std::move(cfg)), fp8_attn_(fp8_attn) {}
+    Loader(std::string model_dir, Config cfg, bool fp8_attn = false, bool fp8_lmhead = false)
+        : dir_(std::move(model_dir)), cfg_(std::move(cfg)), fp8_attn_(fp8_attn),
+          fp8_lmhead_(fp8_lmhead) {}
 
     // cache_path: if present and matching, take the fast path; otherwise cold-load and write
     // it. Pass "" to disable the cache.
@@ -212,6 +223,7 @@ public:
         double t0 = wall_now();
         W_.cfg = cfg_;
         W_.fp8_attn = fp8_attn_;
+        W_.fp8_lmhead = fp8_lmhead_;
         W_.L.resize(cfg_.n_layers);
         read_index();
         reserve();
@@ -264,7 +276,8 @@ private:
         const size_t H = c.hidden, V = c.vocab, E = c.n_experts;
         const size_t MI = c.moe_intermediate, GRP = c.nvfp4_group;
         reserve1(W_.embed,      (size_t)V * H * 2);
-        reserve1(W_.lm_head,    (size_t)V * H * 2);
+        if (fp8_lmhead_) { reserve1(W_.lm_head8, (size_t)V * H); reserve1(W_.lm_head8s, V * 4); }
+        else              { reserve1(W_.lm_head,  (size_t)V * H * 2); }
         reserve1(W_.final_norm, H * 2);
         for (int L = 0; L < c.n_layers; ++L) {
             auto& w = W_.L[L];
@@ -340,7 +353,8 @@ private:
         const size_t H = c.hidden, V = c.vocab, E = c.n_experts;
         const size_t MI = c.moe_intermediate, GRP = c.nvfp4_group;
         put("model.embed_tokens.weight", W_.embed,   (size_t)V * H * 2, "BF16");
-        put("lm_head.weight",            W_.lm_head, (size_t)V * H * 2, "BF16");
+        if (fp8_lmhead_) put_q8("lm_head.weight", W_.lm_head8, W_.lm_head8s, (int)V, (int)H);
+        else             put("lm_head.weight",     W_.lm_head, (size_t)V * H * 2, "BF16");
         put("model.norm.weight",         W_.final_norm, H * 2, "BF16");
         for (int L = 0; L < c.n_layers; ++L) {
             auto& w = W_.L[L];
@@ -569,6 +583,7 @@ private:
     std::vector<uint8_t> rp_buf_;
     void* q8_scratch_ = nullptr; size_t q8_scratch_bytes_ = 0;
     bool fp8_attn_ = false;
+    bool fp8_lmhead_ = false;
     size_t arena_bytes_ = 0, unmapped_ = 0;
 };
 

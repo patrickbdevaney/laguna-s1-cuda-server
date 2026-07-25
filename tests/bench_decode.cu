@@ -12,7 +12,8 @@ int main(int argc,char**argv){
     int PRE=getenv("PRE")?atoi(getenv("PRE")):0;     // synthetic prefill length
     Config c=load_config(md+"/config.json");
     bool FP8A = getenv("LG_FP8ATTN")!=nullptr;
-    Loader ld(md,c,FP8A); Weights W=ld.load("",false);
+    bool FP8L = getenv("LG_FP8LMHEAD")!=nullptr;
+    Loader ld(md,c,FP8A,FP8L); Weights W=ld.load("",false);
     if(FP8A) printf("FP8 attention ON: arena %.3f GB\n", W.arena_bytes/1e9);
     Engine E; E.c=c; E.W=W; E.init(64);
     Session S; S.alloc(c,CTX,E.MAXTOK);
@@ -58,10 +59,11 @@ int main(int argc,char**argv){
     double med=ts[ts.size()/2], best=ts.front();
     size_t ncmp=std::min(got.size(),want.size());
     int match=0; for(size_t i=0;i<ncmp;++i){ if(got[i]==want[i]) ++match; else break; }
-    double Btok=bytes_per_token(c,FP8A,pos);
+    double Btok=bytes_per_token(c,FP8A,pos,FP8L);
     printf("ctx=%d pre=%d  prefill %zu tok %.2fs (%.1f tok/s)\n",CTX,PRE,ids.size(),tpre,ids.size()/tpre);
     printf("DECODE median %.2f tok/s   best %.2f   (n=%zu, ctx@end=%d)\n",1.0/med,1.0/best,ts.size(),pos);
-    printf("B_tok = %.3f GB at pos %d (%s attention)\n",Btok/1e9,pos,FP8A?"FP8":"BF16");
+    printf("B_tok = %.3f GB at pos %d (%s attention, %s lm_head)\n",Btok/1e9,pos,
+           FP8A?"FP8":"BF16", FP8L?"FP8":"BF16");
     printf("effective BW (median) = %.1f GB/s = %.0f%% of the measured %.0f GB/s ceiling\n",
            Btok/med/1e9, Btok/med/THOR_BW_CEILING*100, THOR_BW_CEILING/1e9);
     printf("wall at this B_tok = %.2f tok/s ; headroom x%.2f\n",

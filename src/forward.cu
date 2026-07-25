@@ -59,11 +59,12 @@ struct Session {
 // a hardcoded 10.044 GB — the stock BF16 figure — which quietly kept crediting us with the
 // attention bytes that FP8 attention had already removed, and so reported 83 % of roofline
 // where the truth was 66 %. Never hardcode a byte budget that a build flag can change.
-inline double bytes_per_token(const Config& c, bool fp8_attn, int pos) {
+inline double bytes_per_token(const Config& c, bool fp8_attn, int pos,
+                              bool fp8_lmhead = false) {
     const double H = c.hidden, V = c.vocab;
     const double aw = fp8_attn ? 1.0 : 2.0;                   // attention weight element
     double b = H * 2;                                          // one embedding row
-    b += H * 2 + V * H * 2;                                    // final norm + lm_head
+    b += H * 2 + (fp8_lmhead ? V * H + V * 4 : V * H * 2);      // final norm + lm_head
     for (int L = 0; L < c.n_layers; ++L) {
         const double qd = c.q_dim(L), kvd = (double)c.n_kv_heads * c.head_dim, nh = c.heads[L];
         b += 2.0 * H * 2;                                      // in_ln + post_ln
@@ -367,7 +368,8 @@ struct Engine {
         }
         mark();
         add_rms_cast(hb, h, nullptr, W.final_norm, M, H, (float)c.rms_eps, 0, st);
-        gemm_bf16(logits, W.lm_head, hb, M, c.vocab, H, st);   // NOT tied to the embedding
+        if (W.fp8_lmhead) gemm_fp8(logits, W.lm_head8, W.lm_head8s, hb, M, c.vocab, H, st);
+        else              gemm_bf16(logits, W.lm_head, hb, M, c.vocab, H, st);  // NOT tied
         acc(7);
     }
 

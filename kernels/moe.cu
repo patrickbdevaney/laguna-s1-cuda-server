@@ -382,17 +382,29 @@ __global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
     for (int c0 = c_lo; c0 < c_hi; c0 += RPU) {
         uint4 gv[RPU], uv[RPU];
         float gsc[RPU][2], usc[RPU][2];
+        // ONE 8-byte scale load per matrix covers all RPU chunks in flight. See the layout
+        // note on repack_scale(): the eight per-group bytes a lane needs are contiguous, and
+        // issuing them as eight 1-byte loads was costing 24 % of this kernel.
+        {
+            const size_t gb = (size_t)(c0 * 32 / GRP) / 8;
+            const uint2 gv8 = *(const uint2*)(gsb + (gb * RPNB + lane) * 8);
+            const uint2 uv8 = *(const uint2*)(usb + (gb * RPNB + lane) * 8);
+            const uint8_t* g8 = (const uint8_t*)&gv8;
+            const uint8_t* u8 = (const uint8_t*)&uv8;
+            #pragma unroll
+            for (int u = 0; u < RPU; ++u) {
+                gsc[u][0] = e4m3f(g8[2 * u])     * gi;
+                gsc[u][1] = e4m3f(g8[2 * u + 1]) * gi;
+                usc[u][0] = e4m3f(u8[2 * u])     * ui;
+                usc[u][1] = e4m3f(u8[2 * u + 1]) * ui;
+            }
+        }
         #pragma unroll
         for (int u = 0; u < RPU; ++u) {
             const int c = c0 + u;
             if (c < c_hi) {
                 gv[u] = __ldcs((const uint4*)(gbase + ((size_t)c * RPNB + lane) * 16));
                 uv[u] = __ldcs((const uint4*)(ubase + ((size_t)c * RPNB + lane) * 16));
-                const int g0 = (c * 32) / GRP, g1 = (c * 32 + 16) / GRP;
-                gsc[u][0] = e4m3f(gsb[(size_t)g0 * RPNB + lane]) * gi;
-                gsc[u][1] = e4m3f(gsb[(size_t)g1 * RPNB + lane]) * gi;
-                usc[u][0] = e4m3f(usb[(size_t)g0 * RPNB + lane]) * ui;
-                usc[u][1] = e4m3f(usb[(size_t)g1 * RPNB + lane]) * ui;
             }
         }
         #pragma unroll
@@ -500,15 +512,20 @@ __global__ void k_moe_down_rp(float* __restrict__ dpart,
     }
     for (int c0 = 0; c0 < C; c0 += RPU) {
         uint4 dv[RPU]; float dsc[RPU][2];
+        {
+            const size_t gb = (size_t)(c0 * 32 / GRP) / 8;
+            const uint2 dv8 = *(const uint2*)(dsb + (gb * RPNB + lane) * 8);
+            const uint8_t* d8 = (const uint8_t*)&dv8;
+            #pragma unroll
+            for (int u = 0; u < RPU; ++u) {
+                dsc[u][0] = e4m3f(d8[2 * u])     * di;
+                dsc[u][1] = e4m3f(d8[2 * u + 1]) * di;
+            }
+        }
         #pragma unroll
         for (int u = 0; u < RPU; ++u) {
             const int c = c0 + u;
-            if (c < C) {
-                dv[u] = __ldcs((const uint4*)(dbase + ((size_t)c * RPNB + lane) * 16));
-                const int g0 = (c * 32) / GRP, g1 = (c * 32 + 16) / GRP;
-                dsc[u][0] = e4m3f(dsb[(size_t)g0 * RPNB + lane]) * di;
-                dsc[u][1] = e4m3f(dsb[(size_t)g1 * RPNB + lane]) * di;
-            }
+            if (c < C) dv[u] = __ldcs((const uint4*)(dbase + ((size_t)c * RPNB + lane) * 16));
         }
         #pragma unroll
         for (int u = 0; u < RPU; ++u) {

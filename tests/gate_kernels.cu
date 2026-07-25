@@ -12,21 +12,7 @@
 #include "../include/laguna_weights.h"
 #define CK(x) do{cudaError_t e=(x); if(e){printf("CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
 
-extern "C" {
-void dequant_nvfp4(float*,const uint8_t*,const uint8_t*,float,int,int,int,cudaStream_t);
-void gemm_bf16(float*,const uint16_t*,const uint16_t*,int,int,int,cudaStream_t);
-void gemm_fp4(float*,const uint8_t*,const uint8_t*,float,const uint16_t*,int,int,int,int,cudaStream_t);
-void rmsnorm(float*,const float*,const uint16_t*,int,int,float,cudaStream_t);
-void rope_tables(float*,float*,const float*,int,const int*,int,float,cudaStream_t);
-void router(int*,float*,float*,const float*,const float*,int,int,int,float,int,cudaStream_t);
-void f32_to_bf16(uint16_t*,const float*,long,cudaStream_t);
-void store_kv(uint8_t*,uint8_t*,const float*,const float*,float,float,int,int,int,int,const int*,cudaStream_t);
-void attend(float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,const int*,float,cudaStream_t);
-void moe_invert(int*,int*,int*,int*,int*,int*,const int*,int,int,int,cudaStream_t);
-void moe_gateup_rp(float*,const uint8_t*,const uint8_t*,const float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,int,cudaStream_t);
-void moe_down_rp(float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,cudaStream_t);
-void moe_finalize(float*,const float*,const float*,const int*,int,int,int,float,cudaStream_t);
-}
+#include "../include/laguna_kernels_api.h"
 
 static std::string DIR="docs/kernel_refs/";
 static nlohmann::json REFS;
@@ -193,7 +179,7 @@ int main(){
 
         float* hbuf; CK(cudaMalloc(&hbuf,(size_t)nass*MI*4));
         moe_gateup_rp(hbuf,lw.e_gate_p,lw.e_gate_s,lw.e_gate_inv,lw.e_up_p,lw.e_up_s,lw.e_up_inv,
-                   dxb,el,eo,ec,act,na,h_na,c.hidden,MI,TK,c.nvfp4_group,4,0);
+                   dxb,el,eo,ec,act,na,h_na,c.hidden,MI,TK,c.nvfp4_group,4,nullptr,0);
         CK(cudaGetLastError());
         uint16_t* hbf; CK(cudaMalloc(&hbf,(size_t)nass*MI*2));
         f32_to_bf16(hbf,hbuf,(long)nass*MI,0);

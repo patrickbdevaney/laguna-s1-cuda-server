@@ -72,13 +72,31 @@ inline void repack_packed(uint8_t* dst, const uint8_t* src, int rows, int K) {
 }
 
 // e4m3 group scales: src [rows][K/GRP] -> dst [rows/NB][K/GRP][NB]
+// Scale layout: [n_block][group/8][lane][8].
+//
+// The obvious layout is [n_block][group][lane], which coalesces perfectly -- a warp reads 32
+// contiguous bytes per group. It is still wrong, and it was the single biggest thing left on
+// the table. A lane needs 8 groups to cover the RPU=4 code chunks it holds in flight, and in
+// that layout those 8 bytes are 32 B apart, so it issues EIGHT one-byte loads. In bytes the
+// scales are only 1/16 of the codes; in *transactions* they are four requests per two code
+// requests, and a bisecting microbenchmark (`tests/bench_moe.cu`) showed the kernel running at
+// 184 GB/s with them and 230 GB/s without -- while removing the FP4 decode and the entire FMA
+// chain bought nothing at all.
+//
+// Grouping eight consecutive groups per lane makes it ONE 8-byte load, and the warp still
+// reads 32*8 = 256 contiguous bytes, so coalescing is unchanged. Same bytes, same values, same
+// order: **bit-exact**, 12 % faster on the kernel.
+//
+// Requires ng % 8 == 0, which holds for every shape in this model: gate/up ng = 3072/16 = 192,
+// down ng = 1024/16 = 64.
 inline void repack_scale(uint8_t* dst, const uint8_t* src, int rows, int K, int GRP) {
     const int ng = K / GRP;
+    if (ng % 8) { fprintf(stderr, "repack_scale: ng=%d not a multiple of 8\n", ng); std::abort(); }
     for (int n = 0; n < rows; ++n) {
         const int nb = n / RP_NB, l = n % RP_NB;
         const uint8_t* s = src + (size_t)n * ng;
         for (int g = 0; g < ng; ++g)
-            dst[((size_t)nb * ng + g) * RP_NB + l] = s[g];
+            dst[(((size_t)nb * (ng / 8) + g / 8) * RP_NB + l) * 8 + (g % 8)] = s[g];
     }
 }
 

@@ -37,25 +37,7 @@
 
 namespace laguna {
 
-extern "C" {
-void gemm_bf16(float*, const uint16_t*, const uint16_t*, int, int, int, cudaStream_t);
-void gemm_bf16_seg(float* const*, const int*, int, const uint16_t*, const uint16_t*, int, int, cudaStream_t);
-void f32_to_bf16(uint16_t*, const float*, long, cudaStream_t);
-void rmsnorm(float*, const float*, const uint16_t*, int, int, float, cudaStream_t);
-void add_rms_cast(uint16_t*, float*, const float*, const uint16_t*, int, int, float, int, cudaStream_t);
-void rmsnorm_heads(float*, const float*, const uint16_t*, int, int, int, float, cudaStream_t);
-void rope_tables(float*, float*, const float*, int, const int*, int, float, cudaStream_t);
-void rope_apply(float*, const float*, const float*, int, int, int, int, cudaStream_t);
-void gate_softplus(float*, const float*, int, int, int, cudaStream_t);
-void swiglu(float*, const float*, const float*, long, cudaStream_t);
-void add_inplace(float*, const float*, long, cudaStream_t);
-void embed_rows(float*, const uint16_t*, const int*, int, int, cudaStream_t);
-void store_kv(uint8_t*, uint8_t*, const float*, const float*, float, float, int, int, int, int, const int*, cudaStream_t);
-void attend_split(float*, float*, float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, const int*, float, int, cudaStream_t);
-int  attend_nsplit(int, int, int);
-void set_base(int*, int, cudaStream_t);
-void tap_fuse(uint16_t*, const float*, const uint16_t* const*, int, int, int, int, int, float, cudaStream_t);
-}
+#include "../include/laguna_kernels_api.h"
 
 struct Drafter {
     DraftConfig d;

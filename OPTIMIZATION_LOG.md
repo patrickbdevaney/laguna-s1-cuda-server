@@ -77,6 +77,7 @@ back-to-back A/B/A.
 | 24 | Shared-memory `x` staging at the verify shapes | 0.271 ms | 0.492 ms | **LOST 1.8x, default off** |
 | 25 | N-blocking the M>1 GEMM (2 or 4 outputs per warp) | 0.270 ms | 0.271 / 0.270 | **NEUTRAL, default 1** |
 | 26 | MoE gate/up K-split (grid.z over the K axis + deterministic combine) | 27.30/27.49 | 26.9/26.7 (KS=2), 27.41/27.47 (KS=3) | **NEUTRAL, default off** |
+| 27 | **NVFP4 scale layout `[grp][lane]` → `[grp/8][lane][8]`** (bit-exact) | 27.30/27.49 | **30.80/29.54** | **WON +11 %** |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 
@@ -489,7 +490,43 @@ enough for now"; priority 3 (MoE) is promoted to first.
 
 EV = expected gain × P(works) ÷ cost. Derived from `ROOFLINE.md` and `RESCOPE.md` §2.
 
-### 0. ~~MoE gate/up is grid-starved~~ — **tested three ways, it is not. Gap unexplained.**
+### 0. ~~MoE gate/up~~ — **SOLVED. It was the scale stream, and a bisecting microbenchmark found it.**
+
+Four structural hypotheses had been falsified (#14 warp split, #24 shared-memory staging, #25
+N-blocking, #26 K-split) and `ncu` counters were unavailable, so the gap was recorded as
+unexplained. The way out was not another hypothesis but `tests/bench_moe.cu`: run the *same*
+kernel at the *same* occupancy and remove **one thing at a time**.
+
+| variant | GB/s | what it removes |
+|---|---:|---|
+| FULL (the real kernel) | 184–190 | — |
+| NOSCALE | **226–234** | the per-16-group E4M3 scale stream |
+| NODEQ | 229–234 | + the FP4 hardware decode — **free** |
+| STREAM | 229–241 | + the entire FMA chain — **free** |
+
+The FP4 decode and the arithmetic cost *nothing*. The whole gap was the **second memory
+stream**. Scales are 1/16 of the bytes but the layout `[n_block][group][lane]` puts the eight
+group-bytes a lane needs 32 B apart, so it issued **eight one-byte loads** where the codes
+needed two vector loads — four transactions per two, for 6 % of the bytes.
+
+Regrouped as `[n_block][group/8][lane][8]`, a lane reads all eight as one 8-byte load and the
+warp still reads 256 contiguous bytes, so coalescing is unchanged. Same bytes, same values,
+same order — **bit-exact**, greedy 8/8, and **+11 % end to end** (27.3/27.5 → 30.8/29.5).
+
+Two methodological lessons, both of which nearly sank this:
+
+1. **The first kernel over a freshly allocated arena is not measurable.** An early run of the
+   bisection reported 56 GB/s for a shape that measures 182 in situ — a 3× error, from page
+   table and TLB warmup, that pointed at entirely the wrong conclusion.
+2. **Short microbenchmarks on this part measure the idle clock.** The same shape gave 0.194 ms
+   and 0.627 ms in two processes with identical code, purely on whether the preceding variant
+   had run long enough to ramp DVFS. `bench_moe` now spins for a fixed 300 ms before any
+   measurement. Any microbenchmark here that runs for less than that is suspect — including
+   some of the neutral results above, which are worth re-running.
+
+The residual gap is now ~184 → 230 GB/s of headroom *if* the scale loads could be removed
+entirely, which they cannot; the 8-byte form recovers about half of it.
+
 
 The theory was clean: `k_moe_gateup_rp` sits at 177 GB/s (70 % of the ~254 ceiling) and
 launches only `nact_max × MI/(RPNB·WY)` = 80 blocks = 320 warps of the 960 the part holds,

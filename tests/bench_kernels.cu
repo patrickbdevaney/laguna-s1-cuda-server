@@ -5,15 +5,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #define CK(x) do{cudaError_t e=(x); if(e){printf("CUDA %s\n",cudaGetErrorString(e));exit(1);} }while(0)
-extern "C" {
-void gemm_bf16(float*,const uint16_t*,const uint16_t*,int,int,int,cudaStream_t);
-void gemm_fp4(float*,const uint8_t*,const uint8_t*,float,const uint16_t*,int,int,int,int,cudaStream_t);
-void gemm_fp8(float*,const uint8_t*,const float*,const uint16_t*,int,int,int,cudaStream_t);
-void rmsnorm(float*,const float*,const uint16_t*,int,int,float,cudaStream_t);
-void attend(float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,const int*,float,cudaStream_t);
-void attend_split(float*,float*,float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,const int*,float,int,cudaStream_t);
-int  attend_nsplit(int,int,int);
-}
+#include "../include/laguna_kernels_api.h"
 static float bench(void(*fn)(),int it=20){
     fn(); CK(cudaDeviceSynchronize());
     cudaEvent_t a,b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));

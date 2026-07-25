@@ -1,0 +1,178 @@
+[
+ {
+  "name": "plain",
+  "kw": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "rendered": "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>hi</user>\n<assistant><think>"
+ },
+ {
+  "name": "no_think",
+  "kw": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "rendered": "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>hi</user>\n<assistant></think>"
+ },
+ {
+  "name": "custom_sys",
+  "kw": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "rendered": "〈|EOS|〉<system>You are terse.</system>\n<user>hi</user>\n<assistant><think>"
+ },
+ {
+  "name": "empty_sys",
+  "kw": {
+   "messages": [
+    {
+     "role": "system",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false
+  },
+  "rendered": "〈|EOS|〉<user>hi</user>\n<assistant></think>"
+ },
+ {
+  "name": "multiturn",
+  "kw": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "reasoning": "They greeted me."
+    },
+    {
+     "role": "user",
+     "content": "bye"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "rendered": "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.</system>\n<user>hi</user>\n<assistant><think>They greeted me.</think>Hello!</assistant>\n<user>bye</user>\n<assistant><think>"
+ },
+ {
+  "name": "tools",
+  "kw": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "rendered": "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.\n\n### Tools\n\nYou may call functions to assist with the user query.\nAll available function signatures are listed below:\n<available_tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</available_tools></system>\n<user>weather in Paris?</user>\n<assistant><think>"
+ },
+ {
+  "name": "toolcall_roundtrip",
+  "kw": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Need the tool.",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "{\"temp\": 18}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true
+  },
+  "rendered": "〈|EOS|〉<system>You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.\n\n### Tools\n\nYou may call functions to assist with the user query.\nAll available function signatures are listed below:\n<available_tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</available_tools></system>\n<user>weather in Paris?</user>\n<assistant><think>Need the tool.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call></assistant>\n<tool_response>{\"temp\": 18}</tool_response>\n<assistant><think>"
+ }
+]

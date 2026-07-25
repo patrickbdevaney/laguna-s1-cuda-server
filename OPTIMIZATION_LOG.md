@@ -62,6 +62,7 @@ back-to-back A/B/A.
 | 9 | GEMM M-loop specialised at M=1 (registers 59→32) | 16.57 | 16.59 | NEUTRAL (kept: register headroom) |
 | 10 | **G9 — whole-step CUDA graph** (device-side position counter) | 16.59 | **17.88** | **WON +7.8 %** |
 | 11 | Doubling re-capture bound for the attention split count | 17.88 | **18.74** | **WON +4.8 %** |
+| 12 | **Fused add + RMSNorm + f32→bf16 cast** (`D` a template constant) | 18.46 | **18.90** | **WON +2.4 %** |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
@@ -184,6 +185,35 @@ from full KV *capacity* made it correct but wasteful (10 splits per global layer
 one). Sizing it from a **doubling context bound**, and re-capturing when the conversation
 outgrows it, recovered another 4.8 %. Capture costs one step, and doubling makes re-captures
 logarithmically rare.
+
+### #12 — fused add+RMSNorm+cast (WON, +2.4 %)
+
+The unfused `k_rmsnorm` at `rows=1` is `<<<1,256>>>`: one block on one of twenty SMs, and it
+is **latency**-bound, not bandwidth-bound — 12 strided loads per thread behind a runtime loop
+bound the compiler cannot unroll. Making `D` a template constant unrolls it into 12
+independent loads issued up front, and the residual add and the `f32→bf16` cast fold into the
+same pass. Three kernels → one at 48 sites, two → one at 96.
+
+**Bit-exact by construction**: thread `t` still accumulates elements `t, t+T, t+2T, …` in the
+same order, the warp/cross-warp reduction is untouched, and the cast applies the identical
+`f2bf` to the identical fp32 register value. Gates: 13/13 kernel, 8/8 greedy. Registers 33/40,
+no spill.
+
+### ⚠ MEASUREMENT HAZARD — the first benchmark after a 71.9 GB process exits reads ~50 % low
+
+This change was very nearly reverted. Its first measurement was **8.96 tok/s** against a
+control of 18.50 — an apparent 2× regression on a change that had just passed every
+correctness gate. Re-running the *same binary* immediately afterwards gave **18.65**.
+
+Cause: the run started seconds after a previous 71.9 GB process exited, while the kernel was
+still reclaiming those pages. That reclaim competes for exactly the resource being measured.
+
+**Protocol, now mandatory for every A/B on this box:** allow ~25 s of settling after any
+model-sized process exits, alternate A/B/A/B rather than running A then B, and never trust a
+single first-run number. The final measurement — G 18.37 / 18.54 versus H 18.90 / 18.90,
+alternating with settling — is stable to 0.1 % on the H side across both rounds.
+
+This sits alongside thermal drift as a second, independent reason absolute numbers lie here.
 
 ### Where the time actually goes (per-category profile, `LG_PROF=1`)
 

@@ -49,6 +49,86 @@ extern "C" void rmsnorm(float* out, const float* x, const uint16_t* w,
     k_rmsnorm<<<rows, 256, 0, st>>>(out, x, w, rows, D, eps);
 }
 
+// ---------------------------------------------------------------------------------------
+// Fused (optional add) + RMSNorm + f32->bf16 cast.
+//
+// The unfused `k_rmsnorm` at rows=1 is <<<1,256>>>: ONE block on one of twenty SMs, and it is
+// latency-bound, not bandwidth-bound -- 12 strided loads per thread behind a runtime loop
+// bound the compiler cannot unroll. Making D a template constant unrolls it into 12
+// independent loads issued up front. Measured 12.0 -> 4.5 us (2.7-3.1x), 96 sites per step.
+//
+// BIT-EXACT by construction: thread `t` still accumulates elements t, t+T, t+2T, ... in that
+// same order, the warp/cross-warp reduction is untouched, and the cast applies the identical
+// `f2bf` to the identical fp32 register value the separate cast kernel would have seen.
+// ---------------------------------------------------------------------------------------
+template <int D, int T, bool ADD>
+__global__ __launch_bounds__(T)
+void k_add_rms_cast(uint16_t* __restrict__ ob, float* __restrict__ h,
+                    const float* __restrict__ resid, const uint16_t* __restrict__ w,
+                    float eps) {
+    constexpr int R = D / T;
+    const int row = blockIdx.x;
+    float* hr = h + (long)row * D;
+    uint16_t* obr = ob + (long)row * D;
+    const float* rr = ADD ? resid + (long)row * D : nullptr;
+
+    float v[R];
+    #pragma unroll
+    for (int i = 0; i < R; ++i) {
+        int k = threadIdx.x + i * T;
+        v[i] = ADD ? (hr[k] + rr[k]) : hr[k];
+    }
+    if (ADD) {
+        #pragma unroll
+        for (int i = 0; i < R; ++i) hr[threadIdx.x + i * T] = v[i];   // residual stays fp32
+    }
+    float ss = 0.f;
+    #pragma unroll
+    for (int i = 0; i < R; ++i) ss += v[i] * v[i];       // same order as the strided loop
+
+    ss = warp_sum(ss);
+    __shared__ float red[32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float x = (lane < T / 32) ? red[lane] : 0.f;
+        x = warp_sum(x);
+        if (lane == 0) red[0] = rsqrtf(x / D + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    #pragma unroll
+    for (int i = 0; i < R; ++i) {
+        int k = threadIdx.x + i * T;
+        obr[k] = f2bf(bf2f(w[k]) * (v[i] * inv));
+    }
+}
+
+// Generic fallback: normalise in place into a scratch then cast. Only used if D != 3072.
+extern "C" void f32_to_bf16(uint16_t*, const float*, long, cudaStream_t);
+extern "C" void add_inplace(float*, const float*, long, cudaStream_t);
+static float* g_fallback = nullptr; static size_t g_fb = 0;
+static void rmsnorm_scratch(const float* h, const uint16_t* w, int rows, int D, float eps,
+                            uint16_t* ob, cudaStream_t st) {
+    size_t need = (size_t)rows * D * 4;
+    if (need > g_fb) { cudaFree(g_fallback); cudaMalloc(&g_fallback, need); g_fb = need; }
+    k_rmsnorm<<<rows, 256, 0, st>>>(g_fallback, h, w, rows, D, eps);
+    f32_to_bf16(ob, g_fallback, (long)rows * D, st);
+}
+
+// Falls back to the generic path when D is not the compiled-for hidden size.
+extern "C" void add_rms_cast(uint16_t* ob, float* h, const float* resid, const uint16_t* w,
+                             int rows, int D, float eps, int do_add, cudaStream_t st) {
+    if (D == 3072) {
+        if (do_add) k_add_rms_cast<3072, 256, true ><<<rows, 256, 0, st>>>(ob, h, resid, w, eps);
+        else        k_add_rms_cast<3072, 256, false><<<rows, 256, 0, st>>>(ob, h, resid, w, eps);
+        return;
+    }
+    if (do_add) add_inplace(h, resid, (long)rows * D, st);
+    rmsnorm_scratch(h, w, rows, D, eps, ob, st);
+}
+
 // Per-head QK RMSNorm: x is [rows, heads, head_dim], normalise over head_dim.
 extern "C" void rmsnorm_heads(float* out, const float* x, const uint16_t* w,
                               int rows, int heads, int hd, float eps, cudaStream_t st) {

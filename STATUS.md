@@ -11,14 +11,14 @@ Reference, **read-only**: `~/gemma-cuda-hybrid`.
 | **R1 — roofline** | ✅ **PASS** | `ROOFLINE.md`, generator `tools/roofline.py`, raw `docs/roofline_ctx*.txt` |
 | **A1 — oracle + arch delta** | ✅ **PASS** | `MODEL_INVENTORY.md`, `ARCH_DELTA.md`, `oracle/`, golden tensors in `docs/golden/` → `LOOP_LOG.md` |
 | L1 — loader | ⏳ next | |
-| **B1 — kernels G1–G9** | ✅ **PASS** | `gate_kernels` 13/13; `gate_forward` 8/8 greedy exact; **18.74 tok/s decode / 188.2 GB/s / 83 % of ceiling**; G9 CUDA graph DONE |
+| **B1 — kernels G1–G9** | ✅ **PASS** | `gate_kernels` 13/13; `gate_forward` 8/8 greedy exact; **18.90 tok/s decode / 189.8 GB/s / 84 % of ceiling**; G9 CUDA graph DONE |
 | D1 — DFlash + k-sweep | ▫ | |
 | S1 — server | ▫ | |
 
 ## Current state
 
-Working pure-CUDA Laguna forward pass: **greedy-exact vs the oracle**, **18.74 tok/s median**
-decode at ctx 4096 (188.2 GB/s effective, **83 % of the 227 GB/s ceiling**), prefill 55.0 tok/s.
+Working pure-CUDA Laguna forward pass: **greedy-exact vs the oracle**, **18.90 tok/s median**
+decode at ctx 4096 (189.8 GB/s effective, **84 % of the 227 GB/s ceiling**), prefill 55.0 tok/s.
 For reference, poolside measured **13–14 tok/s** for this model on a DGX Spark (same bandwidth
 class) under vLLM — so the autoregressive path is already ahead of that, before speculation.
 Everything from the checkpoint on disk through to logits is C++/CUDA; Python exists only in

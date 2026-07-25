@@ -25,6 +25,7 @@ void gemm_bf16(float*, const uint16_t*, const uint16_t*, int, int, int, cudaStre
 void gemm_fp4(float*, const uint8_t*, const uint8_t*, float, const uint16_t*, int, int, int, int, cudaStream_t);
 void f32_to_bf16(uint16_t*, const float*, long, cudaStream_t);
 void rmsnorm(float*, const float*, const uint16_t*, int, int, float, cudaStream_t);
+void add_rms_cast(uint16_t*, float*, const float*, const uint16_t*, int, int, float, int, cudaStream_t);
 void rmsnorm_heads(float*, const float*, const uint16_t*, int, int, int, float, cudaStream_t);
 void rope_tables(float*, float*, const float*, int, const int*, int, float, cudaStream_t);
 void rope_apply(float*, const float*, const float*, int, int, int, int, cudaStream_t);
@@ -195,8 +196,7 @@ struct Engine {
 
             // ---- attention
             mark();
-            rmsnorm(hn, h, w.in_ln, M, H, (float)c.rms_eps, st);
-            f32_to_bf16(hb, hn, (long)M * H, st);
+            add_rms_cast(hb, h, nullptr, w.in_ln, M, H, (float)c.rms_eps, 0, st);
             acc(1); mark();
             gemm_bf16(q,  w.q, hb, M, qd,  H, st);
             gemm_bf16(kk, w.k, hb, M, kvd, H, st);
@@ -224,12 +224,10 @@ struct Engine {
             acc(3); mark();
             f32_to_bf16(attb, att, (long)M * qd, st);
             gemm_bf16(hn, w.o, attb, M, H, qd, st);
-            add_inplace(h, hn, (long)M * H, st);
             acc(2); mark();
 
-            // ---- MLP / MoE
-            rmsnorm(hn, h, w.post_ln, M, H, (float)c.rms_eps, st);
-            f32_to_bf16(hb, hn, (long)M * H, st);
+            // ---- MLP / MoE.  The attention residual add is folded into this norm.
+            add_rms_cast(hb, h, hn, w.post_ln, M, H, (float)c.rms_eps, 1, st);
             acc(1); mark();
             if (c.is_dense(L)) {
                 int I = c.intermediate;
@@ -273,8 +271,7 @@ struct Engine {
             }
         }
         mark();
-        rmsnorm(hn, h, W.final_norm, M, H, (float)c.rms_eps, st);
-        f32_to_bf16(hb, hn, (long)M * H, st);
+        add_rms_cast(hb, h, nullptr, W.final_norm, M, H, (float)c.rms_eps, 0, st);
         gemm_bf16(logits, W.lm_head, hb, M, c.vocab, H, st);   // NOT tied to the embedding
         acc(7);
     }

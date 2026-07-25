@@ -247,20 +247,28 @@ enough for now"; priority 3 (MoE) is promoted to first.
 
 EV = expected gain × P(works) ÷ cost. Derived from `ROOFLINE.md` and `RESCOPE.md` §2.
 
-### 1. Self-quantize the BF16 remainder — **the largest lever in the project**
+### 1. Self-quantize the BF16 remainder — **the largest lever, now evidence-staged**
 Poolside quantized only the routed experts; 7.41 GB of every decode step is BF16.
 
-| variant | `B_tok` | AR @227 | gain |
-|---|---:|---:|---:|
-| stock | 10.044 | 22.6 | — |
-| FP8 attention only | 7.241 | 31.4 | **+39 %** |
-| NVFP4 attention only | 6.015 | 37.7 | **+67 %** |
-| NVFP4 all non-expert | 4.718 | 48.1 | **+113 %** |
+| variant | `B_tok` | AR @227 | gain | quality evidence |
+|---|---:|---:|---:|---|
+| stock | 10.044 | 22.6 | — | — |
+| **FP8 attention only** | 7.241 | **31.4** | **+39 %** | **near-lossless (high confidence)** |
+| + NVFP4 `o_proj` | ~6.9 | ~33 | +46 % | small; NVIDIA validated exactly this |
+| NVFP4 all attention | 6.015 | 37.7 | +67 % | **−2.3 pts recovery, MEASURED** |
+| NVFP4 all non-expert | 4.718 | 48.1 | +113 % | compounding, unmeasured |
 
-Not bit-exact ⇒ quality-gated, not equality-gated, and staged: FP8 `o_proj` → FP8 all
-attention → evaluate → NVFP4 attention. Must come after the bit-exact stock path passes B1
-so the comparison has a fixed reference. Also frees ~10 GB of resident memory.
-**P(works) high, cost medium, gain very high.**
+**The research pass changed this entry materially** — see `RESEARCH_FINDINGS.md`. A controlled
+A/B on DeepSeek-R1 (identical GPTQ recipe, attention in vs out) measures **98.81 % → 96.52 %**
+recovery when attention is included. Kimi-K2, DeepSeek-R1-0528 and both Llama-4 models all
+exclude attention; NVIDIA's most aggressive NVFP4 variant adds only `o_proj`. Poolside's choice
+was the industry norm, not an oversight. And the damage scales *down* with active params —
+Qwen loses 0.8 GPQA points at 22 B active but 5.7 at 3.3 B; Laguna is 8.5 B.
+
+⇒ **Build stage 1 (FP8 attention) only.** INT8 weight-only is measured lossless and FP8's error
+is a strict subset; it needs no calibration data and gives 1.39× on `B_tok` for near-zero risk.
+Stages 3–4 need an eval harness first, and **not OpenLLM v1** — every recipe in the survey,
+good and bad, scores 98–100 % there. Only AIME / GPQA-Diamond / BBH discriminate.
 
 ### 2. `k*` selection — free, already modelled
 Both model cards recommend k=7/15; the byte model says k*=3–5 on this hardware and k=15 is

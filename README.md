@@ -87,8 +87,16 @@ Each of these cost a failed gate or a measurement to establish; details in `LOOP
    31 of 32 lanes are silently discarded.
 9. **`cudaMalloc` streams at 227 GB/s; a `cudaHostRegister`'d mmap only 160.** Weights are
    never mapped.
-10. **The profile outranks the byte budget.** Attention is 56 % of `B_tok` but 13 % of the
-    step; the MoE is 25 % of the bytes and **81.5 %** of the step.
+10. **The profile outranks the byte budget, and the bottleneck moves.** Attention is 56 % of
+    `B_tok`; the MoE is 25 %. Before the expert repack the MoE was **81.5 %** of the step and
+    attention 11.6 %; after it they are **37 % each**. Rank levers by bytes, then re-rank by
+    profile after every win.
+11. **Repack trades warp count for iterations-per-warp.** It won +70 % on the MoE (3
+    iterations/warp) and LOST 33 % on the BF16 GEMMs (12 iterations/warp, and small-N ones
+    collapse to 8–32 warps for the whole GPU).
+12. **`__device__` globals are per-module without `-rdc=true`.** An `extern __device__` in a
+    second translation unit silently becomes its own copy; nvcc's warning `#20044-D` is the
+    only sign. Pass device state by pointer instead.
 
 ## KV sizing
 

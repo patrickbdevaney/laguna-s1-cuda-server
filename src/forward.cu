@@ -23,6 +23,8 @@ extern "C" {
 void dequant_nvfp4(float*, const uint8_t*, const uint8_t*, float, int, int, int, cudaStream_t);
 void gemm_bf16(float*, const uint16_t*, const uint16_t*, int, int, int, cudaStream_t);
 void gemm_fp8(float*, const uint8_t*, const float*, const uint16_t*, int, int, int, cudaStream_t);
+void gemm_bf16_seg(float* const*, const int*, int, const uint16_t*, const uint16_t*, int, int, cudaStream_t);
+void gemm_fp8_seg(float* const*, const int*, int, const uint8_t*, const float*, const uint16_t*, int, int, cudaStream_t);
 void gemm_fp4(float*, const uint8_t*, const uint8_t*, float, const uint16_t*, int, int, int, int, cudaStream_t);
 void f32_to_bf16(uint16_t*, const float*, long, cudaStream_t);
 void rmsnorm(float*, const float*, const uint16_t*, int, int, float, cudaStream_t);
@@ -273,15 +275,18 @@ struct Engine {
             add_rms_cast(hb, h, nullptr, w.in_ln, M, H, (float)c.rms_eps, 0, st);
             acc(1); mark();
             if (W.fp8_attn) {
-                gemm_fp8(q,  w.q8, w.q8s, hb, M, qd,  H, st);
-                gemm_fp8(kk, w.k8, w.k8s, hb, M, kvd, H, st);
-                gemm_fp8(vv, w.v8, w.v8s, hb, M, kvd, H, st);
-                gemm_fp8(gp, w.g8, w.g8s, hb, M, nh,  H, st);   // gate from the NORMED input
+                // ONE launch for q|k|v|g. They share K and share the input, the arena keeps
+                // them contiguous, and each keeps its own output buffer -- so this is
+                // bit-exact and nothing downstream changes. On their own the small ones
+                // measure 168 GB/s (k/v) and 25 (g) against q's 236; fused they all run at
+                // q's rate. The gate comes from the NORMED input, same as q/k/v.
+                float* outs[4] = {q, kk, vv, gp};
+                int    Ns[4]   = {qd, kvd, kvd, nh};
+                gemm_fp8_seg(outs, Ns, 4, w.q8, w.q8s, hb, M, H, st);
             } else {
-                gemm_bf16(q,  w.q, hb, M, qd,  H, st);
-                gemm_bf16(kk, w.k, hb, M, kvd, H, st);
-                gemm_bf16(vv, w.v, hb, M, kvd, H, st);
-                gemm_bf16(gp, w.g, hb, M, nh,  H, st);
+                float* outs[4] = {q, kk, vv, gp};
+                int    Ns[4]   = {qd, kvd, kvd, nh};
+                gemm_bf16_seg(outs, Ns, 4, w.q, hb, M, H, st);
             }
             acc(2); mark();
             rmsnorm_heads(q,  q,  w.q_norm, M, nh,          hd, (float)c.rms_eps, st);
@@ -313,8 +318,8 @@ struct Engine {
             acc(1); mark();
             if (c.is_dense(L)) {
                 int I = c.intermediate;
-                gemm_bf16(mlp_a, w.mlp_gate, hb, M, I, H, st);
-                gemm_bf16(mlp_b, w.mlp_up,   hb, M, I, H, st);
+                { float* o2[2] = {mlp_a, mlp_b}; int n2[2] = {I, I};
+                  gemm_bf16_seg(o2, n2, 2, w.mlp_gate, hb, M, H, st); }
                 swiglu(mlp_a, mlp_a, mlp_b, (long)M * I, st);
                 f32_to_bf16(attb, mlp_a, (long)M * I, st);
                 gemm_bf16(hn, w.mlp_down, attb, M, H, I, st);
@@ -323,8 +328,8 @@ struct Engine {
             } else {
                 // shared expert
                 int SI = c.shared_intermediate;
-                gemm_bf16(mlp_a, w.sh_gate, hb, M, SI, H, st);
-                gemm_bf16(mlp_b, w.sh_up,   hb, M, SI, H, st);
+                { float* o2[2] = {mlp_a, mlp_b}; int n2[2] = {SI, SI};
+                  gemm_bf16_seg(o2, n2, 2, w.sh_gate, hb, M, H, st); }
                 swiglu(mlp_a, mlp_a, mlp_b, (long)M * SI, st);
                 f32_to_bf16(attb, mlp_a, (long)M * SI, st);
                 gemm_bf16(hn, w.sh_down, attb, M, H, SI, st);

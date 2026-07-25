@@ -20,8 +20,10 @@ corrections to its factual premises: `RESCOPE.md`.
 | **D1** DFlash + k-sweep | ⏳ |
 | **S1** server layer | ⏳ |
 
-**Current decode: 20.44 tok/s median** (FP8 attention; 18.97 on the bit-exact BF16 path) (ctx 4096, greedy, no speculation) = 189.8 GB/s effective
-= **84 % of the measured 227 GB/s ceiling**. Prefill 55 tok/s.
+**Current decode: 27.35 tok/s median** (FP8 attention, ctx 4096, greedy, no speculation).
+Session arc 21.65 → 27.35 (+26 %) — see `OPTIMIZATION_LOG.md` #18–#23. The streaming ceiling
+is **~254 GB/s** measured on a real weight shape, not the 227 GB/s `bw_probe` reported.
+Prefill 60 tok/s.
 Reference point: poolside measured **13–14 tok/s** for this model on a DGX Spark (same
 bandwidth class) under vLLM, and **22–24 tok/s** with DFlash.
 

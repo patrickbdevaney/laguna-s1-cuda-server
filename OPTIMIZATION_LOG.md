@@ -73,6 +73,34 @@ back-to-back A/B/A.
 | 20 | **MoE: activation row as `uint4`, not 32 scalar 2-byte loads** (bit-exact) | 24.55 | **25.62/25.51** | **WON, with #21** |
 | 21 | **Router top-k on a warp, not on `threadIdx.x == 0`** | — | — | (folded into #20's measurement) |
 | 22 | **FP8 GEMM weight loads 8 B → 16 B**, now that 4 warps hide the latency | 25.63 | **26.59/26.66** | **WON +4.0 %** |
+| 23 | **Segmented GEMM: q\|k\|v\|g, sh_gate\|sh_up, mlp_gate\|mlp_up each one launch** | 26.63 | **27.18/27.35** | **WON +2.7 %**, bit-exact |
+
+### #23 — the loss was in the SMALL projections, not the big ones
+
+Per-shape, the dense GEMM was already near the ceiling where it mattered most and terrible
+where it looked unimportant:
+
+| projection | GB/s |
+|---|---:|
+| q_proj [9216,3072] | 236 |
+| o_proj [3072,9216] | 228 |
+| k/v_proj [1024,3072] | 168 |
+| g_proj [72,3072] | **25** |
+
+`g_proj` is 0.22 MB — easy to dismiss, and it was costing more per byte than anything else in
+the model. The fix is not a better kernel but a better *launch*: q, k, v and g share K and
+share their input, so they are one GEMM over N = qd + 2·kvd + heads. Same for the shared
+expert's gate/up and layer 0's dense gate/up.
+
+Requirement: the weights must be contiguous in the arena. `reserve()` had them interleaved
+with their scale vectors, so the reservation order changed to `q8,k8,v8,g8` then
+`q8s,k8s,v8s,g8s` — every size here is already a multiple of the 256 B reservation quantum, so
+"consecutive" really is "contiguous". (`g8s` at 288 B is the one that is not, which is why it
+is last in its group.)
+
+Each segment keeps its own output buffer and row stride, so nothing downstream learns about
+the fusion, and one warp still reduces one whole output row in the same order — **bit-exact**.
+Greedy 8/8 on both the FP8 and BF16 paths and Gate B1c still 0.0000e+00.
 
 ### #22 — a correct decision that expired
 
@@ -457,6 +485,25 @@ enough for now"; priority 3 (MoE) is promoted to first.
 ## Backlog, ranked by expected value
 
 EV = expected gain × P(works) ÷ cost. Derived from `ROOFLINE.md` and `RESCOPE.md` §2.
+
+### 0. MoE gate/up is grid-starved — the largest remaining base-decode lever
+
+`k_moe_gateup_rp` sits at 177 GB/s (70 % of the ~254 ceiling) and 9.4 ms/step, the worst of
+the four big kernels. The vector-load fix (#20) moved `k_moe_down_rp` 148 → 169 GB/s and did
+**nothing** for gate/up, which localises the cause: down launches 240 blocks, gate/up launches
+only `nact_max × MI/32/4` = **80 blocks = 320 warps = 16 of the 48 warp slots per SM**. It is
+not instruction-starved, it is grid-starved, and the grid is capped by the problem shape
+(10 experts × 1024 outputs, one thread per output).
+
+The fix is a split along K (H=3072) with a deterministic combine, the same move that made
+attention #2 the biggest early win. Note the counter-evidence: #14 doubled the warp count by
+putting gate and up on separate warps and LOST 1.3 % — but that split also duplicated the x
+reads and halved per-warp ILP, neither of which a K-split does. **Gain ~+4 %, P medium.**
+Only helps M=1; at verify M=k+1 the active-expert count already fills the grid.
+
+Second-order: `o_proj` runs at 228 GB/s against `q_proj`'s 236 for identical bytes — N=3072
+with K=9216 gives 36 iterations per lane where q gives 12. Worth one sweep of the load width
+for that shape specifically.
 
 ### 1. Self-quantize the BF16 remainder — **the largest lever, now evidence-staged**
 Poolside quantized only the routed experts; 7.41 GB of every decode step is BF16.

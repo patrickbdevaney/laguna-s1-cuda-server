@@ -326,16 +326,171 @@ void k_gemm_fp8(float* __restrict__ out, const uint8_t* __restrict__ W,
     }
 }
 
+static int fp8_vec() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("LG_FP8_VEC"); v = e ? atoi(e) : 16;
+                 if (v != 8 && v != 16) v = 8; }
+    return v;
+}
+
 extern "C" void gemm_fp8(float* out, const uint8_t* W, const float* rs, const uint16_t* xb,
                          int M, int N, int K, cudaStream_t st) {
-    static int VEC = -1;
-    if (VEC < 0) { const char* e = getenv("LG_FP8_VEC"); VEC = e ? atoi(e) : 16;
-                   if (VEC != 8 && VEC != 16) VEC = 8; }
+    const int VEC = fp8_vec();
     if (VEC == 16) {
         if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8, 1, 16, out, W, rs, xb, M, N, K); return; }
         GEMM_DISPATCH_V(k_gemm_fp8, MAXM, 16, out, W, rs, xb, M, N, K);
     } else {
         if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8, 1, 8, out, W, rs, xb, M, N, K); return; }
         GEMM_DISPATCH_V(k_gemm_fp8, MAXM, 8, out, W, rs, xb, M, N, K);
+    }
+}
+
+// =======================================================================================
+// Segmented GEMM — one launch for several output tensors that share K and share x.
+//
+// Three sites in this model qualify, and all three are launching small-N GEMMs that measure
+// badly on their own:
+//   q|k|v|g   N = qd + 2*kvd + heads   (k/v at 168 GB/s, g at 25, against q's 236)
+//   sh_gate|sh_up                      (1024 rows each)
+//   mlp_gate|mlp_up (layer 0)
+// The weights are already contiguous in the arena (see laguna_weights.h reserve()), so the
+// fused form is the same bytes in the same order — one warp still owns one whole output row
+// and reduces it in the same sequence, so this is **bit-exact**. What changes is the grid:
+// one kernel over sum(N) instead of several that each leave the machine half empty.
+//
+// Each segment keeps its OWN output buffer and its own row stride, so nothing downstream
+// has to learn about the fusion.
+// =======================================================================================
+struct GSegs {
+    float* out[4];
+    int    n0[4];      // first fused row belonging to this segment
+    int    N[4];       // rows in this segment
+    int    nseg;
+};
+
+template <int WARPS, int MM>
+__global__ __launch_bounds__(WARPS * 32)
+void k_gemm_bf16_seg(GSegs sg, const uint16_t* __restrict__ W,
+                     const uint16_t* __restrict__ xb, int M, int Ntot, int K) {
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    if (n >= Ntot) return;
+    const int m0 = blockIdx.y * MM;
+    const int mn = min(MM, M - m0);
+
+    float acc[MM];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) acc[m] = 0.f;
+
+    const uint4* wrow = (const uint4*)(W + (long)n * K);
+    const int K8 = K / 8;
+    for (int c = lane; c < K8; c += 32) {
+        uint4 wv = __ldcs(wrow + c);
+        const uint16_t* wh = (const uint16_t*)&wv;
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) {
+            if (m >= mn) break;
+            const uint4 xv = *(const uint4*)(xb + (long)(m0 + m) * K + c * 8);
+            const uint16_t* xh = (const uint16_t*)&xv;
+            float s = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) s = fmaf(bf2f(wh[j]), bf2f(xh[j]), s);
+            acc[m] += s;
+        }
+    }
+    int seg = 0;
+    #pragma unroll
+    for (int t = 1; t < 4; ++t) if (t < sg.nseg && n >= sg.n0[t]) seg = t;
+    const int nl = n - sg.n0[seg], Ns = sg.N[seg];
+    float* o = sg.out[seg];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) {
+        if (m >= mn) break;
+        float v = warp_sum(acc[m]);
+        if (lane == 0) o[(long)(m0 + m) * Ns + nl] = v;
+    }
+}
+
+template <int WARPS, int MM, int VEC>
+__global__ __launch_bounds__(WARPS * 32)
+void k_gemm_fp8_seg(GSegs sg, const uint8_t* __restrict__ W, const float* __restrict__ rs,
+                    const uint16_t* __restrict__ xb, int M, int Ntot, int K) {
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    if (n >= Ntot) return;
+    const int m0 = blockIdx.y * MM;
+    const int mn = min(MM, M - m0);
+
+    float acc[MM];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) acc[m] = 0.f;
+
+    const int C = K / VEC;
+    typedef typename WVec<VEC>::T wvec_t;
+    const wvec_t* wrow = (const wvec_t*)(W + (long)n * K);
+    for (int c = lane; c < C; c += 32) {
+        wvec_t wv = __ldcs(wrow + c);
+        const uint8_t* wb = (const uint8_t*)&wv;
+        #pragma unroll
+        for (int m = 0; m < MM; ++m) {
+            if (m >= mn) break;
+            const uint16_t* xp = xb + (long)(m0 + m) * K + c * VEC;
+            float s = 0.f;
+            #pragma unroll
+            for (int v = 0; v < VEC / 8; ++v) {
+                const uint4 xv = *(const uint4*)(xp + v * 8);
+                const uint16_t* xh = (const uint16_t*)&xv;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) s = fmaf(e4m3f(wb[v * 8 + j]), bf2f(xh[j]), s);
+            }
+            acc[m] += s;
+        }
+    }
+    const float sc = rs[n];
+    int seg = 0;
+    #pragma unroll
+    for (int t = 1; t < 4; ++t) if (t < sg.nseg && n >= sg.n0[t]) seg = t;
+    const int nl = n - sg.n0[seg], Ns = sg.N[seg];
+    float* o = sg.out[seg];
+    #pragma unroll
+    for (int m = 0; m < MM; ++m) {
+        if (m >= mn) break;
+        float v = warp_sum(acc[m]);
+        if (lane == 0) o[(long)(m0 + m) * Ns + nl] = v * sc;
+    }
+}
+
+static GSegs pack_segs(float* const* outs, const int* Ns, int nseg, int* Ntot) {
+    GSegs sg; sg.nseg = nseg; int acc = 0;
+    for (int i = 0; i < 4; ++i) {
+        sg.out[i] = i < nseg ? outs[i] : nullptr;
+        sg.N[i]   = i < nseg ? Ns[i]   : 0;
+        sg.n0[i]  = acc;
+        if (i < nseg) acc += Ns[i];
+    }
+    *Ntot = acc;
+    return sg;
+}
+
+extern "C" void gemm_bf16_seg(float* const* outs, const int* Ns, int nseg,
+                              const uint16_t* W, const uint16_t* xb, int M, int K,
+                              cudaStream_t st) {
+    int N = 0;
+    GSegs sg = pack_segs(outs, Ns, nseg, &N);
+    if (M == 1) { GEMM_DISPATCH(k_gemm_bf16_seg, 1, sg, W, xb, M, N, K); return; }
+    GEMM_DISPATCH(k_gemm_bf16_seg, MAXM, sg, W, xb, M, N, K);
+}
+
+extern "C" void gemm_fp8_seg(float* const* outs, const int* Ns, int nseg,
+                             const uint8_t* W, const float* rs, const uint16_t* xb,
+                             int M, int K, cudaStream_t st) {
+    int N = 0;
+    GSegs sg = pack_segs(outs, Ns, nseg, &N);
+    if (fp8_vec() == 16) {
+        if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8_seg, 1, 16, sg, W, rs, xb, M, N, K); return; }
+        GEMM_DISPATCH_V(k_gemm_fp8_seg, MAXM, 16, sg, W, rs, xb, M, N, K);
+    } else {
+        if (M == 1) { GEMM_DISPATCH_V(k_gemm_fp8_seg, 1, 8, sg, W, rs, xb, M, N, K); return; }
+        GEMM_DISPATCH_V(k_gemm_fp8_seg, MAXM, 8, sg, W, rs, xb, M, N, K);
     }
 }

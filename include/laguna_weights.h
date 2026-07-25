@@ -253,16 +253,28 @@ private:
             size_t qd = c.q_dim(L), kvd = (size_t)c.n_kv_heads * c.head_dim;
             if (fp8_attn_) {
                 // one byte per weight plus one fp32 scale per output row
-                reserve1(w.q8, qd * H);      reserve1(w.q8s, qd * 4);
-                reserve1(w.k8, kvd * H);     reserve1(w.k8s, kvd * 4);
-                reserve1(w.v8, kvd * H);     reserve1(w.v8s, kvd * 4);
-                reserve1(w.o8, H * qd);      reserve1(w.o8s, H * 4);
+                // q|k|v|g are reserved BACK TO BACK, and their scales likewise, so the four
+                // projections can be issued as ONE GEMM over N = qd+2*kvd+heads. They share
+                // K and they share the input (the post-layernorm hidden), so this is purely
+                // a launch-shape change -- and the small ones badly need it: measured alone,
+                // k/v_proj runs at 168 GB/s and g_proj at 25, against q_proj's 236.
+                // reserve1 rounds every allocation to 256 B and every size here is already a
+                // multiple of 256, so "back to back" really is contiguous. g8s (heads*4 =
+                // 288 B) is the one that is not, which is why it is last in its group.
+                reserve1(w.q8, qd * H);
+                reserve1(w.k8, kvd * H);
+                reserve1(w.v8, kvd * H);
                 reserve1(w.g8, (size_t)c.heads[L] * H);
+                reserve1(w.q8s, qd * 4);
+                reserve1(w.k8s, kvd * 4);
+                reserve1(w.v8s, kvd * 4);
                 reserve1(w.g8s, (size_t)c.heads[L] * 4);
+                reserve1(w.o8, H * qd);      reserve1(w.o8s, H * 4);
             } else {
-                reserve1(w.q, qd * H * 2);   reserve1(w.k, kvd * H * 2);
-                reserve1(w.v, kvd * H * 2);  reserve1(w.o, H * qd * 2);
-                reserve1(w.g, (size_t)c.heads[L] * H * 2);
+                reserve1(w.q, qd * H * 2);   reserve1(w.k, kvd * H * 2);   // q|k|v|g
+                reserve1(w.v, kvd * H * 2);                                    // contiguous:
+                reserve1(w.g, (size_t)c.heads[L] * H * 2);                     // one GEMM
+                reserve1(w.o, H * qd * 2);
             }
             reserve1(w.in_ln, H * 2);            reserve1(w.post_ln, H * 2);
             reserve1(w.q_norm, c.head_dim * 2);  reserve1(w.k_norm, c.head_dim * 2);

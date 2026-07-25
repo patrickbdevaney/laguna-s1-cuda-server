@@ -313,6 +313,20 @@ extern "C" void moe_finalize(float* out, const float* dpart, const float* wts, c
 // owns an output row and streams all of k: the loop is 96 iterations (unrolled by U), 32
 // lanes still read 512 contiguous bytes per step, and there is no warp reduction whatsoever.
 // =======================================================================================
+// The activation row is BROADCAST to all 32 lanes, so it is easy to write as a plain
+// uint16_t* index -- and that compiles to one scalar 2-byte load per element, 32 of them per
+// 16-byte code chunk where 4 vector loads would do. It is the same defect that cost 2.8x in
+// the FP8 GEMM (OPTIMIZATION_LOG #18). Load the row as uint4 and split each 32-bit word into
+// its two bf16 halves in registers; taking the address of a local array here would push it
+// straight back to local memory, so the words are named, not indexed.
+//
+// The j (code-byte) order is unchanged, so both accumulators still sum in the same sequence:
+// this is bit-exact, not an approximation.
+#define LG_XW4(P) const uint4 W0_ = *(const uint4*)(P),      W1_ = *(const uint4*)((P) + 8), \
+                             W2_ = *(const uint4*)((P) + 16), W3_ = *(const uint4*)((P) + 24)
+#define LG_XLO(w) bf2f((uint16_t)((w) & 0xffffu))
+#define LG_XHI(w) bf2f((uint16_t)((w) >> 16))
+
 #define RPNB 32          // output rows per repack block == warp width
 #define RPU  4           // k-chunks in flight per lane
 
@@ -381,22 +395,22 @@ __global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
                 if (i >= nt) break;
-                const uint16_t* xh = xrow[i] + c * 32;
+                LG_XW4(xrow[i] + c * 32);
                 float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    float x0 = bf2f(xh[2 * j]), x1 = bf2f(xh[2 * j + 1]);
-                    float2 gw = fp4x2_f2(gbb[j]), uw = fp4x2_f2(ubb[j]);
-                    g0 = fmaf(gw.x, x0, g0);  g0 = fmaf(gw.y, x1, g0);
-                    u0 = fmaf(uw.x, x0, u0);  u0 = fmaf(uw.y, x1, u0);
-                }
-                #pragma unroll
-                for (int j = 8; j < 16; ++j) {
-                    float x0 = bf2f(xh[2 * j]), x1 = bf2f(xh[2 * j + 1]);
-                    float2 gw = fp4x2_f2(gbb[j]), uw = fp4x2_f2(ubb[j]);
-                    g1 = fmaf(gw.x, x0, g1);  g1 = fmaf(gw.y, x1, g1);
-                    u1 = fmaf(uw.x, x0, u1);  u1 = fmaf(uw.y, x1, u1);
-                }
+                #define GU_(w, j, ga, ua)                                                  \
+                    { const float x0 = LG_XLO(w), x1 = LG_XHI(w);                           \
+                      const float2 gw = fp4x2_f2(gbb[j]), uw = fp4x2_f2(ubb[j]);            \
+                      ga = fmaf(gw.x, x0, ga);  ga = fmaf(gw.y, x1, ga);                    \
+                      ua = fmaf(uw.x, x0, ua);  ua = fmaf(uw.y, x1, ua); }
+                GU_(W0_.x, 0, g0, u0) GU_(W0_.y, 1, g0, u0)
+                GU_(W0_.z, 2, g0, u0) GU_(W0_.w, 3, g0, u0)
+                GU_(W1_.x, 4, g0, u0) GU_(W1_.y, 5, g0, u0)
+                GU_(W1_.z, 6, g0, u0) GU_(W1_.w, 7, g0, u0)
+                GU_(W2_.x, 8, g1, u1) GU_(W2_.y, 9, g1, u1)
+                GU_(W2_.z,10, g1, u1) GU_(W2_.w,11, g1, u1)
+                GU_(W3_.x,12, g1, u1) GU_(W3_.y,13, g1, u1)
+                GU_(W3_.z,14, g1, u1) GU_(W3_.w,15, g1, u1)
+                #undef GU_
                 accg[i] += g0 * gsc[u][0] + g1 * gsc[u][1];
                 accu[i] += u0 * usc[u][0] + u1 * usc[u][1];
             }
@@ -463,20 +477,17 @@ __global__ void k_moe_down_rp(float* __restrict__ dpart,
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
                 if (i >= nt) break;
-                const uint16_t* hh = hrow[i] + c * 32;
+                LG_XW4(hrow[i] + c * 32);
                 float h0 = 0.f, h1 = 0.f;
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    float2 dw = fp4x2_f2(db[j]);
-                    h0 = fmaf(dw.x, bf2f(hh[2 * j]), h0);
-                    h0 = fmaf(dw.y, bf2f(hh[2 * j + 1]), h0);
-                }
-                #pragma unroll
-                for (int j = 8; j < 16; ++j) {
-                    float2 dw = fp4x2_f2(db[j]);
-                    h1 = fmaf(dw.x, bf2f(hh[2 * j]), h1);
-                    h1 = fmaf(dw.y, bf2f(hh[2 * j + 1]), h1);
-                }
+                #define DN_(w, j, ha)                                                      \
+                    { const float2 dw = fp4x2_f2(db[j]);                                    \
+                      ha = fmaf(dw.x, LG_XLO(w), ha);                                       \
+                      ha = fmaf(dw.y, LG_XHI(w), ha); }
+                DN_(W0_.x, 0, h0) DN_(W0_.y, 1, h0) DN_(W0_.z, 2, h0) DN_(W0_.w, 3, h0)
+                DN_(W1_.x, 4, h0) DN_(W1_.y, 5, h0) DN_(W1_.z, 6, h0) DN_(W1_.w, 7, h0)
+                DN_(W2_.x, 8, h1) DN_(W2_.y, 9, h1) DN_(W2_.z,10, h1) DN_(W2_.w,11, h1)
+                DN_(W3_.x,12, h1) DN_(W3_.y,13, h1) DN_(W3_.z,14, h1) DN_(W3_.w,15, h1)
+                #undef DN_
                 acc[i] += h0 * dsc[u][0] + h1 * dsc[u][1];
             }
         }

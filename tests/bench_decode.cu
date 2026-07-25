@@ -66,7 +66,11 @@ int main(int argc,char**argv){
            Btok/med/1e9, Btok/med/THOR_BW_CEILING*100, THOR_BW_CEILING/1e9);
     printf("wall at this B_tok = %.2f tok/s ; headroom x%.2f\n",
            THOR_BW_CEILING/Btok, (THOR_BW_CEILING/Btok)*med);
-    printf("greedy match %d/%zu %s\n",match,ncmp,(size_t)match==ncmp?"OK":"MISMATCH");
+    // The golden continuation is only defined for the real prompt. A synthetic PRE
+    // prefix changes the context, so a mismatch there means nothing -- say so rather
+    // than printing a scary MISMATCH on every long-context run.
+    printf("greedy match %d/%zu %s\n",match,ncmp,
+           PRE>0 ? "(n/a: synthetic prefill)" : ((size_t)match==ncmp?"OK":"MISMATCH"));
     E.prof_report((int)ts.size());
     return 0;
 }

@@ -214,17 +214,38 @@ __global__ void k_router(int* __restrict__ sel, float* __restrict__ wts,
     // top-k by iterative argmax. topk is 10 and E is 256: 2560 comparisons per token,
     // negligible next to the expert GEMMs, and it reproduces torch.topk's tie-breaking
     // (lowest index wins) exactly, which matters because a mis-ordered selection is silent.
-    if (threadIdx.x == 0) {
+    // The argmax scan runs on ONE warp, not one thread. The serial version ("negligible next
+    // to the expert GEMMs") measured 27 us per launch x 47 layers = 1.32 ms, 3.2 % of the
+    // decode step, with 255 of 256 threads idle -- a reminder that "small" means small
+    // *measured*, not small in flops.
+    //
+    // Tie-breaking must stay torch.topk's: lowest index wins. Each lane scans its strided
+    // slice ascending with a strict >, so within a lane the lowest index already wins; the
+    // warp reduction then has to break value ties by index explicitly or the winner depends
+    // on the shuffle order.
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
         float sum = 0.f;
         for (int j = 0; j < topk; ++j) {
-            int best = -1; float bv = -1e30f;
-            for (int e = 0; e < E; ++e) if (ss[e] > bv) { bv = ss[e]; best = e; }
-            sel[(long)r * topk + j] = best;
-            wts[(long)r * topk + j] = sc[best];
-            sum += sc[best];
-            ss[best] = -1e30f;
+            float bv = -1e30f; int best = 0x7fffffff;
+            for (int e = lane; e < E; e += 32)
+                if (ss[e] > bv) { bv = ss[e]; best = e; }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+                const int   oi = __shfl_down_sync(0xffffffffu, best, off);
+                if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+            }
+            best = __shfl_sync(0xffffffffu, best, 0);
+            if (lane == 0) {
+                sel[(long)r * topk + j] = best;
+                wts[(long)r * topk + j] = sc[best];
+                sum += sc[best];
+            }
+            if (lane == 0) ss[best] = -1e30f;
+            __syncwarp();
         }
-        if (norm_topk && sum != 0.f)
+        if (lane == 0 && norm_topk && sum != 0.f)
             for (int j = 0; j < topk; ++j) wts[(long)r * topk + j] /= sum;
     }
 }

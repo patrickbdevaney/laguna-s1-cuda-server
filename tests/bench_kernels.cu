@@ -11,6 +11,8 @@ void gemm_fp4(float*,const uint8_t*,const uint8_t*,float,const uint16_t*,int,int
 void gemm_fp8(float*,const uint8_t*,const float*,const uint16_t*,int,int,int,cudaStream_t);
 void rmsnorm(float*,const float*,const uint16_t*,int,int,float,cudaStream_t);
 void attend(float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,const int*,float,cudaStream_t);
+void attend_split(float*,float*,float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,const int*,float,int,cudaStream_t);
+int  attend_nsplit(int,int,int);
 }
 static float bench(void(*fn)(),int it=20){
     fn(); CK(cudaDeviceSynchronize());
@@ -30,6 +32,8 @@ static void run_fp4(){ size_t n=(size_t)gN*gK; size_t o=roll(n); gemm_fp4(O,P+o/
 static float* Rs; static void run_fp8(){ size_t o=roll((size_t)gN*gK); gemm_fp8(O,P+o,Rs,X,gM,gN,gK,0); }
 static int aM,aNKV,aG,aCAP,aWIN; static int* aBase;
 static void run_attn(){ attend(Oa,Q,Kc,Vc,1.f,1.f,aM,aNKV,aG,aCAP,aWIN,aBase,0.088f,0); }
+static float *pacc,*pml; static int aNSP;
+static void run_attn_split(){ attend_split(Oa,pacc,pml,Q,Kc,Vc,1.f,1.f,aM,aNKV,aG,aCAP,aWIN,aBase,0.088f,aNSP,0); }
 
 int main(){
     size_t big=(size_t)100352*3072;   // sized for lm_head, the largest single weight
@@ -73,15 +77,20 @@ int main(){
     CK(cudaMalloc(&Q,(size_t)64*9216*4)); CK(cudaMalloc(&Oa,(size_t)64*9216*4));
     CK(cudaMalloc(&Kc,(size_t)8*4096*128)); CK(cudaMalloc(&Vc,(size_t)8*4096*128));
     CK(cudaMemset(Kc,0x38,(size_t)8*4096*128)); CK(cudaMemset(Vc,0x38,(size_t)8*4096*128));
-    struct A{const char*n;int M,NKV,G,CAP,WIN;};
-    A as[]={{"attn sliding win=512 M=1",1,8,9,512,512},{"attn global ctx=4096 M=1",1,8,6,4096,0},
-            {"attn sliding win=512 M=6",6,8,9,512,512}};
+    CK(cudaMalloc(&pacc,(size_t)64*8*9*128*32*4)); CK(cudaMalloc(&pml,(size_t)64*8*9*32*2*4));
+    struct A{const char*n;int M,NKV,G,CAP,WIN;int split;};
+    A as[]={{"attn  sliding win=512 M=1",1,8,9,512,512,0},{"attn  global ctx=4096 M=1",1,8,6,4096,0,0},
+            {"attn  sliding win=512 M=6",6,8,9,512,512,0},
+            {"SPLIT sliding win=512 M=1",1,8,9,512,512,1},{"SPLIT global ctx=4096 M=1",1,8,6,4096,0,1},
+            {"SPLIT sliding win=512 M=6",6,8,9,512,512,1},{"SPLIT global ctx=4096 M=6",6,8,6,4096,0,1}};
     for(auto&a:as){
         aM=a.M;aNKV=a.NKV;aG=a.G;aCAP=a.CAP;aWIN=a.WIN;
+        aNSP=attend_nsplit(a.M,a.NKV,a.WIN?a.WIN:a.CAP);
         { int b=a.CAP-1; CK(cudaMemcpy(aBase,&b,4,cudaMemcpyHostToDevice)); }
         double bytes=(double)a.NKV*(a.WIN?a.WIN:a.CAP)*128*2;
-        float ms=bench(run_attn);
-        printf("%-34s %6d %6.1fM %7.3f %9.1f %8.0f%%\n",a.n,a.M,bytes/1e6,ms,bytes/1e9/(ms/1e3),
+        float ms=a.split?bench(run_attn_split):bench(run_attn);
+        char nm[64]; snprintf(nm,sizeof nm,"%s nsp=%d",a.n,a.split?aNSP:1);
+        printf("%-34s %6d %6.1fM %7.3f %9.1f %8.0f%%\n",nm,a.M,bytes/1e6,ms,bytes/1e9/(ms/1e3),
                bytes/1e9/(ms/1e3)/227*100);
     }
     // launch overhead

@@ -70,6 +70,47 @@ back-to-back A/B/A.
 | 17 | `attend_nsplit` no longer depends on `M` (split sized by key length alone) | — | — | **CORRECTNESS FIX**, decode shape unchanged |
 | 18 | **FP8 GEMM: load `x` as one `uint4` instead of 8 scalar 2-byte loads** | 0.809 ms | **0.292 ms** | **WON 2.8x at M=6**, 1.5x at M=1 |
 | 19 | **GEMM warps per block 1 → 4** (occupancy, bit-exact) | 21.65/21.70 | **24.59/24.50** | **WON +13.4 %** |
+| 20 | **MoE: activation row as `uint4`, not 32 scalar 2-byte loads** (bit-exact) | 24.55 | **25.62/25.51** | **WON, with #21** |
+| 21 | **Router top-k on a warp, not on `threadIdx.x == 0`** | — | — | (folded into #20's measurement) |
+
+### #20/#21 — the same scalar-load defect, and a "negligible" kernel that was 3.2 %
+
+`LG_PROF` categories were too coarse and its own `cudaDeviceSynchronize` per category
+inflated the small ones — it reported attention core at 7.8 % of the step when the truth is
+1.4 %. `nsys` per-kernel is the right instrument. Note it must be run with `LG_NOGRAPH=1`:
+with the CUDA graph on, every decode kernel is inside the graph and the report shows only the
+prefill forward.
+
+Decode, 29 steps, ms/step:
+
+| kernel | ms/step | % | GB/step | GB/s | % of ~254 |
+|---|---:|---:|---:|---:|---:|
+| `k_gemm_fp8` q/k/v/o/g | 14.19 | 34 | 2.806 | 198 | 78 % |
+| `k_moe_gateup_rp` | 9.31 | 22 | 1.663 | 179 | 70 % |
+| `k_gemm_bf16` | 8.37 | 20 | 1.800 | 215 | 85 % |
+| `k_moe_down_rp` | 5.61 | 14 | 0.832 | **148** | 58 % |
+| `k_router` | 1.32 | 3.2 | ~0 | — | pure latency |
+| attention core (all kernels) | 0.60 | 1.4 | 0.090 | — | not a problem |
+
+**#20.** Both repacked MoE kernels read the activation row as `xh[2*j]` off a `uint16_t*`.
+The row is broadcast to all 32 lanes, which makes the scalar form look harmless — it is not:
+32 scalar loads per 16-byte code chunk where 4 vector loads do. Rewritten as four `uint4`
+loads with each 32-bit word split into its two bf16 halves in registers. The code-byte order
+is untouched, so both accumulators sum in the same sequence — **bit-exact**, and greedy stayed
+8/8. (Naming the words matters: taking the address of a local `uint4[4]` would put it straight
+back in local memory, which is defect #1 all over again.)
+
+**#21.** `k_router` ran its top-10-of-256 under `if (threadIdx.x == 0)` — 2560 serial
+comparisons with 255 threads idle, 27 µs per launch × 47 layers = **1.32 ms, 3.2 % of the
+step**. The comment justifying it said "negligible next to the expert GEMMs". Moved to a
+warp-wide strided scan plus a shuffle reduction. The tie-break is the subtle part: torch.topk
+gives the lowest index, so each lane scans ascending with a strict `>` and the shuffle
+reduction breaks value ties by index explicitly. Gate G4 still reports 0/540 mismatching
+indices.
+
+**Lesson worth carrying:** "negligible" has to mean negligible *measured*. Both of these were
+justified in comments by flop counts, and both were costing more than several of the wins in
+this table.
 
 ### #18/#19 — the dense GEMMs were issue-bound, and half the warp slots were unreachable
 

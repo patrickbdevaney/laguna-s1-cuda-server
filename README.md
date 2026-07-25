@@ -17,15 +17,34 @@ corrections to its factual premises: `RESCOPE.md`.
 | **L1** loader | ✅ 71.899 GB in one arena, 44.6 s cold, 4.92 GB peak RSS |
 | **B1** kernels G1–G9 | ✅ 13/13 kernel gates; full forward **greedy-exact**; CUDA graph capture |
 | **B1c** batched ≡ sequential | ✅ 10/10 **bit-exact** (MAXTOK 4/16/64 × P 4…1200, above and below the window) |
-| **D1** DFlash + k-sweep | ⏳ |
-| **S1** server layer | ⏳ |
+| **D1** DFlash + k-sweep | ✅ greedy-exact at every k; τ 4.32; k\* = 3–4; E_frac measured |
+| **S1** server layer | ✅ OpenAI endpoint, prefix cache, WebUI, C++ client, adaptive speculation |
 
 **Current decode: 27.35 tok/s median** (FP8 attention, ctx 4096, greedy, no speculation).
 Session arc 21.65 → 27.35 (+26 %) — see `OPTIMIZATION_LOG.md` #18–#23. The streaming ceiling
 is **~254 GB/s** measured on a real weight shape, not the 227 GB/s `bw_probe` reported.
 Prefill 60 tok/s.
+**Served, end to end** (`lgserve`, adaptive speculation): **33.6 tok/s on code**,
+**28–32 tok/s on prose**, with a hard floor at the autoregressive rate.
+
 Reference point: poolside measured **13–14 tok/s** for this model on a DGX Spark (same
 bandwidth class) under vLLM, and **22–24 tok/s** with DFlash.
+
+## Run the server
+
+```bash
+nvcc -O3 -std=c++17 -arch=sm_110a -I. -o build/lgserve src/server.cu kernels/*.cu -lpthread
+g++  -O2 -std=c++17 -I. -o build/lgchat tools/lgchat.cc -lpthread
+
+CTX=262144 ./build/lgserve            # OpenAI endpoint + WebUI on :8080
+./build/lgchat                        # terminal client
+```
+
+`POST /v1/chat/completions` (streaming and not), `GET /v1/models`, `GET /healthz`, WebUI at
+`/`. Reasoning arrives as `reasoning_content` deltas until the model closes `</think>`, then
+as `content`; tool calls are parsed with the same `poolside_v1` grammar the prompt is rendered
+with. `timings.spec_arms` reports what the speculation bandit currently believes about each
+arm.
 
 ## Layout
 

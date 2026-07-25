@@ -313,21 +313,25 @@ extern "C" void embed_rows(float* o, const uint16_t* emb, const int* ids, int ro
 // block so it can be RMS-normed by `aux_hidden_norms.{slot}` with the plain rmsnorm kernel,
 // and the concatenation into [C,18432] happens afterwards, in the cast to bf16.
 // ---------------------------------------------------------------------------------------
+// The position comes in as a DEVICE pointer, not a host int, for the same reason store_kv's
+// does: a host int is baked into a CUDA graph at capture time, so the AR decode step could
+// not be graphed while taps were enabled and every tap would land in the captured position's
+// slot forever. That cost the server's autoregressive arm ~12 %.
 __global__ void k_tap_store(float* __restrict__ taps, const float* __restrict__ h,
-                            int M, int H, int base, int cap, int slot) {
+                            int M, int H, const int* __restrict__ dbase, int cap, int slot) {
     long t = blockIdx.x * (long)blockDim.x + threadIdx.x;
     if (t >= (long)M * H) return;
     const int m = (int)(t / H), d = (int)(t % H);
     // A ring, not a flat buffer: the draft's window is 512 on every layer, so only the last
     // `cap` positions can ever be attended and the tap store is O(1) in conversation length.
-    const int p = (base + m) % cap;
+    const int p = (*dbase + m) % cap;
     taps[((long)slot * cap + p) * H + d] = h[t];
 }
 
-extern "C" void tap_store(float* taps, const float* h, int M, int H, int base, int cap,
+extern "C" void tap_store(float* taps, const float* h, int M, int H, const int* dbase, int cap,
                           int slot, cudaStream_t st) {
     long n = (long)M * H; int T = 256;
-    k_tap_store<<<(int)((n + T - 1) / T), T, 0, st>>>(taps, h, M, H, base, cap, slot);
+    k_tap_store<<<(int)((n + T - 1) / T), T, 0, st>>>(taps, h, M, H, dbase, cap, slot);
 }
 
 // Norm each tap with its own `aux_hidden_norms.{slot}` and concatenate the six results into

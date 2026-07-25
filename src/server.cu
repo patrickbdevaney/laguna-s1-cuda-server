@@ -61,6 +61,89 @@ struct Utf8Stream {
     std::string flush() { std::string o = pending; pending.clear(); return o; }
 };
 
+// ------------------------------------------------------------------ adaptive speculation
+//
+// Speculation is NOT free on this model, and on a bandwidth-bound MoE it is not even reliably
+// positive. Gate D1 measured the break-even: a verify forward at M=k+1 costs about 3x a
+// decode step (the MoE activates ~4x the experts, and the dense GEMMs are issue-bound at
+// M>1), so speculation only wins when tau > ~3. And tau is content-dependent -- poolside
+// publish 6.44 on HumanEval against 4.02 on MT-Bench, and this server measures 3.06 on a
+// math prompt against 2.26 on open prose. At 2.26 with k=3 speculation runs at 20.7 tok/s
+// against 27.4 for plain autoregressive decode: a 25 % LOSS.
+//
+// So the mode is chosen by measurement rather than by configuration. Each arm keeps an EWMA
+// of its achieved tokens/second; the best arm runs, and every arm is re-probed periodically
+// so the estimate tracks a conversation that switches from prose to code. The state lives on
+// the server, not the request, because it is a property of the hardware far more than of any
+// one prompt.
+struct SpecBandit {
+    static const int NM = 4;
+    static const int RUN = 32;              // steps an arm holds before it is re-ranked
+    static const int PROBE_EVERY = 10;      // blocks between exploration
+    static const int SWEEP_EVERY = 50;      // blocks between a forced probe of EVERY arm
+
+    int    k[NM]     = {0, 2, 3, 5};        // 0 = plain autoregressive
+    double rate[NM]  = {0, 0, 0, 0};        // EWMA tokens/second
+    long   tries[NM] = {0, 0, 0, 0};
+
+    // An arm is held for a BLOCK of steps, not one step. A single speculative step yields
+    // between 1 and k+1 tokens, so its instantaneous rate varies by the full width of the
+    // acceptance distribution -- ranking arms on one sample made the bandit thrash and cost
+    // 12 % on the workload where speculation actually wins. Averaging over RUN steps cuts the
+    // variance by ~5x, which is the difference between converging and oscillating.
+    int    cur = 0;
+    int    left = 0;
+    int    blk_tok = 0;
+    double blk_s = 0;
+    long   blocks = 0;
+
+    int pick() {
+        if (left > 0) return cur;
+        if (blk_s > 0) commit();
+        for (int i = 0; i < NM; ++i) if (tries[i] == 0) { cur = i; break; }
+        if (tries[cur] != 0) {
+            int best = 0;
+            for (int i = 1; i < NM; ++i) if (rate[i] > rate[best]) best = i;
+            ++blocks;
+            // Exploration is not free: a block spent on a bad arm costs ~30 % of its tokens,
+            // and acceptance is non-stationary WITHIN a generation (the same arm measured
+            // 37.4 then 22.6 tok/s as a code answer drifted into prose). So probe rarely,
+            // and skip arms that are not plausibly competitive -- unless a full sweep is due,
+            // which is what lets an arm that has recovered come back.
+            const bool sweep = (blocks % SWEEP_EVERY) < NM;
+            if (sweep) cur = (int)(blocks % NM);
+            else if (blocks % PROBE_EVERY == 0) {
+                cur = best;
+                for (int t = 1; t < NM; ++t) {
+                    int cand = (int)((blocks / PROBE_EVERY + t) % NM);
+                    if (rate[cand] >= 0.65 * rate[best]) { cur = cand; break; }
+                }
+            } else cur = best;
+        }
+        left = RUN;
+        return cur;
+    }
+    void update(int, int toks, double secs) { blk_tok += toks; blk_s += secs; --left; }
+    void commit() {
+        double r = blk_tok / std::max(blk_s, 1e-9);
+        rate[cur] = tries[cur] ? 0.6 * rate[cur] + 0.4 * r : r;
+        ++tries[cur];
+        blk_tok = 0; blk_s = 0;
+    }
+    void flush() { if (blk_s > 0) { commit(); left = 0; } }   // end of a request
+
+    std::string report() const {
+        std::string s;
+        for (int i = 0; i < NM; ++i) {
+            char b[64];
+            snprintf(b, sizeof b, "%s%s=%.1f", i ? " " : "",
+                     k[i] ? ("k" + std::to_string(k[i])).c_str() : "ar", rate[i]);
+            s += b;
+        }
+        return s;
+    }
+};
+
 // ------------------------------------------------------------------ engine wrapper
 struct Server {
     Config c;
@@ -76,6 +159,8 @@ struct Server {
     int CTX = 262144;
     int SPEC_K = 3;                 // Gate D1 measured k* = 3-4 on this part
     bool use_spec = true;
+
+    SpecBandit bandit;
 
     // prefix cache
     std::vector<int> cached;        // token ids currently represented in S's KV
@@ -185,10 +270,14 @@ struct GenOpts {
 };
 
 // Emits each newly committed token to `on_tok`; returns false from on_tok to stop.
+struct GenStats { double prefill_s = 0, decode_s = 0; int prompt = 0, gen = 0, steps = 0; };
+
 template <class F>
-static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_tok) {
+static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_tok,
+                     GenStats* stats = nullptr) {
     uint64_t rng = 0x9E3779B97F4A7C15ULL ^ (uint64_t)std::chrono::steady_clock::now()
                        .time_since_epoch().count();
+    double tp0 = wall_now();
     int reused = 0;
     int last_row = s.prefill(ids, reused);
     int next = s.sample_row(last_row, o.temperature, o.top_p, rng);
@@ -200,12 +289,16 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
+    if (stats) { stats->prefill_s = wall_now() - tp0; stats->prompt = (int)ids.size(); }
+    const double td0 = wall_now();
+
     int emitted = 0;
     auto is_eos = [&](int t) {
         for (int e : s.c.eos) if (t == e) return true;
         return false;
     };
-    std::vector<int> draft(s.SPEC_K), blk(s.dc.block_size), tout(s.dc.block_size);
+    const int KMAX = s.dc.block_size - 1;
+    std::vector<int> draft(KMAX), blk(s.dc.block_size), tout(s.dc.block_size);
 
     while (emitted < o.max_tokens) {
         if (is_eos(next)) break;
@@ -213,18 +306,32 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         s.cached.push_back(next);
         ++emitted;
 
-        if (!s.use_spec) {
+        // Sampling has no cheap correct acceptance rule here -- longest-prefix is only valid
+        // against an argmax target, and the rejection sampler needs the draft's own
+        // distribution. Rather than silently change the output distribution, sampled requests
+        // decode autoregressively.
+        const int arm = (s.use_spec && o.temperature <= 0.0) ? s.bandit.pick() : 0;
+        const int k = s.bandit.k[arm];
+        const double ts0 = wall_now();
+
+        if (k == 0) {
+            // The M=1 step runs from a captured CUDA graph -- measured +7.8 % on its own, and
+            // it is the arm the bandit picks on prose, so it is the one that matters most for
+            // a chat workload. The graph is only valid because `tap_store` and `store_kv`
+            // both take the position as a device pointer; a host int would be frozen at
+            // capture time.
             CUDA_CHECK(cudaMemcpy(s.d_tok, &next, 4, cudaMemcpyHostToDevice));
-            set_base(s.E.dbase, s.pos, 0);
-            s.E.forward(s.S, s.d_tok, 1, s.pos);
+            if (s.E.needs_recapture(s.pos)) s.E.capture(s.S, s.d_tok, s.pos);
+            s.E.step_graph(s.pos);
             CUDA_CHECK(cudaDeviceSynchronize());
             s.pos += 1;
             next = s.sample_row(0, o.temperature, o.top_p, rng);
+            if (s.use_spec) s.D.context_kv(s.E.taps, s.E.tap_cap, s.pos - 1, 1);
+            s.bandit.update(arm, 1, wall_now() - ts0);
+            if (stats) ++stats->steps;
             continue;
         }
 
-        // ---- speculative step: propose k, verify k+1, accept the longest greedy prefix ----
-        const int k = s.SPEC_K;
         s.D.propose(next, s.pos, k, s.W.embed, s.W.lm_head, draft.data());
         blk[0] = next;
         for (int i = 0; i < k; ++i) blk[1 + i] = draft[i];
@@ -235,10 +342,7 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
 
         for (int j = 0; j <= k; ++j) tout[j] = s.sample_row(j, o.temperature, o.top_p, rng);
         int nacc = 0;
-        // Acceptance is only valid against a GREEDY target. Under sampling the correct rule is
-        // the rejection sampler, which needs the draft's own distribution; we do not have it
-        // cheaply here, so sampled requests fall back to accepting nothing beyond the bonus.
-        if (o.temperature <= 0.0) while (nacc < k && draft[nacc] == tout[nacc]) ++nacc;
+        while (nacc < k && draft[nacc] == tout[nacc]) ++nacc;
 
         for (int j = 0; j < nacc; ++j) {
             if (emitted >= o.max_tokens || is_eos(draft[j])) { nacc = j; break; }
@@ -249,7 +353,11 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         s.pos += nacc + 1;
         next = tout[nacc];
         s.D.context_kv(s.E.taps, s.E.tap_cap, s.pos - (nacc + 1), nacc + 1);
+        s.bandit.update(arm, nacc + 1, wall_now() - ts0);
+        if (stats) ++stats->steps;
     }
+    s.bandit.flush();
+    if (stats) { stats->decode_s = wall_now() - td0; stats->gen = emitted; }
 }
 
 // ------------------------------------------------------------------ HTTP
@@ -346,9 +454,8 @@ int main(int argc, char** argv) {
 
         if (!stream) {
             std::string text;
-            double t0 = wall_now(); int n = 0;
-            generate(s, ids, o, [&](int t) { text += s.tok->decode({t}); ++n; return true; });
-            double dt = wall_now() - t0;
+            GenStats gs; int n = 0;
+            generate(s, ids, o, [&](int t) { text += s.tok->decode({t}); ++n; return true; }, &gs);
             lgchat::Parsed p = lgchat::parse_output(text, o.thinking);
             ojson msg{{"role", "assistant"}, {"content", p.content}};
             if (!p.reasoning.empty()) msg["reasoning_content"] = p.reasoning;
@@ -366,7 +473,16 @@ int main(int argc, char** argv) {
                     {"usage", ojson{{"prompt_tokens", (int)ids.size()},
                                     {"completion_tokens", n},
                                     {"total_tokens", (int)ids.size() + n}}},
-                    {"timings", ojson{{"tokens_per_second", n / std::max(dt, 1e-9)}}}};
+                    // Decode rate EXCLUDING prefill is the number to compare against the
+                    // benchmarks; the combined figure just tracks prompt length.
+                    {"timings", ojson{
+                        {"prefill_seconds", gs.prefill_s},
+                        {"decode_seconds", gs.decode_s},
+                        {"decode_tokens_per_second", gs.gen / std::max(gs.decode_s, 1e-9)},
+                        {"tokens_per_second", gs.gen / std::max(gs.prefill_s + gs.decode_s, 1e-9)},
+                        {"target_forwards", gs.steps},
+                        {"accepted_per_forward", gs.steps ? (double)gs.gen / gs.steps : 0.0},
+                        {"spec_arms", s.bandit.report()}}}};
             res.set_content(j.dump(), "application/json");
             return;
         }

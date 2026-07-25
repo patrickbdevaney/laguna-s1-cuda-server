@@ -37,7 +37,7 @@ void gate_softplus(float*, const float*, int, int, int, cudaStream_t);
 void swiglu(float*, const float*, const float*, long, cudaStream_t);
 void add_inplace(float*, const float*, long, cudaStream_t);
 void embed_rows(float*, const uint16_t*, const int*, int, int, cudaStream_t);
-void tap_store(float*, const float*, int, int, int, int, int, cudaStream_t);
+void tap_store(float*, const float*, int, int, const int*, int, int, cudaStream_t);
 void tap_concat_cast(uint16_t*, const float*, int, int, int, int, int, cudaStream_t);
 void rmsnorm_tap(float*, const uint16_t*, int, int, int, int, int, float, cudaStream_t);
 void store_kv(uint8_t*, uint8_t*, const float*, const float*, float, float, int, int, int, int, const int*, cudaStream_t);
@@ -265,7 +265,10 @@ struct Engine {
     }
 
     // One forward over M tokens starting at absolute position `base`.
+    // `base` is retained for call-site readability only: every position-dependent kernel now
+    // reads the device-side `dbase`, which is what makes the whole step capturable as a graph.
     void forward(Session& S, const int* d_ids, int M, int base, cudaStream_t st = 0) {
+        (void)base;
         const int H = c.hidden, E = c.n_experts, TK = c.top_k, MI = c.moe_intermediate;
         const float qscale = 1.0f / sqrtf((float)c.head_dim);
 
@@ -390,7 +393,7 @@ struct Engine {
                 acc(6);
             }
             if (taps && tap_of[L] >= 0)
-                tap_store(taps, h, M, H, base, tap_cap, tap_of[L], st);
+                tap_store(taps, h, M, H, dbase, tap_cap, tap_of[L], st);
             dbg_grab(M);
         }
         mark();

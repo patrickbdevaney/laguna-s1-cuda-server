@@ -11,7 +11,7 @@ Reference, **read-only**: `~/gemma-cuda-hybrid`.
 | **R1 — roofline** | ✅ **PASS** | `ROOFLINE.md`, generator `tools/roofline.py`, raw `docs/roofline_ctx*.txt` |
 | **A1 — oracle + arch delta** | ✅ **PASS** | `MODEL_INVENTORY.md`, `ARCH_DELTA.md`, `oracle/`, golden tensors in `docs/golden/` → `LOOP_LOG.md` |
 | L1 — loader | ⏳ next | |
-| B1 — kernels G1–G9 | ▫ | |
+| B1 — kernels G1–G9 | 🟡 G1–G8 PASS | `tests/gate_kernels` 13/13; `gate_forward` 8/8 greedy; **9.00 tok/s decode**, G9 CUDA graph pending |
 | D1 — DFlash + k-sweep | ▫ | |
 | S1 — server | ▫ | |
 

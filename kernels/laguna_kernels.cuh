@@ -43,9 +43,17 @@ __device__ __forceinline__ __half2 fp4x2_to_h2(uint8_t byte) {
     return *reinterpret_cast<__half2*>(&r);
 }
 __device__ __forceinline__ float e2m1f(uint8_t code) {
+    // Scalar reference form. NOTE: the `t[8]` array indexed by a runtime value lands in
+    // LOCAL memory, so this must NOT appear in a GEMM inner loop -- use fp4x2_f2 instead.
     const float t[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     float v = t[code & 7];
     return (code & 8) ? -v : v;
+}
+
+// Both nibbles of a packed byte, via the hardware converter. .x = low nibble (even k),
+// .y = high nibble (odd k). Register-only; this is the form the inner loops use.
+__device__ __forceinline__ float2 fp4x2_f2(uint8_t byte) {
+    return __half22float2(fp4x2_to_h2(byte));
 }
 
 // ---------------------------------------------------------------- warp reduction

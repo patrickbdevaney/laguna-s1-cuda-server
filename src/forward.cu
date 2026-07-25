@@ -1,0 +1,227 @@
+// forward.cu — G7/G8: the full Laguna forward pass in pure CUDA.
+//
+// Layer order is a direct transcription of LagunaDecoderLayer.forward
+// (modeling_laguna.py:490-519), with the Laguna-specific pieces called out where they differ
+// from anything in the gemma port:
+//   * per-layer head count (48 global / 72 sliding) and GQA group (6 / 9)
+//   * QK-RMSNorm per head, BEFORE rope
+//   * partial rotary: 64 of 128 dims on global (yarn), 128 of 128 on sliding
+//   * per-head softplus gate driven by the POST-LAYERNORM input, applied before o_proj
+//   * sigmoid router with a selection-only bias, top-10, sum-normalised
+//   * routed-expert output scaled by 2.5 and added to a shared expert
+//   * layer 0 is a dense MLP, not MoE
+//   * lm_head is NOT tied to the embedding
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <vector>
+#include <string>
+#include "../include/laguna_config.h"
+#include "../include/laguna_weights.h"
+
+extern "C" {
+void dequant_nvfp4(float*, const uint8_t*, const uint8_t*, float, int, int, int, cudaStream_t);
+void gemm_bf16(float*, const uint16_t*, const uint16_t*, int, int, int, cudaStream_t);
+void gemm_fp4(float*, const uint8_t*, const uint8_t*, float, const uint16_t*, int, int, int, int, cudaStream_t);
+void f32_to_bf16(uint16_t*, const float*, long, cudaStream_t);
+void rmsnorm(float*, const float*, const uint16_t*, int, int, float, cudaStream_t);
+void rmsnorm_heads(float*, const float*, const uint16_t*, int, int, int, float, cudaStream_t);
+void rope_tables(float*, float*, const float*, int, int, int, float, cudaStream_t);
+void rope_apply(float*, const float*, const float*, int, int, int, int, cudaStream_t);
+void router(int*, float*, float*, const float*, const float*, int, int, int, float, int, cudaStream_t);
+void gate_softplus(float*, const float*, int, int, int, cudaStream_t);
+void swiglu(float*, const float*, const float*, long, cudaStream_t);
+void add_inplace(float*, const float*, long, cudaStream_t);
+void embed_rows(float*, const uint16_t*, const int*, int, int, cudaStream_t);
+void store_kv(uint8_t*, uint8_t*, const float*, const float*, float, float, int, int, int, int, int, cudaStream_t);
+void attend(float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, int, float, cudaStream_t);
+int  attend_nsplit(int, int, int);
+void attend_split(float*, float*, float*, const float*, const uint8_t*, const uint8_t*, float, float, int, int, int, int, int, int, float, int, cudaStream_t);
+void moe_invert(int*, int*, int*, int*, int*, int*, const int*, int, int, int, cudaStream_t);
+void moe_gateup(float*, const uint8_t*, const uint8_t*, const float*, const uint8_t*, const uint8_t*,
+                const float*, const uint16_t*, const int*, const int*, const int*, const int*,
+                const int*, int, int, int, int, int, cudaStream_t);
+void moe_down(float*, const uint8_t*, const uint8_t*, const float*, const uint16_t*, const int*,
+              const int*, const int*, const int*, const int*, int, int, int, int, cudaStream_t);
+void moe_finalize(float*, const float*, const float*, const int*, int, int, int, float, cudaStream_t);
+}
+
+namespace laguna {
+
+// KV cache. Sliding layers get a ring of exactly `window` slots — 36 of 48 layers therefore
+// cost a constant 1.05 MB per sequence regardless of conversation length (ROOFLINE.md §6).
+struct Session {
+    std::vector<uint8_t*> Kc, Vc;
+    std::vector<int> cap;
+    int pos = 0;
+    size_t bytes = 0;
+
+    void alloc(const Config& c, int ctx) {
+        Kc.resize(c.n_layers); Vc.resize(c.n_layers); cap.resize(c.n_layers);
+        size_t per = (size_t)c.n_kv_heads * c.head_dim;
+        for (int L = 0; L < c.n_layers; ++L) {
+            cap[L] = c.is_sliding(L) ? c.sliding_window : ctx;
+            size_t n = per * cap[L];
+            CUDA_CHECK(cudaMalloc(&Kc[L], n));
+            CUDA_CHECK(cudaMalloc(&Vc[L], n));
+            CUDA_CHECK(cudaMemset(Kc[L], 0, n));
+            CUDA_CHECK(cudaMemset(Vc[L], 0, n));
+            bytes += 2 * n;
+        }
+    }
+    void free_() { for (auto p : Kc) cudaFree(p); for (auto p : Vc) cudaFree(p); Kc.clear(); Vc.clear(); }
+};
+
+struct Engine {
+    Config c;
+    Weights W;
+    int MAXTOK = 64;
+
+    // scratch
+    float *h, *hn, *q, *kk, *vv, *att, *gp, *mlp_a, *mlp_b, *moe_h, *dpart, *rlogit, *rwts, *logits;
+    uint16_t *hb, *attb, *moe_hb;
+    int *sel, *ecount, *eoff, *elist, *cursor, *active, *nactive;
+    float *cos_f, *sin_f, *cos_s, *sin_s, *inv_f, *inv_s;
+    float *pacc, *pml;                 // split-attention partials
+    static const int MAXSPLIT = 32;
+
+    void init(int maxtok) {
+        MAXTOK = maxtok;
+        int H = c.hidden, V = c.vocab, E = c.n_experts, TK = c.top_k, MI = c.moe_intermediate;
+        int maxq = 0, maxheads = 0;
+        for (int L = 0; L < c.n_layers; ++L) {
+            maxq = std::max(maxq, c.q_dim(L));
+            maxheads = std::max(maxheads, c.heads[L]);
+        }
+        int kvd = c.n_kv_heads * c.head_dim;
+        auto A = [&](void** p, size_t n) { CUDA_CHECK(cudaMalloc(p, n)); };
+        A((void**)&h,   (size_t)MAXTOK * H * 4);
+        A((void**)&hn,  (size_t)MAXTOK * H * 4);
+        A((void**)&hb,  (size_t)MAXTOK * std::max(H, maxq) * 2);
+        A((void**)&q,   (size_t)MAXTOK * maxq * 4);
+        A((void**)&kk,  (size_t)MAXTOK * kvd * 4);
+        A((void**)&vv,  (size_t)MAXTOK * kvd * 4);
+        A((void**)&att, (size_t)MAXTOK * maxq * 4);
+        A((void**)&attb,(size_t)MAXTOK * maxq * 2);
+        A((void**)&gp,  (size_t)MAXTOK * maxheads * 4);
+        A((void**)&mlp_a, (size_t)MAXTOK * c.intermediate * 4);
+        A((void**)&mlp_b, (size_t)MAXTOK * c.intermediate * 4);
+        A((void**)&moe_h, (size_t)MAXTOK * TK * MI * 4);
+        A((void**)&moe_hb,(size_t)MAXTOK * TK * MI * 2);
+        A((void**)&dpart, (size_t)MAXTOK * TK * H * 4);
+        A((void**)&rlogit,(size_t)MAXTOK * E * 4);
+        A((void**)&rwts,  (size_t)MAXTOK * TK * 4);
+        A((void**)&logits,(size_t)MAXTOK * V * 4);
+        A((void**)&sel,   (size_t)MAXTOK * TK * 4);
+        A((void**)&ecount, E * 4); A((void**)&eoff, (E + 1) * 4);
+        A((void**)&elist, (size_t)MAXTOK * TK * 4);
+        A((void**)&cursor, E * 4); A((void**)&active, E * 4); A((void**)&nactive, 4);
+        // split-attention scratch: [M][nkv*Gmax][NSP][HD] plus {m,l} per partial
+        int gmax = 0; for (int L = 0; L < c.n_layers; ++L) gmax = std::max(gmax, c.kv_group(L));
+        size_t nh_max = (size_t)MAXTOK * c.n_kv_heads * gmax * MAXSPLIT;
+        A((void**)&pacc, nh_max * c.head_dim * 4);
+        A((void**)&pml,  nh_max * 2 * 4);
+
+        // rope: one table per layer TYPE (not per layer) — Laguna has exactly two
+        auto ivf = c.rope_full.inv_freq(c.head_dim);
+        auto ivs = c.rope_slide.inv_freq(c.head_dim);
+        A((void**)&inv_f, ivf.size() * 4); A((void**)&inv_s, ivs.size() * 4);
+        CUDA_CHECK(cudaMemcpy(inv_f, ivf.data(), ivf.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(inv_s, ivs.data(), ivs.size() * 4, cudaMemcpyHostToDevice));
+        A((void**)&cos_f, (size_t)MAXTOK * c.rope_full.rotary_dim * 4);
+        A((void**)&sin_f, (size_t)MAXTOK * c.rope_full.rotary_dim * 4);
+        A((void**)&cos_s, (size_t)MAXTOK * c.rope_slide.rotary_dim * 4);
+        A((void**)&sin_s, (size_t)MAXTOK * c.rope_slide.rotary_dim * 4);
+    }
+
+    // One forward over M tokens starting at absolute position `base`.
+    void forward(Session& S, const int* d_ids, int M, int base, cudaStream_t st = 0) {
+        const int H = c.hidden, E = c.n_experts, TK = c.top_k, MI = c.moe_intermediate;
+        const float qscale = 1.0f / sqrtf((float)c.head_dim);
+
+        embed_rows(h, W.embed, d_ids, M, H, st);
+        rope_tables(cos_f, sin_f, inv_f, M, base, c.rope_full.rotary_dim / 2,
+                    (float)c.rope_full.attention_factor, st);
+        rope_tables(cos_s, sin_s, inv_s, M, base, c.rope_slide.rotary_dim / 2,
+                    (float)c.rope_slide.attention_factor, st);
+
+        for (int L = 0; L < c.n_layers; ++L) {
+            const LayerW& w = W.L[L];
+            const int nh = c.heads[L], G = c.kv_group(L), hd = c.head_dim;
+            const int qd = c.q_dim(L), kvd = c.n_kv_heads * hd;
+            const bool slide = c.is_sliding(L);
+            const float* cosT = slide ? cos_s : cos_f;
+            const float* sinT = slide ? sin_s : sin_f;
+            const int rot = slide ? c.rope_slide.rotary_dim : c.rope_full.rotary_dim;
+
+            // ---- attention
+            rmsnorm(hn, h, w.in_ln, M, H, (float)c.rms_eps, st);
+            f32_to_bf16(hb, hn, (long)M * H, st);
+            gemm_bf16(q,  w.q, hb, M, qd,  H, st);
+            gemm_bf16(kk, w.k, hb, M, kvd, H, st);
+            gemm_bf16(vv, w.v, hb, M, kvd, H, st);
+            gemm_bf16(gp, w.g, hb, M, nh,  H, st);        // gate from the NORMED input
+            rmsnorm_heads(q,  q,  w.q_norm, M, nh,          hd, (float)c.rms_eps, st);
+            rmsnorm_heads(kk, kk, w.k_norm, M, c.n_kv_heads, hd, (float)c.rms_eps, st);
+            rope_apply(q,  cosT, sinT, M, nh,           hd, rot, st);
+            rope_apply(kk, cosT, sinT, M, c.n_kv_heads, hd, rot, st);
+            store_kv(S.Kc[L], S.Vc[L], kk, vv, w.k_scale, w.v_scale, M, c.n_kv_heads, hd,
+                     S.cap[L], base, st);
+            int klen = slide ? std::min(base + M, c.sliding_window) : (base + M);
+            int nsp = attend_nsplit(M, c.n_kv_heads, klen);
+            if (nsp > MAXSPLIT) nsp = MAXSPLIT;
+            attend_split(att, pacc, pml, q, S.Kc[L], S.Vc[L], w.k_scale, w.v_scale, M,
+                         c.n_kv_heads, G, S.cap[L], slide ? c.sliding_window : 0, base,
+                         qscale, nsp, st);
+            gate_softplus(att, gp, M, nh, hd, st);
+            f32_to_bf16(attb, att, (long)M * qd, st);
+            gemm_bf16(hn, w.o, attb, M, H, qd, st);
+            add_inplace(h, hn, (long)M * H, st);
+
+            // ---- MLP / MoE
+            rmsnorm(hn, h, w.post_ln, M, H, (float)c.rms_eps, st);
+            f32_to_bf16(hb, hn, (long)M * H, st);
+            if (c.is_dense(L)) {
+                int I = c.intermediate;
+                gemm_bf16(mlp_a, w.mlp_gate, hb, M, I, H, st);
+                gemm_bf16(mlp_b, w.mlp_up,   hb, M, I, H, st);
+                swiglu(mlp_a, mlp_a, mlp_b, (long)M * I, st);
+                f32_to_bf16(attb, mlp_a, (long)M * I, st);
+                gemm_bf16(hn, w.mlp_down, attb, M, H, I, st);
+                add_inplace(h, hn, (long)M * H, st);
+            } else {
+                // shared expert
+                int SI = c.shared_intermediate;
+                gemm_bf16(mlp_a, w.sh_gate, hb, M, SI, H, st);
+                gemm_bf16(mlp_b, w.sh_up,   hb, M, SI, H, st);
+                swiglu(mlp_a, mlp_a, mlp_b, (long)M * SI, st);
+                f32_to_bf16(attb, mlp_a, (long)M * SI, st);
+                gemm_bf16(hn, w.sh_down, attb, M, H, SI, st);
+                add_inplace(h, hn, (long)M * H, st);      // shared expert added first
+
+                // routed experts
+                gemm_bf16(rlogit, w.router, hb, M, E, H, st);
+                router(sel, rwts, nullptr, rlogit, w.router_bias, M, E, TK,
+                       (float)c.router_softcap, c.norm_topk_prob ? 1 : 0, st);
+                moe_invert(ecount, eoff, elist, cursor, active, nactive, sel, M, TK, E, st);
+                // Grid must be sized by the tokens in THIS call, not by MAXTOK: at decode
+                // M=1 there are at most 10 active experts, and launching 256 x (MI/4) blocks
+                // means 96 % of them exist only to read *nactive and exit.
+                int nact = std::min(E, M * TK);
+                moe_gateup(moe_h, w.e_gate_p, w.e_gate_s, w.e_gate_inv,
+                           w.e_up_p, w.e_up_s, w.e_up_inv, hb, elist, eoff, ecount,
+                           active, nactive, nact, H, MI, TK, c.nvfp4_group, st);
+                f32_to_bf16(moe_hb, moe_h, (long)M * TK * MI, st);
+                moe_down(dpart, w.e_down_p, w.e_down_s, w.e_down_inv, moe_hb, elist, eoff,
+                         ecount, active, nactive, nact, H, MI, c.nvfp4_group, st);
+                moe_finalize(hn, dpart, rwts, sel, M, H, TK, (float)c.routed_scaling, st);
+                add_inplace(h, hn, (long)M * H, st);
+            }
+        }
+        rmsnorm(hn, h, W.final_norm, M, H, (float)c.rms_eps, st);
+        f32_to_bf16(hb, hn, (long)M * H, st);
+        gemm_bf16(logits, W.lm_head, hb, M, c.vocab, H, st);   // NOT tied to the embedding
+    }
+};
+
+} // namespace laguna

@@ -151,15 +151,15 @@ void k_gemm_fp4(float* __restrict__ out,
             float h0 = 0.f, h1 = 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {            // first group of 16 = bytes 0..7
-                uint8_t b = pb[j];
-                h0 = fmaf(e2m1f(b & 0x0F), bf2f(xh[2 * j]), h0);
-                h0 = fmaf(e2m1f(b >> 4),   bf2f(xh[2 * j + 1]), h0);
+                float2 w = fp4x2_f2(pb[j]);
+                h0 = fmaf(w.x, bf2f(xh[2 * j]), h0);
+                h0 = fmaf(w.y, bf2f(xh[2 * j + 1]), h0);
             }
             #pragma unroll
             for (int j = 8; j < 16; ++j) {           // second group of 16 = bytes 8..15
-                uint8_t b = pb[j];
-                h1 = fmaf(e2m1f(b & 0x0F), bf2f(xh[2 * j]), h1);
-                h1 = fmaf(e2m1f(b >> 4),   bf2f(xh[2 * j + 1]), h1);
+                float2 w = fp4x2_f2(pb[j]);
+                h1 = fmaf(w.x, bf2f(xh[2 * j]), h1);
+                h1 = fmaf(w.y, bf2f(xh[2 * j + 1]), h1);
             }
             acc[m] += h0 * s0 + h1 * s1;
         }

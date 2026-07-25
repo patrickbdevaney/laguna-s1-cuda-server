@@ -313,3 +313,58 @@ before `down_proj`, which the reference mirrors — that rounding is the dominan
 **It also produced a real measurement:** 44 active experts of 256 for 8 tokens, against 70.5
 from the independent-uniform union model. That prompted the full `E_frac` measurement now in
 `ROOFLINE.md` §10, which raises `k*` and improves every speculative projection.
+
+### G7/G8 — full autoregressive forward · **PASS**
+
+`src/forward.cu` + `tests/gate_forward.cu`. The pure-CUDA forward reproduces the oracle's
+greedy continuation **exactly, 8/8 tokens**:
+`33586 81 397 874 367 2440 330 2833` → `"Okay, I need to write a Python"`.
+
+G7 note: `lm_head` is **not** tied to the embedding (`tie_word_embeddings: false`), so
+gemma's tied-embed quantization trick does not apply. It is a separate BF16 `[100352, 3072]`
+tensor and is loaded and used as one. Quantizing it is part of the §5 lever, not a free port.
+
+### G8 reconciliation — the directive requires closing any >20 % gap before proceeding
+
+First working version: **3.66 tok/s** against a 22.6 tok/s roofline — 16 % of it, ~37 GB/s
+effective. Profiled before touching anything (`tests/bench_kernels.cu`, real decode shapes):
+
+| kernel @ decode shape | bytes | ms | GB/s | % of 227 |
+|---|---:|---:|---:|---:|
+| `q_proj` sliding [9216,3072] | 56.6 M | 0.415 | 136.5 | 60 % |
+| `o_proj` sliding [3072,9216] | 56.6 M | 0.405 | 139.9 | 62 % |
+| `lm_head` [100352,3072] | 616.6 M | 2.518 | 244.8 | — |
+| **expert gate FP4 [1024,3072]** | 1.8 M | 0.162 | **11.0** | **5 %** |
+| **attn sliding win=512 M=1** | 1.0 M | 0.574 | **1.8** | **1 %** |
+| **attn global ctx=4096 M=1** | 8.4 M | 2.206 | **3.8** | **2 %** |
+| per-launch overhead | — | 4.15 µs | — | — |
+
+Three fixes, each from the profile rather than from guessing:
+
+**1. FP4 dequant was hitting local memory.** `e2m1f()` indexes a `const float t[8]` by a
+runtime code; in a GEMM inner loop that array lands in **local memory**, so every weight cost
+a stack load. Replaced with the hardware converter `__nv_cvt_fp4x2_to_halfraw2` (both nibbles
+per call). **11.0 → 27.1 GB/s, 2.5×**, correctness unchanged. This is gemma's
+"C_LUT → HW cvt" win, but worth 2.5× here rather than 0.5 % because the LUT was on the stack.
+
+**2. Attention was grid-starved by construction.** One block per (query, kv_head) means
+decode launches **8 blocks on 20 SMs** — the GPU is 60 % idle by design, and it measured 1–2 %
+of roofline. Added a flash-decoding split over the key range (`k_attn_split` +
+`k_attn_combine`), with the split chosen to land at ~4 blocks/SM. Pure scheduling change; the
+combine is still deterministic.
+
+**3. The MoE grid was sized by `MAXTOK`, not by the actual token count.** At decode M=1 there
+are at most 10 active experts, but the grid was `min(E, MAXTOK·topk) = 256` wide — so ~96 % of
+blocks existed only to read `*nactive` and exit.
+
+| | before | after |
+|---|---:|---:|
+| decode | 3.66 tok/s | **9.00 tok/s** |
+| prefill | 4.5 tok/s | **16.0 tok/s** |
+| greedy match vs oracle | 8/8 | **8/8** |
+| effective bandwidth | ~37 GB/s | **~90 GB/s** |
+
+**2.46× with correctness held.** 90 GB/s is now level with the effective bandwidth gemma's
+champion path achieved (91 GB/s), and 40 % of the 227 GB/s ceiling — so ~2.5× of headroom
+remains. The gap is no longer "unreconciled": it is the MoE FP4 GEMM (27 GB/s = 12 %), the
+BF16 GEMM (136 GB/s = 60 %), and ~1665 kernel launches per step with no CUDA graph yet.

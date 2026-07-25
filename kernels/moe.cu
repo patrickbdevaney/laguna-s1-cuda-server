@@ -128,18 +128,16 @@ __global__ void k_moe_gateup(float* __restrict__ hbuf,
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 float x0 = bf2f(xh[2 * j]), x1 = bf2f(xh[2 * j + 1]);
-                g0 = fmaf(e2m1f(gb[j] & 0x0F), x0, g0);
-                g0 = fmaf(e2m1f(gb[j] >> 4),   x1, g0);
-                u0 = fmaf(e2m1f(ub[j] & 0x0F), x0, u0);
-                u0 = fmaf(e2m1f(ub[j] >> 4),   x1, u0);
+                float2 gw = fp4x2_f2(gb[j]), uw = fp4x2_f2(ub[j]);
+                g0 = fmaf(gw.x, x0, g0);  g0 = fmaf(gw.y, x1, g0);
+                u0 = fmaf(uw.x, x0, u0);  u0 = fmaf(uw.y, x1, u0);
             }
             #pragma unroll
             for (int j = 8; j < 16; ++j) {
                 float x0 = bf2f(xh[2 * j]), x1 = bf2f(xh[2 * j + 1]);
-                g1 = fmaf(e2m1f(gb[j] & 0x0F), x0, g1);
-                g1 = fmaf(e2m1f(gb[j] >> 4),   x1, g1);
-                u1 = fmaf(e2m1f(ub[j] & 0x0F), x0, u1);
-                u1 = fmaf(e2m1f(ub[j] >> 4),   x1, u1);
+                float2 gw = fp4x2_f2(gb[j]), uw = fp4x2_f2(ub[j]);
+                g1 = fmaf(gw.x, x0, g1);  g1 = fmaf(gw.y, x1, g1);
+                u1 = fmaf(uw.x, x0, u1);  u1 = fmaf(uw.y, x1, u1);
             }
             accg[i] += g0 * gsa + g1 * gsb;
             accu[i] += u0 * usa + u1 * usb;
@@ -188,13 +186,15 @@ __global__ void k_moe_down(float* __restrict__ dpart,
             float h0 = 0.f, h1 = 0.f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                h0 = fmaf(e2m1f(db[j] & 0x0F), bf2f(hh[2 * j]), h0);
-                h0 = fmaf(e2m1f(db[j] >> 4),   bf2f(hh[2 * j + 1]), h0);
+                float2 dw = fp4x2_f2(db[j]);
+                h0 = fmaf(dw.x, bf2f(hh[2 * j]), h0);
+                h0 = fmaf(dw.y, bf2f(hh[2 * j + 1]), h0);
             }
             #pragma unroll
             for (int j = 8; j < 16; ++j) {
-                h1 = fmaf(e2m1f(db[j] & 0x0F), bf2f(hh[2 * j]), h1);
-                h1 = fmaf(e2m1f(db[j] >> 4),   bf2f(hh[2 * j + 1]), h1);
+                float2 dw = fp4x2_f2(db[j]);
+                h1 = fmaf(dw.x, bf2f(hh[2 * j]), h1);
+                h1 = fmaf(dw.y, bf2f(hh[2 * j + 1]), h1);
             }
             acc[i] += h0 * sa + h1 * sb;
         }

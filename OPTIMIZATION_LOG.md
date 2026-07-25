@@ -57,6 +57,7 @@ back-to-back A/B/A.
 | 4 | MoE accumulators templated on a compile-time token bound | 9.00 | 9.31 | marginal (+3 %, within noise) |
 | 5 | MoE E4M3 scale rows staged in shared memory | 9.34 | 9.17 | **LOST, reverted** |
 | 6 | MoE token loop specialised TM=1 at decode (registers 127→50 / 80→40) | 9.35 | **9.73** | **WON +4.1 %** |
+| 7 | **Offline expert repack + thread-per-output MoE** | 9.71 | **16.57** | **WON +70.6 %** |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
@@ -95,11 +96,43 @@ receives exactly one token, so dispatching a `TM=1` instantiation drops it to **
 Also hoisted the `elist` load and `/topk` division out of the k-loop, where they were being
 redone every iteration.
 
+### #7 — the offline repack, and why it was worth 70 % (WON)
+
+The diagnosis that mattered was not bandwidth or coalescing — the row-major kernel was
+*already* perfectly coalesced (lane `c` strides 32, so 32 lanes read 512 contiguous bytes).
+The problem was **iteration count**: with `C = H/32 = 96` chunks and a 32-lane stride, a warp
+that owns one output row gets exactly **3 k-iterations**. Three dependent loads is no
+memory-level parallelism *inside* a warp at all, so throughput depended entirely on warp
+count — and warp count was register-capped (#6).
+
+Fix: repack each expert projection from `[n][k]` to `[n_block][k_chunk][lane][16 B]` on the
+host at load (`laguna_weights.h:repack_packed` / `repack_scale`), so a **lane** owns an output
+row and streams all of k:
+
+* 96 iterations per lane instead of 3, unrolled by `RPU=4` → several loads in flight
+* still perfectly coalesced (32 lanes × 16 B = 512 contiguous bytes per step)
+* **no warp reduction at all** — each lane's accumulator is its own output
+* each expert's region stays contiguous and the same size, so the arena layout and every
+  base pointer are unchanged
+
+| | before | after |
+|---|---:|---:|
+| decode | 9.71 tok/s | **16.57 tok/s** |
+| prefill | 15.4 tok/s | **55.0 tok/s** |
+| effective bandwidth | 97.7 GB/s | **166.5 GB/s (73 % of 227)** |
+| greedy vs oracle | 8/8 | **8/8** |
+
+Registers rose (gateup 50 → 79) because `RPU=4` holds four `uint4` plus eight scales in
+flight — that is the *point*, and it pays for itself 17×.
+
+**This also finally makes the repack cache worth building** (`OPTIMIZATION_LOG` L1 note): the
+repack is now a real host-side transform over 63.9 GB, not a memcpy.
+
 ### Where the time actually goes (per-category profile, `LG_PROF=1`)
 
 | category | share of step |
 |---|---:|
-| **routed-expert MoE** | **81.5 %** |
+| **routed-expert MoE** | **81.5 %** ← *measured before #7; re-profile* |
 | attention q/k/v/o GEMMs | 11.6 % |
 | shared expert + dense | 2.7 % |
 | attention core | 1.3 % |

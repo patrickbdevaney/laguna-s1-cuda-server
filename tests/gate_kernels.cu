@@ -23,8 +23,8 @@ void f32_to_bf16(uint16_t*,const float*,long,cudaStream_t);
 void store_kv(uint8_t*,uint8_t*,const float*,const float*,float,float,int,int,int,int,int,cudaStream_t);
 void attend(float*,const float*,const uint8_t*,const uint8_t*,float,float,int,int,int,int,int,int,float,cudaStream_t);
 void moe_invert(int*,int*,int*,int*,int*,int*,const int*,int,int,int,cudaStream_t);
-void moe_gateup(float*,const uint8_t*,const uint8_t*,const float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,int,cudaStream_t);
-void moe_down(float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,cudaStream_t);
+void moe_gateup_rp(float*,const uint8_t*,const uint8_t*,const float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,int,cudaStream_t);
+void moe_down_rp(float*,const uint8_t*,const uint8_t*,const float*,const uint16_t*,const int*,const int*,const int*,const int*,const int*,int,int,int,int,int,cudaStream_t);
 void moe_finalize(float*,const float*,const float*,const int*,int,int,int,float,cudaStream_t);
 }
 
@@ -192,13 +192,13 @@ int main(){
         printf("  active experts = %d of %d for %d tokens x top-%d\n",h_na,E,rows,TK);
 
         float* hbuf; CK(cudaMalloc(&hbuf,(size_t)nass*MI*4));
-        moe_gateup(hbuf,lw.e_gate_p,lw.e_gate_s,lw.e_gate_inv,lw.e_up_p,lw.e_up_s,lw.e_up_inv,
+        moe_gateup_rp(hbuf,lw.e_gate_p,lw.e_gate_s,lw.e_gate_inv,lw.e_up_p,lw.e_up_s,lw.e_up_inv,
                    dxb,el,eo,ec,act,na,h_na,c.hidden,MI,TK,c.nvfp4_group,4,0);
         CK(cudaGetLastError());
         uint16_t* hbf; CK(cudaMalloc(&hbf,(size_t)nass*MI*2));
         f32_to_bf16(hbf,hbuf,(long)nass*MI,0);
         float* dpart; CK(cudaMalloc(&dpart,(size_t)nass*c.hidden*4));
-        moe_down(dpart,lw.e_down_p,lw.e_down_s,lw.e_down_inv,hbf,el,eo,ec,act,na,h_na,
+        moe_down_rp(dpart,lw.e_down_p,lw.e_down_s,lw.e_down_inv,hbf,el,eo,ec,act,na,h_na,
                  c.hidden,MI,c.nvfp4_group,4,0);
         CK(cudaGetLastError());
         float* dout; CK(cudaMalloc(&dout,(size_t)rows*c.hidden*4));

@@ -302,3 +302,218 @@ extern "C" void moe_finalize(float* out, const float* dpart, const float* wts, c
     int T = 256, n = rows * H;
     k_moe_finalize<<<(n + T - 1) / T, T, 0, st>>>(out, dpart, wts, sel, rows, H, topk, scaling);
 }
+
+// =======================================================================================
+// REPACKED MoE — thread-per-output over the [n_block][k_chunk][lane][16B] layout produced
+// by laguna_weights.h:repack_packed / repack_scale.
+//
+// Why this exists: in the row-major kernels above, a warp owns ONE output row and gets only
+// H/32/32 = 3 k-iterations. Three dependent loads is no memory-level parallelism at all, so
+// the kernel depends entirely on warp count — and warp count is register-capped. Here a LANE
+// owns an output row and streams all of k: the loop is 96 iterations (unrolled by U), 32
+// lanes still read 512 contiguous bytes per step, and there is no warp reduction whatsoever.
+// =======================================================================================
+#define RPNB 32          // output rows per repack block == warp width
+#define RPU  4           // k-chunks in flight per lane
+
+template <int TM>
+__global__ void k_moe_gateup_rp(float* __restrict__ hbuf,
+                                const uint8_t* __restrict__ gp, const uint8_t* __restrict__ gs,
+                                const float* __restrict__ ginv,
+                                const uint8_t* __restrict__ up, const uint8_t* __restrict__ us,
+                                const float* __restrict__ uinv,
+                                const uint16_t* __restrict__ xb,
+                                const int* __restrict__ elist, const int* __restrict__ eoff,
+                                const int* __restrict__ ecount, const int* __restrict__ active,
+                                const int* __restrict__ nactive,
+                                int H, int MI, int topk, int GRP) {
+    const int slot = blockIdx.x;
+    if (slot >= *nactive) return;
+    const int e = active[slot];
+    const int cnt = ecount[e], base = eoff[e];
+    const int lane = threadIdx.x;
+    const int nb = blockIdx.y * blockDim.y + threadIdx.y;      // which 32-row block
+    const int nblocks = MI / RPNB;
+    if (nb >= nblocks) return;
+    const int n = nb * RPNB + lane;                            // THIS lane's output row
+
+    const int C  = H / 32;                                     // 16-byte code chunks
+    const int NG = H / GRP;                                    // scale groups
+    const size_t eb = (size_t)e * nblocks;
+    const uint8_t* gbase = gp + ((eb + nb) * C) * RPNB * 16;
+    const uint8_t* ubase = up + ((eb + nb) * C) * RPNB * 16;
+    const uint8_t* gsb   = gs + ((eb + nb) * NG) * RPNB;
+    const uint8_t* usb   = us + ((eb + nb) * NG) * RPNB;
+    const float gi = ginv[e], ui = uinv[e];
+
+  for (int t0 = 0; t0 < cnt; t0 += TM) {
+    const int nt = min(TM, cnt - t0);
+    float accg[TM], accu[TM];
+    const uint16_t* xrow[TM];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        accg[i] = 0.f; accu[i] = 0.f;
+        xrow[i] = xb + (long)(((i < nt) ? elist[base + t0 + i] : 0) / topk) * H;
+    }
+
+    for (int c0 = 0; c0 < C; c0 += RPU) {
+        uint4 gv[RPU], uv[RPU];
+        float gsc[RPU][2], usc[RPU][2];
+        #pragma unroll
+        for (int u = 0; u < RPU; ++u) {
+            const int c = c0 + u;
+            if (c < C) {
+                gv[u] = __ldcs((const uint4*)(gbase + ((size_t)c * RPNB + lane) * 16));
+                uv[u] = __ldcs((const uint4*)(ubase + ((size_t)c * RPNB + lane) * 16));
+                const int g0 = (c * 32) / GRP, g1 = (c * 32 + 16) / GRP;
+                gsc[u][0] = e4m3f(gsb[(size_t)g0 * RPNB + lane]) * gi;
+                gsc[u][1] = e4m3f(gsb[(size_t)g1 * RPNB + lane]) * gi;
+                usc[u][0] = e4m3f(usb[(size_t)g0 * RPNB + lane]) * ui;
+                usc[u][1] = e4m3f(usb[(size_t)g1 * RPNB + lane]) * ui;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < RPU; ++u) {
+            const int c = c0 + u;
+            if (c >= C) break;
+            const uint8_t* gbb = (const uint8_t*)&gv[u];
+            const uint8_t* ubb = (const uint8_t*)&uv[u];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                if (i >= nt) break;
+                const uint16_t* xh = xrow[i] + c * 32;
+                float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    float x0 = bf2f(xh[2 * j]), x1 = bf2f(xh[2 * j + 1]);
+                    float2 gw = fp4x2_f2(gbb[j]), uw = fp4x2_f2(ubb[j]);
+                    g0 = fmaf(gw.x, x0, g0);  g0 = fmaf(gw.y, x1, g0);
+                    u0 = fmaf(uw.x, x0, u0);  u0 = fmaf(uw.y, x1, u0);
+                }
+                #pragma unroll
+                for (int j = 8; j < 16; ++j) {
+                    float x0 = bf2f(xh[2 * j]), x1 = bf2f(xh[2 * j + 1]);
+                    float2 gw = fp4x2_f2(gbb[j]), uw = fp4x2_f2(ubb[j]);
+                    g1 = fmaf(gw.x, x0, g1);  g1 = fmaf(gw.y, x1, g1);
+                    u1 = fmaf(uw.x, x0, u1);  u1 = fmaf(uw.y, x1, u1);
+                }
+                accg[i] += g0 * gsc[u][0] + g1 * gsc[u][1];
+                accu[i] += u0 * usc[u][0] + u1 * usc[u][1];
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        if (i >= nt) break;
+        hbuf[(long)elist[base + t0 + i] * MI + n] = silu(accg[i]) * accu[i];   // no reduction
+    }
+  }
+}
+
+template <int TM>
+__global__ void k_moe_down_rp(float* __restrict__ dpart,
+                              const uint8_t* __restrict__ dp, const uint8_t* __restrict__ ds,
+                              const float* __restrict__ dinv, const uint16_t* __restrict__ hb,
+                              const int* __restrict__ elist, const int* __restrict__ eoff,
+                              const int* __restrict__ ecount, const int* __restrict__ active,
+                              const int* __restrict__ nactive, int H, int MI, int GRP) {
+    const int slot = blockIdx.x;
+    if (slot >= *nactive) return;
+    const int e = active[slot];
+    const int cnt = ecount[e], base = eoff[e];
+    const int lane = threadIdx.x;
+    const int nb = blockIdx.y * blockDim.y + threadIdx.y;
+    const int nblocks = H / RPNB;
+    if (nb >= nblocks) return;
+    const int n = nb * RPNB + lane;
+
+    const int C  = MI / 32;
+    const int NG = MI / GRP;
+    const size_t eb = (size_t)e * nblocks;
+    const uint8_t* dbase = dp + ((eb + nb) * C) * RPNB * 16;
+    const uint8_t* dsb   = ds + ((eb + nb) * NG) * RPNB;
+    const float di = dinv[e];
+
+  for (int t0 = 0; t0 < cnt; t0 += TM) {
+    const int nt = min(TM, cnt - t0);
+    float acc[TM];
+    const uint16_t* hrow[TM];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        acc[i] = 0.f;
+        hrow[i] = hb + (long)((i < nt) ? elist[base + t0 + i] : 0) * MI;
+    }
+    for (int c0 = 0; c0 < C; c0 += RPU) {
+        uint4 dv[RPU]; float dsc[RPU][2];
+        #pragma unroll
+        for (int u = 0; u < RPU; ++u) {
+            const int c = c0 + u;
+            if (c < C) {
+                dv[u] = __ldcs((const uint4*)(dbase + ((size_t)c * RPNB + lane) * 16));
+                const int g0 = (c * 32) / GRP, g1 = (c * 32 + 16) / GRP;
+                dsc[u][0] = e4m3f(dsb[(size_t)g0 * RPNB + lane]) * di;
+                dsc[u][1] = e4m3f(dsb[(size_t)g1 * RPNB + lane]) * di;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < RPU; ++u) {
+            const int c = c0 + u;
+            if (c >= C) break;
+            const uint8_t* db = (const uint8_t*)&dv[u];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                if (i >= nt) break;
+                const uint16_t* hh = hrow[i] + c * 32;
+                float h0 = 0.f, h1 = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    float2 dw = fp4x2_f2(db[j]);
+                    h0 = fmaf(dw.x, bf2f(hh[2 * j]), h0);
+                    h0 = fmaf(dw.y, bf2f(hh[2 * j + 1]), h0);
+                }
+                #pragma unroll
+                for (int j = 8; j < 16; ++j) {
+                    float2 dw = fp4x2_f2(db[j]);
+                    h1 = fmaf(dw.x, bf2f(hh[2 * j]), h1);
+                    h1 = fmaf(dw.y, bf2f(hh[2 * j + 1]), h1);
+                }
+                acc[i] += h0 * dsc[u][0] + h1 * dsc[u][1];
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        if (i >= nt) break;
+        dpart[(long)elist[base + t0 + i] * H + n] = acc[i];
+    }
+  }
+}
+
+extern "C" void moe_gateup_rp(float* hbuf, const uint8_t* gp, const uint8_t* gs, const float* ginv,
+                              const uint8_t* up, const uint8_t* us, const float* uinv,
+                              const uint16_t* xb, const int* elist, const int* eoff,
+                              const int* ecount, const int* active, const int* nactive,
+                              int nact_max, int H, int MI, int topk, int GRP, int maxtok,
+                              cudaStream_t st) {
+    const int WY = 4;
+    dim3 blk(RPNB, WY), grd(nact_max, (MI / RPNB + WY - 1) / WY);
+    if (maxtok <= 1)
+        k_moe_gateup_rp<1><<<grd, blk, 0, st>>>(hbuf, gp, gs, ginv, up, us, uinv, xb, elist,
+                                                eoff, ecount, active, nactive, H, MI, topk, GRP);
+    else
+        k_moe_gateup_rp<TMAX><<<grd, blk, 0, st>>>(hbuf, gp, gs, ginv, up, us, uinv, xb, elist,
+                                                   eoff, ecount, active, nactive, H, MI, topk, GRP);
+}
+extern "C" void moe_down_rp(float* dpart, const uint8_t* dp, const uint8_t* ds, const float* dinv,
+                            const uint16_t* hb, const int* elist, const int* eoff,
+                            const int* ecount, const int* active, const int* nactive,
+                            int nact_max, int H, int MI, int GRP, int maxtok, cudaStream_t st) {
+    const int WY = 4;
+    dim3 blk(RPNB, WY), grd(nact_max, (H / RPNB + WY - 1) / WY);
+    if (maxtok <= 1)
+        k_moe_down_rp<1><<<grd, blk, 0, st>>>(dpart, dp, ds, dinv, hb, elist, eoff, ecount,
+                                              active, nactive, H, MI, GRP);
+    else
+        k_moe_down_rp<TMAX><<<grd, blk, 0, st>>>(dpart, dp, ds, dinv, hb, elist, eoff, ecount,
+                                                 active, nactive, H, MI, GRP);
+}

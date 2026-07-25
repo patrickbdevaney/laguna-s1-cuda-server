@@ -39,6 +39,47 @@
 
 namespace laguna {
 
+// ---------------------------------------------------------------------------------------
+// Expert-weight repack (the "offline repack" of DIRECTIVE.md §5 / the gemma Marlin recipe).
+//
+// The checkpoint stores each expert projection row-major [n][k]. A warp-per-output-row GEMV
+// over that layout gives each warp only H/32/32 = 3 k-iterations, so there is no
+// memory-level parallelism *inside* a warp -- the kernel depends entirely on having many
+// warps, and occupancy is register-limited.
+//
+// Repacking to  [n_block][k_chunk][lane][16B]  lets one LANE own an output row and stream
+// all of k: 32 lanes read 32 x 16 B = 512 contiguous bytes per step (still perfectly
+// coalesced), each lane accumulates privately (no warp reduction at all), and the loop is
+// long enough to unroll and keep several loads in flight.
+//
+// Each expert's region stays contiguous and the same size, so the arena layout and the
+// per-expert base pointers are unchanged -- only the addressing inside an expert changes.
+constexpr int RP_NB = 32;      // output rows per repack block == warp width
+
+// packed codes: src [rows][K/2] bytes -> dst [rows/NB][K/32][NB][16]
+inline void repack_packed(uint8_t* dst, const uint8_t* src, int rows, int K) {
+    const int chunks = K / 32;                       // 16 bytes of codes = 32 weights
+    for (int n = 0; n < rows; ++n) {
+        const int nb = n / RP_NB, l = n % RP_NB;
+        const uint8_t* s = src + (size_t)n * (K / 2);
+        for (int c = 0; c < chunks; ++c) {
+            uint8_t* d = dst + (((size_t)nb * chunks + c) * RP_NB + l) * 16;
+            memcpy(d, s + (size_t)c * 16, 16);
+        }
+    }
+}
+
+// e4m3 group scales: src [rows][K/GRP] -> dst [rows/NB][K/GRP][NB]
+inline void repack_scale(uint8_t* dst, const uint8_t* src, int rows, int K, int GRP) {
+    const int ng = K / GRP;
+    for (int n = 0; n < rows; ++n) {
+        const int nb = n / RP_NB, l = n % RP_NB;
+        const uint8_t* s = src + (size_t)n * ng;
+        for (int g = 0; g < ng; ++g)
+            dst[((size_t)nb * ng + g) * RP_NB + l] = s[g];
+    }
+}
+
 #define CUDA_CHECK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, \
             cudaGetErrorString(_e)); std::abort(); } } while (0)
@@ -169,7 +210,10 @@ public:
 
 private:
     struct Fix { const void** slot; size_t off; };
-    struct Slot { void* dst; size_t bytes; const char* dtype; float* host_scalar; };
+    // rp: 0 = plain copy, 1 = repack packed codes, 2 = repack e4m3 scales.
+    // rows/K describe the ORIGINAL [rows][K] logical shape of that projection.
+    struct Slot { void* dst; size_t bytes; const char* dtype; float* host_scalar;
+                  int rp = 0, rows = 0, K = 0; };
 
     template <class T>
     void reserve1(const T*& field, size_t bytes) {
@@ -225,9 +269,15 @@ private:
     }
 
     void put(const std::string& n, const void* dst, size_t b, const char* dt) {
-        slots_[n] = Slot{(void*)dst, b, dt, nullptr};
+        slots_[n] = Slot{(void*)dst, b, dt, nullptr, 0, 0, 0};
     }
-    void put_scalar(const std::string& n, float* h) { slots_[n] = Slot{nullptr, 2, "BF16", h}; }
+    void put_rp(const std::string& n, const void* dst, size_t b, const char* dt,
+                int rp, int rows, int K) {
+        slots_[n] = Slot{(void*)dst, b, dt, nullptr, rp, rows, K};
+    }
+    void put_scalar(const std::string& n, float* h) {
+        slots_[n] = Slot{nullptr, 2, "BF16", h, 0, 0, 0};
+    }
 
     void plan() {
         const auto& c = cfg_;
@@ -265,12 +315,12 @@ private:
                 put(p + "mlp.shared_expert.down_proj.weight", w.sh_down, H * SI * 2, "BF16");
                 for (size_t e = 0; e < E; ++e) {
                     std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
-                    put(ep + "gate_proj.weight_packed", w.e_gate_p + e * MI * (H / 2),  MI * (H / 2), "U8");
-                    put(ep + "up_proj.weight_packed",   w.e_up_p   + e * MI * (H / 2),  MI * (H / 2), "U8");
-                    put(ep + "down_proj.weight_packed", w.e_down_p + e * H  * (MI / 2), H * (MI / 2), "U8");
-                    put(ep + "gate_proj.weight_scale",  w.e_gate_s + e * MI * (H / GRP),  MI * (H / GRP), "F8_E4M3");
-                    put(ep + "up_proj.weight_scale",    w.e_up_s   + e * MI * (H / GRP),  MI * (H / GRP), "F8_E4M3");
-                    put(ep + "down_proj.weight_scale",  w.e_down_s + e * H  * (MI / GRP), H * (MI / GRP), "F8_E4M3");
+                    put_rp(ep + "gate_proj.weight_packed", w.e_gate_p + e * MI * (H / 2),  MI * (H / 2), "U8", 1, (int)MI, (int)H);
+                    put_rp(ep + "up_proj.weight_packed",   w.e_up_p   + e * MI * (H / 2),  MI * (H / 2), "U8", 1, (int)MI, (int)H);
+                    put_rp(ep + "down_proj.weight_packed", w.e_down_p + e * H  * (MI / 2), H * (MI / 2), "U8", 1, (int)H, (int)MI);
+                    put_rp(ep + "gate_proj.weight_scale",  w.e_gate_s + e * MI * (H / GRP),  MI * (H / GRP), "F8_E4M3", 2, (int)MI, (int)H);
+                    put_rp(ep + "up_proj.weight_scale",    w.e_up_s   + e * MI * (H / GRP),  MI * (H / GRP), "F8_E4M3", 2, (int)MI, (int)H);
+                    put_rp(ep + "down_proj.weight_scale",  w.e_down_s + e * H  * (MI / GRP), H * (MI / GRP), "F8_E4M3", 2, (int)H, (int)MI);
                     gs_[ep + "gate_proj.weight_global_scale"] = {(const float*)w.e_gate_inv, e};
                     gs_[ep + "up_proj.weight_global_scale"]   = {(const float*)w.e_up_inv,   e};
                     gs_[ep + "down_proj.weight_global_scale"] = {(const float*)w.e_down_inv, e};
@@ -325,7 +375,15 @@ private:
                     *s.host_scalar = fv; filled_.insert(name); ++done; continue;
                 }
                 if (v.n != s.bytes) throw std::runtime_error("size mismatch " + name);
-                CUDA_CHECK(cudaMemcpy(s.dst, v.p, s.bytes, cudaMemcpyHostToDevice));
+                if (s.rp) {
+                    if (rp_buf_.size() < s.bytes) rp_buf_.resize(s.bytes);
+                    if (s.rp == 1) repack_packed(rp_buf_.data(), (const uint8_t*)v.p, s.rows, s.K);
+                    else           repack_scale (rp_buf_.data(), (const uint8_t*)v.p, s.rows, s.K,
+                                                 cfg_.nvfp4_group);
+                    CUDA_CHECK(cudaMemcpy(s.dst, rp_buf_.data(), s.bytes, cudaMemcpyHostToDevice));
+                } else {
+                    CUDA_CHECK(cudaMemcpy(s.dst, v.p, s.bytes, cudaMemcpyHostToDevice));
+                }
                 filled_.insert(name); ++done;
             }
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -431,6 +489,7 @@ private:
     std::map<std::string, std::pair<const float*, size_t>> gs_;
     std::set<std::string> filled_;
     std::vector<Fix> fixups_;
+    std::vector<uint8_t> rp_buf_;
     size_t arena_bytes_ = 0, unmapped_ = 0;
 };
 

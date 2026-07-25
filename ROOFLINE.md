@@ -406,3 +406,32 @@ differently — plausibly *more* correlated (the draft is a compressed model) bu
 assumption, not a measurement. Gate D1 must re-measure on real draft blocks before `k*` is
 frozen. Until then, treat the `k*` shift as directional and the tok/s figures as the
 optimistic end of the band.
+
+
+---
+
+## 11. SECOND MEASURED CORRECTION (2026-07-25) — the 227 GB/s ceiling was a low sample
+
+§9 replaced the inherited 200 GB/s with a measured 227.4. That measurement does not
+reproduce. Re-running the identical protocol and geometry gives **242.5 GB/s**, and the
+geometry our GEMM kernels actually use — row-per-warp rather than grid-stride — gives
+**256.9 GB/s = 94.1 % of the 273 GB/s peak**. Run-to-run spread on the same code is 212–248.
+
+The tell was already in `LOOP_LOG`: `lm_head` measured **244.8 GB/s**, *above* the supposed
+ceiling, and it was not chased. **A number that exceeds your stated ceiling is a bug report
+about the ceiling.**
+
+| | old (227) | **corrected (250 typical / 257 best)** |
+|---|---:|---:|
+| achievable streaming BW | 227.4 | **245–257 GB/s** |
+| AR wall at `B_tok` 10.044 | 22.6 tok/s | **25.5 tok/s** |
+| our 189.8 GB/s as a fraction | 84 % | **74–77 %** |
+
+So there is **~1.30× of kernel headroom left, not 1.19×** — more than we thought, and the BF16
+GEMV is not where it is: `q_proj` measures 256.0 GB/s = 94 % of peak and is **finished**.
+
+One further untaken lever sits outside the kernels entirely: the memory controller spends
+**38.4 % of GPU-busy time at 3200 MHz** rather than 4266, so the *mean* available peak is
+246.8 rather than 273. Pinning `/sys/class/devfreq/bwmgr/min_freq` is worth **+3–8 %** and is
+independent of the 120 W cap (EMC max is 4266 MHz in every power mode — the cap costs GPU
+clock, not memory clock). Requires root; left for the operator.

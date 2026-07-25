@@ -60,7 +60,7 @@ int main(int argc,char**argv){
     double Btok=10.0444e9;
     printf("ctx=%d pre=%d  prefill %zu tok %.2fs (%.1f tok/s)\n",CTX,PRE,ids.size(),tpre,ids.size()/tpre);
     printf("DECODE median %.2f tok/s   best %.2f   (n=%zu, ctx@end=%d)\n",1.0/med,1.0/best,ts.size(),pos);
-    printf("effective BW (median) = %.1f GB/s = %.0f%% of 227\n",Btok/med/1e9,Btok/med/1e9/227*100);
+    printf("effective BW (median) = %.1f GB/s = %.0f%% of 250\n",Btok/med/1e9,Btok/med/1e9/250*100);
     printf("greedy match %d/%zu %s\n",match,ncmp,(size_t)match==ncmp?"OK":"MISMATCH");
     E.prof_report((int)ts.size());
     return 0;

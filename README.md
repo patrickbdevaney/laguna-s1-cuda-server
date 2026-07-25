@@ -19,7 +19,7 @@ corrections to its factual premises: `RESCOPE.md`.
 | **D1** DFlash + k-sweep | ⏳ |
 | **S1** server layer | ⏳ |
 
-**Current decode: 18.90 tok/s median** (ctx 4096, greedy, no speculation) = 189.8 GB/s effective
+**Current decode: 20.44 tok/s median** (FP8 attention; 18.97 on the bit-exact BF16 path) (ctx 4096, greedy, no speculation) = 189.8 GB/s effective
 = **84 % of the measured 227 GB/s ceiling**. Prefill 55 tok/s.
 Reference point: poolside measured **13–14 tok/s** for this model on a DGX Spark (same
 bandwidth class) under vLLM, and **22–24 tok/s** with DFlash.

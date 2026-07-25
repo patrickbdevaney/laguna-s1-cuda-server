@@ -63,6 +63,9 @@ back-to-back A/B/A.
 | 10 | **G9 — whole-step CUDA graph** (device-side position counter) | 16.59 | **17.88** | **WON +7.8 %** |
 | 11 | Doubling re-capture bound for the attention split count | 17.88 | **18.74** | **WON +4.8 %** |
 | 12 | **Fused add + RMSNorm + f32→bf16 cast** (`D` a template constant) | 18.46 | **18.90** | **WON +2.4 %** |
+| 13 | Sliding-ring `cap = window + MAXTOK` | — | — | **CORRECTNESS FIX** |
+| 14 | MoE gate/up on separate warps (320→640 warps) | 18.90 | 18.62/18.68 | **LOST −1.3 %, default off** |
+| 15 | **FP8 e4m3 attention weights, per-output-row scale** | 18.94 | **20.44** | **WON +8.1 %** |
 
 ### #1 — the LUT was in local memory (WON)
 `e2m1f()` indexes `const float t[8]` by a runtime code. Inside a GEMM inner loop the compiler
@@ -214,6 +217,58 @@ single first-run number. The final measurement — G 18.37 / 18.54 versus H 18.9
 alternating with settling — is stable to 0.1 % on the H side across both rounds.
 
 This sits alongside thermal drift as a second, independent reason absolute numbers lie here.
+
+### #13 — the sliding ring aliased future tokens into the read window (CORRECTNESS)
+
+`cap[L] = sliding_window` exactly means the read arc `[p−window+1, p]` covers **all** `cap`
+slots, so any token written later in the same batch lands inside it. Verified independently:
+at `base=1000, M=64`, **63 of 64 future tokens collide** with positions the first query reads.
+
+Decode (M=1) is immune — 512 consecutive positions map to 512 distinct slots. It bites
+multi-token forwards only: prefill, and the speculative verify path. **Every prompt over 512
+tokens was silently wrong on 36 of 48 layers**, and the 54-token greedy gate could not see it.
+Fix: `cap = window + MAXTOK`, making the read and look-ahead arcs disjoint. Cost 4.7 MB.
+
+Found by the Axis E research pass reading the code, not by any test we had. The gate that
+would have caught it — a >512-token prompt checked against sequential single-token decode,
+which is provably alias-free — is the one to add.
+
+### #14 — MoE gate/up on separate warps (LOST −1.3 %, despite a measured +22.5 % in isolation)
+
+A synthetic benchmark at full 2.5 GB scale showed the gate/up kernel is warp-starved
+(320 warps / 33 % occupancy → 159.6 GB/s) against `k_moe_down_rp`'s identical inner loop at
+960 warps → 222.3 GB/s, and that splitting the two weight streams onto separate warps takes it
+to 195.6 GB/s. End-to-end it measured **18.62 / 18.68 against an 18.90 control**.
+
+The isolated kernel win did not survive integration. Most likely the extra `gbuf`/`ubuf`
+round-trip, and that in the full step the MoE shares the machine with other resident work, so
+the spare warp slots the synthetic benchmark found were not actually spare. **Kept behind
+`LG_SPLIT`, default off.** Lesson: a synthetic kernel benchmark measures the kernel, not the
+step — the only number that counts is end-to-end.
+
+### #15 — FP8 attention weights (WON +8.1 %, the first `B_tok` reduction)
+
+Per-output-row e4m3 with the scale applied once after the dot product, so the inner loop is
+the BF16 loop with half the bytes and no extra math. `B_tok` 10.044 → **7.242 GB**; arena
+71.9 → **69.1 GB**. A/B/A: 18.90 → **20.44** → 18.97, greedy 8/8 throughout.
+
+**One instructive failure first.** The obvious 16-byte (`uint4`) load covers 16 fp8 weights,
+which at K=3072 leaves only `K/16/32 = 6` iterations per lane — half what the BF16 kernel gets,
+and straight into the latency-bound regime our own repack rule describes. It measured **17.23
+tok/s, slower than the BF16 baseline it was supposed to beat**. Narrowing to 8-byte `uint2`
+loads restores 12 iterations per lane and gives the +8.1 %. Same lesson as #7 and #8:
+**iterations per lane is the variable, and halving the bytes per weight halves it.**
+
+**Honest accounting: this path is less byte-efficient, not more.** At 7.242 GB and 20.44 tok/s
+the FP8 attention path runs at **148 GB/s effective**, against the BF16 path's 190. It wins on
+bytes and loses on efficiency, netting +8.1 %. If the FP8 GEMM reached the BF16 kernel's
+efficiency the same byte budget would give **26 tok/s** — so roughly two thirds of this lever
+is still unclaimed.
+
+Quality: greedy-exact on the 8-token gate, which is a *weak* signal. The research (see
+`RESEARCH_FINDINGS.md`) puts weight-only 8-bit at measured-lossless — llama.cpp Q8_0 on
+Llama-3.1-8B moves ppl 7.32 → 7.33 — so confidence is high, but the flag stays opt-in and the
+BF16 path remains the bit-exact gate oracle.
 
 ### Where the time actually goes (per-category profile, `LG_PROF=1`)
 

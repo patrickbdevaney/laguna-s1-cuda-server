@@ -28,8 +28,13 @@ Arc: 3.66 → 21.65 → **33.0** tok/s. See `OPTIMIZATION_LOG.md` #18–#30 and
 For scale: published full-step batch-1 bandwidth efficiency tops out at **82 %**
 (FlashFormer, H100); we are at ~85 %. poolside's own DGX Spark GB10 measurement — the closest
 hardware analogue — is **13–14 tok/s** unspeculated and 22–24 with DFlash.
-**Served, end to end** (`lgserve`, adaptive speculation): **~40 tok/s on code**,
-**33 tok/s on prose**, with a hard floor at the autoregressive rate.
+**Served, end to end** (`lgserve`, cost-aware speculation policy over {AR, DFlash, suffix}):
+
+| workload | tok/s | accepted / forward |
+|---|---:|---:|
+| prose | 33.6 | 1.00 (declines to speculate) |
+| code | 40.1 | 3.67 |
+| repetitive / edit-style | **49.7** | **14.6** |
 
 Reference point: poolside measured **13–14 tok/s** for this model on a DGX Spark (same
 bandwidth class) under vLLM, and **22–24 tok/s** with DFlash.

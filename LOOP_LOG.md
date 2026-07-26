@@ -610,3 +610,84 @@ in the captured position's ring slot forever. Changed to a device pointer, exact
 * **Concurrency.** One session at a time, on a mutex. Decode is bandwidth-bound at batch 1 on
   a 69 GB weight set; a second concurrent sequence would not add throughput, it would halve
   both sequences' latency. Requests queue.
+
+---
+
+## N2 + N3 — cost-aware speculation policy and a zero-weight drafter · 2026-07-25
+
+### N2 — the throughput bandit is gone
+
+The bandit ranked whole arms by *realised tokens/second*. That is the highest-variance signal
+available: one speculative step yields between 1 and k+1 tokens, so a single sample spans the
+entire acceptance distribution. Averaging it needed 32-step blocks, which made exploration cost
+~30 % of a block and left the controller lagging acceptance that changes mid-generation.
+
+The replacement measures the *low*-variance thing instead. Every verify already reports, for
+free, whether position i was accepted **given** that 0..i−1 were — Bernoulli observations, one
+per position, five per k=5 step. From per-position acceptance the expected yield of any k
+follows in closed form, and the choice is a cost-weighted argmax:
+
+```
+E[tokens | k] = 1 + p0 + p0·p1 + … + Π_{i<k} p_i
+k*            = argmax_k  E[tokens | k] / cost(k)          (AR scored as k = 0)
+```
+
+A step at **any** k updates the estimate for **every** k, so steady-state exploration cost is
+zero. `cost(k)` is established by a one-time boot sweep and then tracked by EWMA.
+
+### Three bugs, each of which made the controller worse than the thing it replaced
+
+Worth recording in order, because each looked like a tuning problem and was actually a
+measurement problem.
+
+1. **`cost_ar` from a single sample.** Measured once during the boot sweep and never updated.
+   It rated AR at 23.4 tok/s against a true 33, so a k=1 verify with **zero** acceptance looked
+   cheaper than decoding, and the controller chose it on prose.
+2. **The estimate could never recover.** Fixing (1) with an EWMA made it *worse* — 19.7 —
+   because once the controller stopped choosing AR there were no AR steps to update it from.
+   **An arm that is never selected is never re-measured.** Any cost feeding an argmax has to be
+   established before the argmax can starve it. Fixed with a bounded boot sweep that samples AR
+   four times, skipping the first, because the first AR step also captures the CUDA graph and
+   is ~1.7× a steady one.
+3. **A boolean where a position belonged.** `draft_ctx_current` meant every AR step invalidated
+   the draft's context, so the next DFlash step rebuilt the entire 512-wide window — four
+   chunks, each an fc GEMM of 113 MB plus six layers of K/V. Harmless when arms were held for
+   32 steps; ruinous when the mode can change every token. Replaced with `draft_ctx_pos`, which
+   bounds the rebuild to the tokens actually committed while the draft was idle.
+
+After (3), the controller's own AR estimate reads **33.0 tok/s** — matching standalone
+`bench_decode` exactly. That agreement is the signal that the cost model is finally calibrated.
+
+### N3 — SuffixDecoding
+
+A suffix automaton over prompt + generated tokens, indexing 3- to 12-grams. Marginal cost is a
+hash lookup; it reads no weights at all. That matters here because Gate D1 established a verify
+forward costs ~3× a decode step, so DFlash must clear τ ≈ 3 to pay — and after the FP8 work
+raised base decode to 33 tok/s, that bar went up again. A drafter with no weight reads only has
+to beat 1.0 accepted tokens.
+
+**Two bugs, both of which made it silently never fire:**
+
+* **Cold start.** An unobserved position priced at a 0.5 prior put the suffix arm at 31.5 tok/s
+  against AR's 33.3 — just below, forever, so it was never chosen and never learned. Fixed with
+  a bounded number of forced trials per source, per server lifetime.
+* **Self-match.** `extend()` indexed *through* the current position, so `draft()` found the
+  current position as its own "earlier occurrence" and fell through every length. Twelve forced
+  trials, zero accepted tokens, `p[0]` pinned at 0. The index now stops one short.
+
+With both fixed, `p_sfx` reads 0.92 / 1.00 / 1.00 on repetitive output.
+
+### Measured
+
+| workload | tok/s | accepted / forward | chosen arm |
+|---|---:|---:|---|
+| prose | **33.6** | 1.00 | AR — correctly declines to speculate |
+| code | **40.1** | 3.67 | DFlash k=3 |
+| repetitive / edit-style | **49.7** | **14.6** | DFlash k=15, suffix competitive at 47–50 |
+
+All gates green throughout: 13/13 kernels, B1c bit-exact, D1 greedy 8/8 at every k.
+
+**One honest limitation.** `p[]` is global across requests, so a hard workload switch costs
+tens of steps to re-converge — visible as a first-request number below steady state. The EWMA
+decay (0.92) sets that timescale deliberately: faster tracking would reintroduce the variance
+the bandit suffered from.

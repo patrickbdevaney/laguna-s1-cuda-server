@@ -29,6 +29,7 @@
 #include "../src/draft.cu"
 #include "../include/tokenizer.h"
 #include "../include/chat.h"
+#include "../include/suffix.h"
 #include "../include/third_party/httplib.h"
 #include "../include/webui.h"
 
@@ -61,87 +62,141 @@ struct Utf8Stream {
     std::string flush() { std::string o = pending; pending.clear(); return o; }
 };
 
-// ------------------------------------------------------------------ adaptive speculation
+// ------------------------------------------------------------------ speculation policy
 //
-// Speculation is NOT free on this model, and on a bandwidth-bound MoE it is not even reliably
-// positive. Gate D1 measured the break-even: a verify forward at M=k+1 costs about 3x a
-// decode step (the MoE activates ~4x the experts, and the dense GEMMs are issue-bound at
-// M>1), so speculation only wins when tau > ~3. And tau is content-dependent -- poolside
-// publish 6.44 on HumanEval against 4.02 on MT-Bench, and this server measures 3.06 on a
-// math prompt against 2.26 on open prose. At 2.26 with k=3 speculation runs at 20.7 tok/s
-// against 27.4 for plain autoregressive decode: a 25 % LOSS.
+// This replaces a 4-arm throughput bandit, and the reason is worth recording because the
+// bandit was not obviously wrong.
 //
-// So the mode is chosen by measurement rather than by configuration. Each arm keeps an EWMA
-// of its achieved tokens/second; the best arm runs, and every arm is re-probed periodically
-// so the estimate tracks a conversation that switches from prose to code. The state lives on
-// the server, not the request, because it is a property of the hardware far more than of any
-// one prompt.
-struct SpecBandit {
-    static const int NM = 4;
-    static const int RUN = 32;              // steps an arm holds before it is re-ranked
-    static const int PROBE_EVERY = 10;      // blocks between exploration
-    static const int SWEEP_EVERY = 50;      // blocks between a forced probe of EVERY arm
+// The bandit ranked whole arms by *realised tokens/second*. One speculative step yields
+// between 1 and k+1 tokens, so a single sample spans the entire acceptance distribution --
+// ranking on it thrashed, and blocking 32 steps per arm to average it out made exploration
+// cost ~30 % of a block and left it lagging behind acceptance that changes mid-generation.
+//
+// The fix is to stop measuring the thing with high variance and start measuring the thing
+// with low variance. Every verify already tells us, for free, whether position i was accepted
+// GIVEN that 0..i-1 were. Those are Bernoulli observations, one per position, and a single
+// k=5 step yields five of them. From per-position acceptance p[i] the expected yield of ANY k
+// follows in closed form:
+//
+//     E[tokens | k] = 1 + p0 + p0·p1 + … + Π_{i<k} p_i
+//     k*            = argmax_k  E[tokens | k] / cost(k)
+//
+// Three consequences, each fixing one of the bandit's observed failures:
+//   * a step at ANY k updates the estimate for EVERY k, so exploration cost goes to zero;
+//   * ~5x the signal per step, so no 32-step commitment is needed;
+//   * an EWMA on p[i] re-converges in tens of steps rather than hundreds.
+//
+// `cost(k)` is profiled once at boot rather than learned. Cohere measured adjacent-token
+// expert overlap at 0.381 across all 13 Spec-Bench categories and seven languages -- routing
+// correlation is a structural property of MoE, not of the prompt -- so the cost of verifying
+// k+1 tokens does not depend on the workload, only the acceptance does.
+//
+// Two drafters compete on the same footing. DFlash pays 2.23 GB of weights per propose;
+// SuffixDecoding pays a hash lookup. They keep separate p[] tables because their acceptance
+// is completely differently distributed, but they share cost_verify(k).
+struct SpecPolicy {
+    // block_size-1: DFlash emits the whole block in one forward, so a larger k costs the
+    // draft nothing extra -- only the verify grows. On repetitive output tau reaches 8.5,
+    // which was clipped by an earlier cap of 8.
+    static const int KMAX = 15;
+    enum Src { AR = 0, DFLASH = 1, SUFFIX = 2 };
 
-    int    k[NM]     = {0, 2, 3, 5};        // 0 = plain autoregressive
-    double rate[NM]  = {0, 0, 0, 0};        // EWMA tokens/second
-    long   tries[NM] = {0, 0, 0, 0};
+    // per-position conditional acceptance, per drafter
+    double p[3][KMAX] = {};
+    long   np[3][KMAX] = {};
 
-    // An arm is held for a BLOCK of steps, not one step. A single speculative step yields
-    // between 1 and k+1 tokens, so its instantaneous rate varies by the full width of the
-    // acceptance distribution -- ranking arms on one sample made the bandit thrash and cost
-    // 12 % on the workload where speculation actually wins. Averaging over RUN steps cuts the
-    // variance by ~5x, which is the difference between converging and oscillating.
-    int    cur = 0;
-    int    left = 0;
-    int    blk_tok = 0;
-    double blk_s = 0;
-    long   blocks = 0;
+    // profiled costs, seconds
+    double cost_ar = 0;                        // one M=1 graph step
+    double cost_verify[KMAX + 1] = {};         // one M=k+1 target forward
+    double cost_draft_dflash = 0;              // one propose (~flat in k)
+    bool   profiled = false;
+    int    boot = 0;                           // one-time cost sweep, KMAX+1 steps
 
-    int pick() {
-        if (left > 0) return cur;
-        if (blk_s > 0) commit();
-        for (int i = 0; i < NM; ++i) if (tries[i] == 0) { cur = i; break; }
-        if (tries[cur] != 0) {
-            int best = 0;
-            for (int i = 1; i < NM; ++i) if (rate[i] > rate[best]) best = i;
-            ++blocks;
-            // Exploration is not free: a block spent on a bad arm costs ~30 % of its tokens,
-            // and acceptance is non-stationary WITHIN a generation (the same arm measured
-            // 37.4 then 22.6 tok/s as a code answer drifted into prose). So probe rarely,
-            // and skip arms that are not plausibly competitive -- unless a full sweep is due,
-            // which is what lets an arm that has recovered come back.
-            const bool sweep = (blocks % SWEEP_EVERY) < NM;
-            if (sweep) cur = (int)(blocks % NM);
-            else if (blocks % PROBE_EVERY == 0) {
-                cur = best;
-                for (int t = 1; t < NM; ++t) {
-                    int cand = (int)((blocks / PROBE_EVERY + t) % NM);
-                    if (rate[cand] >= 0.65 * rate[best]) { cur = cand; break; }
-                }
-            } else cur = best;
+    // Until every cost_verify[k] has been observed once, walk k deterministically instead of
+    // choosing. This costs KMAX+1 steps ONCE per server lifetime -- against a bandit that paid
+    // an exploration tax forever -- and after it the controller never needs to explore again,
+    // because a step at any k informs the estimate for every k.
+    // The boot sweep is [AR x AR_SAMPLES] then [k=1..KMAX]. Several AR steps, not one,
+    // because the FIRST AR step also captures the CUDA graph and is therefore ~1.7x a steady
+    // one. Measuring cost_ar from that single sample rated AR at 19.7 tok/s against a true 33,
+    // and since the controller then never CHOSE AR, the estimate never got a chance to
+    // correct itself -- an arm that is never selected is never re-measured. Any cost that
+    // feeds an argmax has to be established before the argmax can starve it.
+    static const int AR_SAMPLES = 4;
+    bool bootstrapping() const { return !profiled; }
+    int  boot_k() const { return boot < AR_SAMPLES ? 0 : boot - AR_SAMPLES + 1; }
+    bool boot_record_ar() const { return boot > 0 && boot < AR_SAMPLES; }  // skip the capture
+
+    void observe(Src s, int k, int nacc) {
+        // positions 0..nacc-1 accepted; position nacc rejected (unless the block ran out)
+        for (int i = 0; i < nacc && i < KMAX; ++i) obs(s, i, 1.0);
+        if (nacc < k && nacc < KMAX) obs(s, nacc, 0.0);
+    }
+    void obs(Src s, int i, double v) {
+        p[s][i] = np[s][i] ? 0.92 * p[s][i] + 0.08 * v : v;
+        ++np[s][i];
+    }
+
+    double yield(Src s, int k) const {
+        double e = 1.0, run = 1.0;             // the bonus token is always committed
+        for (int i = 0; i < k; ++i) {
+            // an unobserved position is optimistic-but-bounded, so a fresh k is tried once
+            // and then judged on evidence rather than on a prior
+            run *= np[s][i] ? p[s][i] : 0.5;
+            e += run;
         }
-        left = RUN;
-        return cur;
+        return e;
     }
-    void update(int, int toks, double secs) { blk_tok += toks; blk_s += secs; --left; }
-    void commit() {
-        double r = blk_tok / std::max(blk_s, 1e-9);
-        rate[cur] = tries[cur] ? 0.6 * rate[cur] + 0.4 * r : r;
-        ++tries[cur];
-        blk_tok = 0; blk_s = 0;
+    double rate(Src s, int k) const {
+        if (s == AR) return cost_ar > 0 ? 1.0 / cost_ar : 0.0;
+        const double c = cost_verify[k] + (s == DFLASH ? cost_draft_dflash : 0.0);
+        return c > 0 ? yield(s, k) / c : 0.0;
     }
-    void flush() { if (blk_s > 0) { commit(); left = 0; } }   // end of a request
+
+    // Best (source, k). `suffix_k` is how many tokens the suffix index can actually offer
+    // this step -- 0 means that arm does not exist right now.
+    // A source that is never chosen is never measured, and an unobserved position priced at
+    // 0.5 put SuffixDecoding at 31.5 tok/s against AR's 33.3 -- just below, forever. Give each
+    // source a bounded number of forced trials so the argmax runs on evidence rather than on
+    // a prior. TRIALS is per server lifetime, not per request.
+    static const int TRIALS = 12;
+    bool needs_trial(Src s) const { return np[s][0] < TRIALS; }
+
+    void choose(int suffix_k, Src* s_out, int* k_out) const {
+        if (suffix_k > 0 && needs_trial(SUFFIX)) {
+            *s_out = SUFFIX; *k_out = std::min(3, suffix_k); return;
+        }
+        Src bs = AR; int bk = 0; double br = rate(AR, 0);
+        for (int k = 1; k <= KMAX; ++k) {
+            if (cost_verify[k] <= 0) continue;
+            double r = rate(DFLASH, k);
+            if (r > br) { br = r; bs = DFLASH; bk = k; }
+            if (k <= suffix_k) {
+                r = rate(SUFFIX, k);
+                if (r > br) { br = r; bs = SUFFIX; bk = k; }
+            }
+        }
+        *s_out = bs; *k_out = bk;
+    }
 
     std::string report() const {
-        std::string s;
-        for (int i = 0; i < NM; ++i) {
-            char b[64];
-            snprintf(b, sizeof b, "%s%s=%.1f", i ? " " : "",
-                     k[i] ? ("k" + std::to_string(k[i])).c_str() : "ar", rate[i]);
-            s += b;
-        }
-        return s;
+        char b[256];
+        Src s; int k; choose(KMAX, &s, &k);
+        snprintf(b, sizeof b,
+                 "ar=%.1f dflash_best=%.1f@k%d suffix_best=%.1f@k%d p_df=%.2f/%.2f/%.2f "
+                 "p_sfx=%.2f/%.2f/%.2f",
+                 rate(AR, 0), best_rate(DFLASH), best_k(DFLASH), best_rate(SUFFIX),
+                 best_k(SUFFIX), p[DFLASH][0], p[DFLASH][1], p[DFLASH][2],
+                 p[SUFFIX][0], p[SUFFIX][1], p[SUFFIX][2]);
+        return b;
     }
+    int best_k(Src s) const {
+        int bk = 1; double br = 0;
+        for (int k = 1; k <= KMAX; ++k)
+            if (cost_verify[k] > 0 && rate(s, k) > br) { br = rate(s, k); bk = k; }
+        return bk;
+    }
+    double best_rate(Src s) const { return rate(s, best_k(s)); }
 };
 
 // ------------------------------------------------------------------ engine wrapper
@@ -160,14 +215,19 @@ struct Server {
     int SPEC_K = 3;                 // Gate D1 measured k* = 3-4 on this part
     bool use_spec = true;
 
-    SpecBandit bandit;
-    // Is the draft's context K/V current for `pos`? While the bandit sits on the
-    // autoregressive arm the draft is not consulted, and projecting context K/V for every
-    // committed token costs an fc GEMM (113 MB) plus six layers of k/v (75 MB) -- about
-    // 1 ms per token, ~2.6 % of an AR step, spent maintaining state nothing reads. The TAPS
-    // still have to be written (they are part of the target forward and free), so switching
-    // back only needs one rebuild over the draft's 512-wide window.
-    bool draft_ctx_current = false;
+    SpecPolicy policy;
+    lgsuffix::SuffixIndex sfx;
+    // How far the draft's context K/V have been projected. NOT a boolean: with a per-step
+    // controller the mode can change every token, and a boolean meant every AR step
+    // invalidated the whole thing, so the next DFlash step rebuilt the entire 512-wide window
+    // (four chunks x an fc GEMM of 113 MB plus six layers of k/v). That made AR look 30 %
+    // more expensive than it is and pushed the controller off it on prose. Tracking the
+    // POSITION bounds the rebuild to exactly the tokens that were committed while the draft
+    // was not being consulted -- usually a handful.
+    //
+    // The taps themselves are always fresh: they are written by the target forward and cost
+    // nothing, so only the projection can fall behind.
+    int draft_ctx_pos = 0;
 
     // prefix cache
     std::vector<int> cached;        // token ids currently represented in S's KV
@@ -292,7 +352,7 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
 
     // The prefix cache means the draft's context may be stale for an arbitrary rewind, so it
     // is rebuilt lazily on the first speculative step rather than eagerly here.
-    s.draft_ctx_current = false;
+    s.draft_ctx_pos = 0;
 
     if (stats) { stats->prefill_s = wall_now() - tp0; stats->prompt = (int)ids.size(); }
     const double td0 = wall_now();
@@ -315,35 +375,69 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         // against an argmax target, and the rejection sampler needs the draft's own
         // distribution. Rather than silently change the output distribution, sampled requests
         // decode autoregressively.
-        const int arm = (s.use_spec && o.temperature <= 0.0) ? s.bandit.pick() : 0;
-        const int k = s.bandit.k[arm];
+        s.sfx.extend(s.cached);
+        int sfx_avail = 0;
+        std::vector<int> sfx_draft(SpecPolicy::KMAX);
+        if (s.use_spec && o.temperature <= 0.0)
+            sfx_avail = s.sfx.draft(s.cached, SpecPolicy::KMAX, sfx_draft.data())
+                        ? SpecPolicy::KMAX : 0;
+
+        SpecPolicy::Src src = SpecPolicy::AR;
+        int k = 0;
+        if (s.use_spec && o.temperature <= 0.0) {
+            if (s.policy.bootstrapping()) {
+                k = s.policy.boot_k();
+                src = k ? SpecPolicy::DFLASH : SpecPolicy::AR;
+                if (++s.policy.boot > SpecPolicy::AR_SAMPLES + SpecPolicy::KMAX - 1)
+                    s.policy.profiled = true;
+            } else {
+                s.policy.choose(sfx_avail, &src, &k);
+            }
+        }
         const double ts0 = wall_now();
 
         if (k == 0) {
             // The M=1 step runs from a captured CUDA graph -- measured +7.8 % on its own, and
-            // it is the arm the bandit picks on prose, so it is the one that matters most for
-            // a chat workload. The graph is only valid because `tap_store` and `store_kv`
-            // both take the position as a device pointer; a host int would be frozen at
-            // capture time.
+            // it is the arm chosen on prose, so it is the one that matters most for a chat
+            // workload. The graph is only valid because `tap_store` and `store_kv` both take
+            // the position as a device pointer; a host int would be frozen at capture time.
             CUDA_CHECK(cudaMemcpy(s.d_tok, &next, 4, cudaMemcpyHostToDevice));
             if (s.E.needs_recapture(s.pos)) s.E.capture(s.S, s.d_tok, s.pos);
             s.E.step_graph(s.pos);
             CUDA_CHECK(cudaDeviceSynchronize());
             s.pos += 1;
             next = s.sample_row(0, o.temperature, o.top_p, rng);
-            s.draft_ctx_current = false;          // taps stay fresh; the projection lapses
-            s.bandit.update(arm, 1, wall_now() - ts0);
+            {   // EWMA, not a single sample. cost_ar was measured once during the boot
+                // sweep -- on a cold clock, before DVFS had ramped -- and never revisited, so
+                // AR was permanently underrated at 23.4 tok/s against a true ~33. That made a
+                // k=1 verify with ZERO acceptance look cheaper than decoding, and the
+                // controller picked it on prose. Every arm's cost must decay the same way, or
+                // the argmax is comparing a stale number against fresh ones.
+                const double ca = wall_now() - ts0;
+                const bool boot_ok = !s.policy.bootstrapping() || s.policy.boot_record_ar();
+                if (boot_ok)
+                    s.policy.cost_ar = s.policy.cost_ar > 0 ? 0.9 * s.policy.cost_ar + 0.1 * ca
+                                                            : ca;
+            }
             if (stats) ++stats->steps;
             continue;
         }
 
-        if (!s.draft_ctx_current) {
-            const int c0 = std::max(0, s.pos - s.dc.sliding_window);
-            s.D.context_kv(s.E.taps, s.E.tap_cap, c0, s.pos - c0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            s.draft_ctx_current = true;
+        if (src == SpecPolicy::SUFFIX) {
+            for (int i = 0; i < k; ++i) draft[i] = sfx_draft[i];
+        } else {
+            if (s.draft_ctx_pos < s.pos) {
+                const int lo = std::max(std::max(0, s.pos - s.dc.sliding_window),
+                                        s.draft_ctx_pos);
+                s.D.context_kv(s.E.taps, s.E.tap_cap, lo, s.pos - lo);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                s.draft_ctx_pos = s.pos;
+            }
+            s.D.propose(next, s.pos, k, s.W.embed, s.W.lm_head, s.W.lm_head8, s.W.lm_head8s,
+                        draft.data());
         }
-        s.D.propose(next, s.pos, k, s.W.embed, s.W.lm_head, s.W.lm_head8, s.W.lm_head8s, draft.data());
+        const double tdraft = wall_now();
+
         blk[0] = next;
         for (int i = 0; i < k; ++i) blk[1 + i] = draft[i];
         CUDA_CHECK(cudaMemcpy(s.d_tok, blk.data(), (k + 1) * 4, cudaMemcpyHostToDevice));
@@ -363,12 +457,24 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         }
         s.pos += nacc + 1;
         next = tout[nacc];
-        s.D.context_kv(s.E.taps, s.E.tap_cap, s.pos - (nacc + 1), nacc + 1);
-        s.draft_ctx_current = true;
-        s.bandit.update(arm, nacc + 1, wall_now() - ts0);
+        if (s.draft_ctx_pos == s.pos - (nacc + 1)) {   // contiguous: extend cheaply
+            s.D.context_kv(s.E.taps, s.E.tap_cap, s.draft_ctx_pos, nacc + 1);
+            s.draft_ctx_pos = s.pos;
+        }
+        // The observation is per POSITION, not per step -- this is the whole point.
+        s.policy.observe(src, k, nacc);
+        {   // EWMA the cost too: it drifts with context length as KV grows
+            const double cv = wall_now() - tdraft;
+            s.policy.cost_verify[k] = s.policy.cost_verify[k] > 0
+                                    ? 0.9 * s.policy.cost_verify[k] + 0.1 * cv : cv;
+            if (src == SpecPolicy::DFLASH) {
+                const double cd = tdraft - ts0;
+                s.policy.cost_draft_dflash = s.policy.cost_draft_dflash > 0
+                                           ? 0.9 * s.policy.cost_draft_dflash + 0.1 * cd : cd;
+            }
+        }
         if (stats) ++stats->steps;
     }
-    s.bandit.flush();
     if (stats) { stats->decode_s = wall_now() - td0; stats->gen = emitted; }
 }
 
@@ -501,7 +607,7 @@ int main(int argc, char** argv) {
                         {"tokens_per_second", gs.gen / std::max(gs.prefill_s + gs.decode_s, 1e-9)},
                         {"target_forwards", gs.steps},
                         {"accepted_per_forward", gs.steps ? (double)gs.gen / gs.steps : 0.0},
-                        {"spec_arms", s.bandit.report()}}}};
+                        {"spec_arms", s.policy.report()}}}};
             res.set_content(j.dump(), "application/json");
             return;
         }

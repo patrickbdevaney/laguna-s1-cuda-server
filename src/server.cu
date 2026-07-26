@@ -216,6 +216,16 @@ struct Server {
     bool use_spec = true;
 
     SpecPolicy policy;
+    // LG_TAU_LOG=<path> appends one CSV row per speculative step:
+    //   prompt_tokens, generated_position, source, k, accepted
+    // The two length axes are confounded in any single generation -- generated position grows
+    // while prompt length is fixed -- so the only way to separate them is to hold the task
+    // constant and vary the prompt independently. The literature disagrees about which axis
+    // drives acceptance collapse (DFlash/OWL measure input length; others measure acceptance
+    // RISING with output position on reasoning traffic), and the answer decides whether the
+    // fix is a drafter fine-tune or a controller change.
+    FILE* tau_log = nullptr;
+    int   tau_plen = 0;
     lgsuffix::SuffixIndex sfx;
     // How far the draft's context K/V have been projected. NOT a boolean: with a per-step
     // controller the mode can change every token, and a boolean meant every AR step
@@ -258,6 +268,10 @@ struct Server {
                 E.tap_of[dc.target_layer_ids[i]] = (int)i;
             CUDA_CHECK(cudaMalloc(&E.taps, (size_t)dc.target_layer_ids.size() *
                                            E.tap_cap * c.hidden * 4));
+        }
+        if (const char* p = getenv("LG_TAU_LOG")) {
+            tau_log = fopen(p, "a");
+            if (tau_log) fprintf(tau_log, "# plen,gpos,src,k,nacc\n");
         }
         tok = new lgtok::Tokenizer(md + "/tokenizer.json");
         logits_host.resize(c.vocab);
@@ -587,6 +601,8 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         }
         // The observation is per POSITION, not per step -- this is the whole point.
         s.policy.observe(src, k, nacc);
+        if (s.tau_log)
+            fprintf(s.tau_log, "%d,%d,%d,%d,%d\n", s.tau_plen, emitted, (int)src, k, nacc);
         {   // EWMA the cost too: it drifts with context length as KV grows
             const double cv = wall_now() - tdraft;
             s.policy.cost_verify[k] = s.policy.cost_verify[k] > 0
@@ -599,6 +615,7 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         }
         if (stats) ++stats->steps;
     }
+    if (s.tau_log) fflush(s.tau_log);
     if (stats) { stats->decode_s = wall_now() - td0; stats->gen = emitted; }
 }
 
@@ -693,6 +710,7 @@ int main(int argc, char** argv) {
 
         std::lock_guard<std::mutex> lk(s.mu);
         std::vector<int> ids = s.tok->encode(prompt);
+        s.tau_plen = (int)ids.size();
         if ((int)ids.size() + o.max_tokens > s.CTX) {
             res.status = 400;
             res.set_content(ojson{{"error", ojson{{"message", "context length exceeded"}}}}.dump(),

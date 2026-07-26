@@ -743,3 +743,53 @@ the regime it will be used to make decisions in.
 |---|---:|---:|
 | prose | 33.6 | 1.00 (declines to speculate; `ar` estimate 33.1 matches `bench_decode`) |
 | code | 40.1 | 3.67 |
+
+---
+
+## τ against prompt length vs generated position · MEASURED · 2026-07-25
+
+The literature conflicts: DFlash/OWL/SpecExtend measure acceptance degrading with long **input**
+context; others measure it *rising* with **output** position on reasoning traffic. The two axes
+are confounded in any single generation, so `tools/tau_sweep.py` holds the task constant and
+varies only the prompt, by prepending a neutral filler document. 525 speculative steps.
+
+**By prompt length** (all generated positions pooled):
+
+| prompt tokens | mean accepted / forward |
+|---:|---:|
+| ≤ 256 | **0.817** |
+| ≤ 1024 | 0.619 |
+| ≤ 16384 | **0.533** |
+
+**By generated position, within each prompt-length bucket:**
+
+| prompt | pos 0–99 | 100–199 | 200–299 | 300+ |
+|---|---:|---:|---:|---:|
+| ≤ 256 | 0.86 | 0.55 | 0.84 | **1.11** |
+| ≤ 1024 | 0.62 | 0.59 | 0.61 | 0.67 |
+
+**The answer is unambiguous: acceptance degrades with PROMPT LENGTH, not with generated
+position.** Within a generation it is flat or slightly *rising*. A 35 % fall from 67 to 15 267
+prompt tokens, and no decay at all along the output axis.
+
+This retires the "acceptance collapses mid-generation" explanation we had been carrying — that
+was content and policy convergence, not position.
+
+### And it points at an inference-side fix, not a training one
+
+The draft's context K/V are projected from the target's taps over **the most recent 512
+positions** — its sliding window. On a long prompt those 512 positions cover only the tail,
+while the target still attends to the whole prompt through its 12 global layers. **The draft is
+systematically under-informed exactly when the prompt is long**, which is precisely the shape
+the data shows.
+
+We control which positions get projected. `context_kv()` currently takes
+`c0 = max(0, pos − sliding_window)`; nothing forces that choice to be *the most recent* 512
+rather than *the most relevant* 512 — and the target's own attention over the taps is available
+to rank them. The tap ring would need to grow beyond its current 528 entries (73 KB per
+position, so 4096 positions ≈ 302 MB — affordable).
+
+This matters because it is **exact, inference-side, and inside this repo**. The published fixes
+for long-context acceptance are all drafter retrains, and DFlash is the *shipped* head for this
+NVFP4 checkpoint — retraining it means forking poolside's artifact on hardware we do not have.
+The measurement moved the fix from out-of-scope to in-scope.

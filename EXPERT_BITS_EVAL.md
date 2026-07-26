@@ -74,8 +74,61 @@ it measures quality at constant bandwidth. A real 3.0 bpw win requires the trell
 kernel, and the case for building that rests on a capability number that does not exist yet for
 any MoE at these bit-widths.
 
+## The distortion bridge: how pessimistic is the RTN proxy? (`tools/trellis_vs_rtn.py`)
+
+"RTN is a pessimistic proxy for trellis" was an assertion. Without a number it is useless: a pass
+on RTN could not be converted into a statement about trellis, and a failure could not be
+attributed — we would not know whether 3 bits is too few or whether RTN is simply a bad code.
+
+So the trellis was actually built: a Viterbi-optimal trellis-coded quantizer with a hashed
+Gaussian codebook over a 10-bit state (the QTIP shape — the state shifts in `bits` new bits per
+weight, so reconstruction levels depend on neighbours and the effective codebook is far larger
+than 2^bits). Run on **real expert matrices**, against the same per-16 E4M3 scale structure, so
+the only thing varying is the code:
+
+| code | payload bits | rel. Frobenius error | sd (n=6) |
+|---|---:|---:|---:|
+| NVFP4 as shipped | 4.00 | 0 (reference) | — |
+| **trellis** | **3.00** | **0.1396** | 0.0006 |
+| RTN 7 levels | 2.81 | 0.2204 | 0.0106 |
+| trellis | 2.00 | 0.2760 | 0.0013 |
+| RTN 5 levels | 2.32 | 0.3146 | 0.0163 |
+
+Two things fall out.
+
+**The proxy is pessimistic by a wide margin, and now it is quantified.** Trellis at 3.00 bits has
+**37 % lower error** than the RTN-7 the sweep is scoring, at only 0.19 bits more rate. Fitting the
+RTN points gives 6.32 dB/bit; the trellis is 3.97 dB better at +0.19 bits, so the code itself is
+worth **≈0.43 bits equivalent** — trellis@3.0 lands where RTN would need ~3.2–3.4 bits.
+
+**Ordering is what matters operationally:** `trellis@3.0 < RTN@2.81 < trellis@2.0 < RTN@2.32`.
+So if the sweep says RTN-7 holds up, **trellis at 3.0 bpw holds up with room to spare** — that is
+the shipping configuration, and it is strictly the better code at strictly higher rate. Note also
+that trellis@**2.0** beats RTN@2.32, which puts a genuine 2-bit expert path on the map.
+
+0.43 bits is a **lower bound on the trellis advantage**, deliberately: the state is only 10 bits
+(short constraint length), no Hadamard incoherence transform was applied, and the source is
+already-NVFP4-discretized values, which is a poorly-behaved source for a Gaussian codebook. EXL3
+in its real configuration has all three working in its favour. Theory says the recoverable gap is
+nearer a full bit.
+
 ## Next
 
-AIME / GPQA-Diamond, scored as **time-to-correct-answer with generated-token counts**, comparing
-baseline against 7 and 5 levels. RTN in-container is a *pessimistic* proxy for EXL3 trellis at
-similar payload bits, so a pass here is strong evidence for trellis and a fail is not fatal to it.
+The capability sweep (`tools/run_capability_sweep.sh`, `tools/eval_capability.py`) — GSM8K n=150
+as the primary discriminator (±3 % error bars, short traces) and AIME-2024 n=30 as the
+hard-reasoning secondary (±9 %, only detects a large drop) — scored as **time-to-correct-answer**:
+
+    s_per_correct = total_wall_seconds / n_correct
+
+Seconds, not accuracy alone, because the whole point of dropping bits is speed: a config 15 %
+faster per token that needs 30 % more reasoning tokens to arrive is a **loss**, and an
+accuracy-only score hides that. Truncated traces are scored wrong on purpose.
+
+Budgets were sized from measured trace lengths on this model (AIME ran 588 → 3459 tokens with a
+tail past 14 k), not guessed — the first attempt used 2048 and truncated everything.
+
+**Operational note — the box OOM'd once during this work.** Reading the 57 GB checkpoint leaves
+~68 GB in a cache that `MemAvailable` does **not** count, so the next server boot sees ~48 GB
+"available", the kernel hands out free pages instead of reclaiming, and the box dies. A probe
+confirmed only 42 GB was allocatable in that state; `echo 3 > /proc/sys/vm/drop_caches` takes it
+straight back to ~118 GB. The sweep now does this between every config.

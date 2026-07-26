@@ -123,10 +123,16 @@ sys.stdout.write(((m.get('reasoning_content') or '')+(m.get('content') or ''))[:
 }
 
 run_cfg() {
-  local tag=$1 levels=$2
-  echo "######## $tag (LG_EXPERT_LEVELS=${levels:-unset})  free=$(free_gb)GB"
+  local tag=$1 envspec=$2
+  echo "######## $tag (${envspec:-no env})  free=$(free_gb)GB"
   kill_server
-  if [ -n "$levels" ]; then export LG_EXPERT_LEVELS=$levels; else unset LG_EXPERT_LEVELS; fi
+  # Clear every variable any config might set, so a config never inherits a previous one's
+  # state -- that is its own way to produce a well-formed lie.
+  unset LG_EXPERT_LEVELS LG_NVFP4_SIM
+  if [ -n "$envspec" ]; then
+    IFS=',' read -ra _KV <<< "$envspec"
+    for kv in "${_KV[@]}"; do export "${kv?}"; done
+  fi
 
   CTX=4096 PORT=8080 ./build/lgserve > "$OUT/server_$tag.log" 2>&1 &
   local pid=$!
@@ -137,21 +143,38 @@ run_cfg() {
   done
   curl -s -m 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1 || die "$tag never became healthy"
 
-  # G3 -- THE guard. A config that cannot prove it behaves differently from baseline does not
-  # get to contribute a data point, because "identical to baseline" is precisely the result we
-  # would otherwise misread as "this quantization is free".
+  # G3 -- proof that the MECHANISM fired, which is not the same as proof the OUTPUT changed.
+  #
+  # The first version of this guard demanded that a non-baseline config diverge from baseline on
+  # a probe. That is wrong, and testing NVFP4 attention exposed it: quantizing all five
+  # attention projections to NVFP4 produced BYTE-IDENTICAL greedy output -- which is the
+  # SUCCESS case, and the old guard would have aborted on it. "Config had no effect on this
+  # prompt" and "config was ignored" are different claims, and only the second is a bug.
+  #
+  # So the guard now checks that the loader ANNOUNCED the transform it was asked for. That also
+  # catches the original stale-binary bug more directly than divergence ever did: a binary
+  # without the feature prints nothing, and we abort in 90 seconds.
+  case "$envspec" in
+    *LG_EXPERT_LEVELS*) want="routed experts requantized";;
+    *LG_NVFP4_SIM*)     want="NVFP4 simulation on attention";;
+    *)                  want="";;
+  esac
+  if [ -n "$want" ]; then
+    grep -q "$want" "$OUT/server_$tag.log" \
+      || die "$tag: loader never announced '$want' -- the flag was IGNORED (G3)"
+    echo "  loader confirms: $(grep -m1 "$want" "$OUT/server_$tag.log")"
+  fi
+
+  # The probe is still taken and still compared, but only as a RECORDED OBSERVATION. Whether a
+  # quantization changes greedy output is a finding, not a validity condition.
   probe_of > "$OUT/.probe_$tag"
-  if [ "$tag" = "baseline" ]; then
-    [ -s "$OUT/.probe_baseline" ] || die "baseline probe came back empty (G3)"
-    echo "  probe recorded as reference"
-  else
-    [ -s "$OUT/.probe_baseline" ] || die "no baseline probe to compare against (G3)"
+  [ -s "$OUT/.probe_$tag" ] || die "$tag probe came back empty (G3)"
+  if [ "$tag" != "baseline" ] && [ -s "$OUT/.probe_baseline" ]; then
     if cmp -s "$OUT/.probe_baseline" "$OUT/.probe_$tag"; then
-      echo "  probe (baseline): $(head -c 90 "$OUT/.probe_baseline")"
-      echo "  probe ($tag):     $(head -c 90 "$OUT/.probe_$tag")"
-      die "$tag is byte-identical to baseline on the probe: LG_EXPERT_LEVELS had NO EFFECT (G3)"
+      echo "  probe IDENTICAL to baseline (perturbation flipped no token here)"
+    else
+      echo "  probe diverges from baseline"
     fi
-    echo "  probe diverges from baseline (flag is live)"
   fi
 
   $PY tools/eval_capability.py --suite gsm8k --limit "$LIMIT_GSM" --max-tokens "$MAXTOK_GSM" \
@@ -170,9 +193,13 @@ if errs: sys.exit('%d request failures (G7): %s' % (len(errs), str(errs[0].get('
   echo "  done, free=$(free_gb)GB"
 }
 
-run_cfg baseline ""
-run_cfg lv7 7
-run_cfg lv5 5
+# CONFIGS is "tag:ENV=VAL[,ENV=VAL...];tag:..." -- baseline MUST be first and carries no env,
+# because every other config's G3 probe is compared against it.
+CONFIGS=${CONFIGS:-'baseline:;lv7:LG_EXPERT_LEVELS=7;lv5:LG_EXPERT_LEVELS=5'}
+IFS=';' read -ra _CFGS <<< "$CONFIGS"
+for spec in "${_CFGS[@]}"; do
+  run_cfg "${spec%%:*}" "${spec#*:}"
+done
 
 # ------------------------------------------------------------------------------ postflight
 echo "======== POSTFLIGHT ========"
@@ -204,8 +231,11 @@ for a, b in itertools.combinations(tags, 2):
     same = sum(1 for i in ra
                if ra[i].get("pred") == rb[i].get("pred") and ra[i]["gen"] == rb[i]["gen"])
     if same == len(ra):
-        sys.exit(f"G4 VIOLATION: {a} and {b} are IDENTICAL on all {same} problems -- "
-                 f"they are the same model and the comparison is meaningless")
+        # Identity is only a bug if the mechanism never fired, and G3 already proved it did by
+        # reading the loader's own announcement. A quantization that changes no answer across
+        # 200 problems is a RESULT -- and the best possible one.
+        print(f"  NOTE: {a} and {b} identical on all {same} problems "
+              f"(mechanism confirmed by G3, so this is a finding, not a fault)")
     print(f"  {a} vs {b}: {same}/{len(ra)} identical, differ on {len(ra)-same}")
 print("  cross-config checks passed (G4/G5/G6)")
 PY

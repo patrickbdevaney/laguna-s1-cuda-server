@@ -240,6 +240,11 @@ public:
             if (expert_lut_) printf("[loader] routed experts requantized to %d levels "
                                     "(%.2f bits payload)\n", lv, std::log2((double)lv));
         }
+        if (const char* e = getenv("LG_NVFP4_SIM")) {
+            nvfp4_sim_ = e;
+            if (!fp8_attn_) { fprintf(stderr, "LG_NVFP4_SIM needs the FP8 attention path\n"); std::abort(); }
+            printf("[loader] NVFP4 simulation on attention projections: %s\n", nvfp4_sim_.c_str());
+        }
         W_.L.resize(cfg_.n_layers);
         read_index();
         reserve();
@@ -500,7 +505,28 @@ private:
                         CUDA_CHECK(cudaMalloc(&q8_scratch_, need));
                         q8_scratch_bytes_ = need;
                     }
-                    CUDA_CHECK(cudaMemcpy(q8_scratch_, v.p, need, cudaMemcpyHostToDevice));
+                    // Optional NVFP4 SIMULATION on an attention projection. Rounds the BF16
+                    // weights onto the exact NVFP4 grid (E2M1 codes, per-16 E4M3 group scale,
+                    // per-tensor global scale) and then hands the result to the normal FP8
+                    // path, so the kernels are untouched and the measured delta is purely
+                    // capability. This is the same in-container trick used for the routed
+                    // experts, and for the same reason: it answers "can this projection
+                    // survive 4 bits" before anyone writes a W4A16 kernel for it.
+                    //
+                    // o_proj is the interesting case. It is 42.7% of the attention weight
+                    // bytes (+9.2% end-to-end if it can go to NVFP4), and it is the one place
+                    // where a per-head softplus gate -- which is UNBOUNDED -- is applied
+                    // immediately upstream, so quantization error here is multiplied by an
+                    // unbounded factor. That is a reason to measure it, not to assume either
+                    // outcome.
+                    const void* src_bf16 = v.p;
+                    if (!nvfp4_sim_.empty() && name_matches_sim(name)) {
+                        if (sim_buf_.size() < need / 2) sim_buf_.resize(need / 2);
+                        memcpy(sim_buf_.data(), v.p, need);
+                        nvfp4_roundtrip_rows(sim_buf_.data(), s.rows, s.K);
+                        src_bf16 = sim_buf_.data();
+                    }
+                    CUDA_CHECK(cudaMemcpy(q8_scratch_, src_bf16, need, cudaMemcpyHostToDevice));
                     quant_fp8_rows((uint8_t*)s.dst, (float*)s.scale,
                                    (const uint16_t*)q8_scratch_, s.rows, s.K, 0);
                     CUDA_CHECK(cudaGetLastError());
@@ -649,6 +675,89 @@ private:
     static constexpr uint8_t LUT5_[8] = {0,0,0,5,5,5,5,7};
     static constexpr uint8_t LUT3_[8] = {0,0,0,0,0,7,7,7};
     const uint8_t* expert_lut_ = nullptr;
+
+    // ---- NVFP4 simulation on attention projections (LG_NVFP4_SIM=o|q|k|v|g, comma-separated,
+    // or "all"). See the call site in stream() for why this exists.
+    std::string nvfp4_sim_;
+    std::vector<uint16_t> sim_buf_;
+
+    bool name_matches_sim(const std::string& n) const {
+        if (nvfp4_sim_ == "all") return n.find("self_attn.") != std::string::npos;
+        static const char* KEY[5] = {"q_proj", "k_proj", "v_proj", "o_proj", "g_proj"};
+        static const char  TAG[5] = {'q', 'k', 'v', 'o', 'g'};
+        for (int i = 0; i < 5; ++i)
+            if (n.find(KEY[i]) != std::string::npos &&
+                nvfp4_sim_.find(TAG[i]) != std::string::npos) return true;
+        return false;
+    }
+
+    static float bf16_to_f32(uint16_t b) {
+        unsigned u = (unsigned)b << 16; float f; memcpy(&f, &u, 4); return f;
+    }
+    static uint16_t f32_to_bf16(float f) {
+        unsigned u; memcpy(&u, &f, 4);
+        // round-to-nearest-even on the truncated mantissa
+        unsigned r = (u >> 16) & 1u;
+        u += 0x7FFFu + r;
+        return (uint16_t)(u >> 16);
+    }
+    // E4M3 round trip, by exhaustive search over the 256 codes. 256 candidates is nothing
+    // against being subtly wrong about a float format, and this runs once at load.
+    static float e4m3_rt(float x) {
+        if (x <= 0.f) return 0.f;
+        static float tbl[256]; static bool init = false;
+        if (!init) {
+            for (int c = 0; c < 256; ++c) {
+                int e = (c >> 3) & 0xF, m = c & 7;
+                float s = (c >> 7) ? -1.f : 1.f;
+                tbl[c] = e == 0 ? s * (m / 8.f) * powf(2.f, -6.f)
+                                : s * (1.f + m / 8.f) * powf(2.f, (float)(e - 7));
+            }
+            init = true;
+        }
+        float best = tbl[0], bd = fabsf(x - tbl[0]);
+        for (int c = 0; c < 128; ++c) {           // positive codes only
+            float d = fabsf(x - tbl[c]);
+            if (d < bd) { bd = d; best = tbl[c]; }
+        }
+        return best;
+    }
+
+    // Round rows onto the NVFP4 grid in place: E2M1 codes {0,.5,1,1.5,2,3,4,6} with sign,
+    // one E4M3 scale per 16 elements, one fp32 global scale per tensor.
+    void nvfp4_roundtrip_rows(uint16_t* w, int rows, int K) {
+        static const float E2M1[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        const int G = 16;
+        // Global scale so that every group scale (amax/6) lands inside E4M3's range. NVFP4
+        // divides amax by 6 precisely because 6 is E2M1's maximum; the global scale then keeps
+        // the per-group scale off E4M3's 448 ceiling. Getting this wrong silently halves every
+        // weight -- it did exactly that once, in the expert requantizer.
+        float amax_t = 0.f;
+        for (size_t i = 0; i < (size_t)rows * K; ++i) amax_t = fmaxf(amax_t, fabsf(bf16_to_f32(w[i])));
+        if (amax_t == 0.f) return;
+        const float gs = amax_t / (6.f * 448.f);
+        for (int r = 0; r < rows; ++r) {
+            uint16_t* row = w + (size_t)r * K;
+            for (int g0 = 0; g0 < K; g0 += G) {
+                const int n = (g0 + G <= K) ? G : (K - g0);
+                float amax = 0.f;
+                for (int i = 0; i < n; ++i) amax = fmaxf(amax, fabsf(bf16_to_f32(row[g0 + i])));
+                if (amax == 0.f) continue;
+                const float s_eff = e4m3_rt((amax / 6.f) / gs) * gs;   // quantized group scale
+                if (s_eff <= 0.f) continue;
+                for (int i = 0; i < n; ++i) {
+                    const float v = bf16_to_f32(row[g0 + i]);
+                    const float a = fabsf(v) / s_eff;
+                    int best = 0; float bd = fabsf(a - E2M1[0]);
+                    for (int c = 1; c < 8; ++c) {
+                        const float d = fabsf(a - E2M1[c]);
+                        if (d < bd) { bd = d; best = c; }
+                    }
+                    row[g0 + i] = f32_to_bf16(copysignf(E2M1[best] * s_eff, v));
+                }
+            }
+        }
+    }
     void* q8_scratch_ = nullptr; size_t q8_scratch_bytes_ = 0;
     bool fp8_attn_ = false;
     bool fp8_lmhead_ = false;

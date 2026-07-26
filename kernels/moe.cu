@@ -564,7 +564,17 @@ extern "C" void moe_gateup_rp(float* hbuf, const uint8_t* gp, const uint8_t* gs,
                               const int* ecount, const int* active, const int* nactive,
                               int nact_max, int H, int MI, int topk, int GRP, int maxtok,
                               float* part, cudaStream_t st) {
-    const int WY = 4;
+    // Threads per block, via the y dimension: RPNB(32) x WY. At the decode shape this kernel
+    // launches nact_max x MI/(RPNB*WY) blocks -- 80 at WY=4 -- and a streaming microbenchmark
+    // at exactly 80 blocks measures 213 GB/s with 128 threads and 249 with 256. The binding
+    // constraint on this part is resident threads per SM, not block count (bandwidth is flat
+    // from 240 blocks to 20000, so there is no wave-quantization effect to chase). Tunable
+    // because the same sweep that made this look obvious also showed the optimum moves with
+    // the kernel's structure.
+    static int WYENV = -1;
+    if (WYENV < 0) { const char* e = getenv("LG_MOE_WY"); WYENV = e ? atoi(e) : 4;
+                     if (WYENV != 1 && WYENV != 2 && WYENV != 4 && WYENV != 8) WYENV = 4; }
+    const int WY = WYENV;
     // KS only helps the DECODE shape. At verify M=k+1 the active-expert count already fills
     // the grid, and the split would just add partial traffic.
     static int KSENV = -1;

@@ -82,6 +82,7 @@ back-to-back A/B/A.
 | 29 | **`lm_head` BF16 → FP8 W8A16, per-output-row scale** | 29.55/29.42 | **30.61/30.57** | **WON +3.6 %**, greedy 8/8 |
 | 30 | **Shared experts + layer-0 dense BF16 → FP8** | 30.63/30.52 | **33.01/32.87** | **WON +7.8 %**, greedy 8/8 |
 | 31 | L2 `cudaAccessPropertyStreaming` hint on the weight arena | 31.35/31.17 | 31.23/31.15 | **NEUTRAL**, kept (free, and it documents the reasoning) |
+| 32 | MoE threads/block 128 → 256 (`LG_MOE_WY`) | 32.75 | 32.64/32.97 | **NEUTRAL**, default 4 |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 
@@ -587,6 +588,26 @@ Only helps M=1; at verify M=k+1 the active-expert count already fills the grid.
 Second-order: `o_proj` runs at 228 GB/s against `q_proj`'s 236 for identical bytes — N=3072
 with K=9216 gives 36 iterations per lane where q gives 12. Worth one sweep of the load width
 for that shape specifically.
+
+### -1. The 256-thread microbenchmark result does NOT transfer to the MoE kernel
+
+A streaming microbenchmark measured 213 GB/s at 80 blocks x 128 threads against 249 GB/s at
+80 blocks x 256 threads, which looked like a free +17 % on exactly our MoE gate/up shape.
+Measured end to end: **32.75 vs 32.64/32.97 — neutral.**
+
+The reason is worth keeping. That microbenchmark varied threads/block at a *fixed grid*, so it
+was really measuring **more total resident threads**. Our MoE kernel is thread-per-output with
+10240 outputs fixed by the problem (10 experts x 1024), so WY=8 gives 40 blocks of 256 threads
+where WY=4 gave 80 of 128 — **the same residency, just reshaped**. There is no free thread to
+add; getting more requires splitting K, which measured neutral for its own reason (#26: the
+partial traffic cancels the occupancy gain).
+
+**Generalisable:** a microbenchmark that varies one launch parameter at fixed grid is measuring
+*total threads*, not *threads per block*. Before transferring such a result, check whether the
+target kernel's thread count is free or fixed by its problem shape.
+
+(Also recorded: the first sample of that A/B read 15.16 tok/s against a true 32.75 — the DVFS
+ramp again. Every A/B here needs its first sample discarded.)
 
 ### 1. ~~Self-quantize the BF16 remainder~~ — **DONE. B_tok 10.044 → 6.251 GB, +52 % cumulative.**
 

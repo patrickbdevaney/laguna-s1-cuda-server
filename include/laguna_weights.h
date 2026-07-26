@@ -233,6 +233,13 @@ public:
         W_.fp8_attn = fp8_attn_;
         W_.fp8_lmhead = fp8_lmhead_;
         W_.fp8_dense = fp8_dense_;
+        if (const char* e = getenv("LG_EXPERT_LEVELS")) {
+            const int lv = atoi(e);
+            expert_lut_ = lv == 7 ? LUT7_ : lv == 5 ? LUT5_ : lv == 3 ? LUT3_ : nullptr;
+            if (!expert_lut_ && lv) { fprintf(stderr, "LG_EXPERT_LEVELS must be 7, 5 or 3\n"); std::abort(); }
+            if (expert_lut_) printf("[loader] routed experts requantized to %d levels "
+                                    "(%.2f bits payload)\n", lv, std::log2((double)lv));
+        }
         W_.L.resize(cfg_.n_layers);
         read_index();
         reserve();
@@ -501,8 +508,25 @@ private:
                 }
                 if (s.rp) {
                     if (rp_buf_.size() < s.bytes) rp_buf_.resize(s.bytes);
-                    if (s.rp == 1) repack_packed(rp_buf_.data(), (const uint8_t*)v.p, s.rows, s.K);
-                    else           repack_scale (rp_buf_.data(), (const uint8_t*)v.p, s.rows, s.K,
+                    // Optional expert requantization, applied to the E2M1 codes on the way in.
+                    // The scale is INHERITED and the container is unchanged, so the CUDA
+                    // kernels are untouched and the capability delta is measured at identical
+                    // speed. Doing it here rather than as a 57 GB requantized checkpoint means
+                    // the original weights are never an output path of anything.
+                    const uint8_t* src8 = (const uint8_t*)v.p;
+                    if (s.rp == 1 && expert_lut_) {
+                        if (lut_buf_.size() < v.n) lut_buf_.resize(v.n);
+                        const uint8_t* L = expert_lut_;
+                        for (size_t i = 0; i < v.n; ++i) {
+                            const uint8_t b = src8[i];
+                            lut_buf_[i] = (uint8_t)((b & 0x88) |            // signs
+                                                    (L[b & 0x07]) |         // low nibble mag
+                                                    (L[(b >> 4) & 0x07] << 4));
+                        }
+                        src8 = lut_buf_.data();
+                    }
+                    if (s.rp == 1) repack_packed(rp_buf_.data(), src8, s.rows, s.K);
+                    else           repack_scale (rp_buf_.data(), src8, s.rows, s.K,
                                                  cfg_.nvfp4_group);
                     CUDA_CHECK(cudaMemcpy(s.dst, rp_buf_.data(), s.bytes, cudaMemcpyHostToDevice));
                 } else {
@@ -614,6 +638,17 @@ private:
     std::set<std::string> filled_;
     std::vector<Fix> fixups_;
     std::vector<uint8_t> rp_buf_;
+    std::vector<uint8_t> lut_buf_;
+    // E2M1 magnitude-index remap for expert requantization. Values {0,.5,1,1.5,2,3,4,6}.
+    // Ties round AWAY from zero -- an argmin would break them toward zero and shrink every
+    // weight systematically.
+    //   7 levels {0,+-2,+-4,+-6}: 2.81 bits payload
+    //   5 levels {0,+-3,+-6}    : 2.32
+    //   3 levels {0,+-6}        : 1.58
+    static constexpr uint8_t LUT7_[8] = {0,0,4,4,4,6,6,7};
+    static constexpr uint8_t LUT5_[8] = {0,0,0,5,5,5,5,7};
+    static constexpr uint8_t LUT3_[8] = {0,0,0,0,0,7,7,7};
+    const uint8_t* expert_lut_ = nullptr;
     void* q8_scratch_ = nullptr; size_t q8_scratch_bytes_ = 0;
     bool fp8_attn_ = false;
     bool fp8_lmhead_ = false;

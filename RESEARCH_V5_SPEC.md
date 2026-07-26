@@ -370,7 +370,12 @@ each with a full distribution. That is a latent tree we currently flatten. Build
 positions 1–3 and applying EcoSpec's marginal-cost score would give the mechanism something to
 choose between for the first time. **But** §1 says our optimal M is 1–2, and a tree only helps if
 extra breadth is cheaper than extra depth — which it is not, since breadth grows the expert union
-just as depth does. **Recommend: do not pursue. Rank low.** Documented so it is not re-proposed.
+just as depth does. **Recommend: do not pursue *routing-aware re-ranking*. Rank low.** Documented so
+it is not re-proposed.
+*(Note the distinction from §5.3: building a tree at all is a separate question with a much larger
+prize — DDTree gets +25–60% acceptance length at T=0 with zero extra draft traffic — and is worth
+one more budget sweep. What is dead is EcoSpec-style re-ranking of the tree's siblings by expert
+cost, not tree breadth itself.)*
 
 ### 4.5 Routing correlation via retraining — the ceiling, for calibration only
 
@@ -855,9 +860,37 @@ Only the first is a research finding:
 * **"Our E_frac curve is unpublished and uniquely correlated."** **REFUTED** (§4.1, §4.2). What
   survives is narrower and still valuable: no published *cost model* carries the correlation (§4.3).
 * **Could not refute:** that `cost(M)` genuinely is ~3.0 at M=5 (it is a measurement; §2 attacks its
-  *attribution*, not its value). Also could not resolve the contradiction in §7.4 — one paper reports
-  chat outperforming code on acceptance length, the opposite of our measurement, and I could not
-  extract its numbers.
+  *attribution*, not its value). Also could not resolve the contradiction in §7.2 item 4 — one paper
+  (arXiv 2604.14682) reports chat outperforming code on acceptance length, the opposite of our
+  measurement and of WhiFlash's DFlash numbers, and I could not extract its table. Its target is a
+  7B GPTQ model with a 1.1B drafter, so it is probably a drafter-family artefact, but it is
+  unresolved.
+
+**Two further novelty claims that survived checking:**
+* **Nobody models MoE expert-activation cost in an adaptive-draft-length or verification-rule
+  paper.** Every adaptive-M cost model found (SpecDec++, DISCO, AdaEDL, BanditSpec, SmartSpec, D-cut,
+  CaDDTree) is a flat draft-vs-verify latency ratio. Our `19.6·E_frac(M)` term has no counterpart.
+  Corollary: every published magnitude was measured in the regime `verify ≫ draft`
+  (SpecDec++ measures `c₂/c₁ ≈ 3.76`); ours is the inverse. **Directions transfer, magnitudes do not.**
+* **Nobody has applied Block Verification to a factorised block-diffusion drafter.** DDTree states
+  the factorisation `Q = ∏ q_i` explicitly and does not cite Sun et al. at all. §5.1 shows the
+  substitution is exact rather than approximate, and the `min(∏) ≥ ∏(min)` gap should be *largest*
+  for a factorised drafter (frequent `q−b` sign flips across positions, plus the weak-drafter effect
+  in Traversal Verification's Table 3). Gated on T > 0.
+
+**Provenance warning.** Two independent extraction passes disagreed on Sun et al.'s Table 1
+(mine, from `pdftotext` on the v2 PDF: +8.30% block efficiency / +6.49% wall-clock average; the
+other: +1.48–2.83%). Mine reconciles with the abstract's "5%–8%"; the other does not. Separately,
+early PDF-only extractions in the parallel pass produced at least one *fabricated* range that the
+HTML later contradicted. **Re-verify any number in this document before building on it**, and prefer
+the open-model replications (Traversal Verification's A6000 chain columns, the Spec-Bench
+leaderboard) over the PaLM-2 numbers, which state neither hardware, batch size, nor temperature.
+
+**Hardware caveat that applies to the whole document.** Nothing here was measured on Jetson /
+Orin / Thor-class silicon. Every number is A100 / H100 / H200 / H20 / B200 / A6000 / A800 /
+RTX 3090 / RTX 6000 Ada. The two nearest analogues are Cascade (RTX 6000 Ada, single GPU, batch 1,
+explicitly data-movement-bound) and Lookahead's measured A100 → RTX 3090 degradation. **On 20 SMs,
+expect every tree/breadth optimum to be far smaller and every FLOP-surplus technique to fail.**
 
 ---
 
@@ -882,3 +915,42 @@ Acceptance dynamics across cognitive domains — https://arxiv.org/abs/2604.1468
 AdaEDL — https://arxiv.org/pdf/2410.18351 ·
 HiSpec — https://arxiv.org/abs/2510.01336 ·
 Cohere, "Why MoE Models Get More From Speculative Decoding" — https://cohere.com/blog/mixture-of-experts-models-get-more-from-speculative-decoding
+
+**Block-diffusion drafters (our drafter class):**
+DFlash — https://arxiv.org/html/2602.06036v2 · poolside/Laguna-S-2.1-DFlash on HF ·
+DDTree — https://arxiv.org/html/2604.12989 ·
+CaDDTree — https://arxiv.org/abs/2606.01813 ·
+BlockPilot — https://arxiv.org/abs/2606.31315 ·
+WhiFlash (AR ↔ diffusion routing) — https://arxiv.org/abs/2606.07710 ·
+Speculative Diffusions via Block Verification — https://arxiv.org/abs/2606.13426 *(continuous
+diffusion, not discrete — title is a false friend; 6.3% headline)*
+
+**Verification rules / multi-draft:**
+SpecTr-GBV — https://arxiv.org/html/2604.25925 ·
+Sequoia — https://arxiv.org/abs/2402.12374 ·
+EAGLE-2 — https://arxiv.org/html/2406.16858v1
+
+**Adaptive draft length:**
+SpecDec++ — https://arxiv.org/html/2405.19715v2 ·
+DISCO — https://arxiv.org/abs/2405.04304 ·
+BanditSpec — https://arxiv.org/abs/2505.15141 ·
+SVIP — https://arxiv.org/html/2411.18462v2 ·
+SmartSpec/TurboSpec — https://arxiv.org/abs/2406.14066 ·
+PEARL — https://arxiv.org/abs/2408.11850 ·
+DSDE — https://arxiv.org/abs/2509.01083 ·
+MetaSD — https://arxiv.org/abs/2604.05417 ·
+Nightjar — https://arxiv.org/abs/2512.22420
+
+**Drafter-free / weight-free:**
+Spec-Bench leaderboard — https://github.com/hemingkx/Spec-Bench/blob/main/Leaderboard.md ·
+SuffixDecoding — https://arxiv.org/abs/2411.04975 ·
+Token Recycling — https://arxiv.org/abs/2408.08696 ·
+SAM-Decoding — https://arxiv.org/abs/2411.10666 ·
+REST — https://arxiv.org/abs/2311.08252 ·
+PLD+ — https://arxiv.org/abs/2412.01447 ·
+Lookahead — https://arxiv.org/abs/2402.02057 *(ruled out)* ·
+Hierarchy Drafting — https://arxiv.org/abs/2502.05609 ·
+Hybrid Verified Decoding — https://arxiv.org/abs/2606.01019 ·
+Graft — https://arxiv.org/abs/2605.20104 ·
+CLLM — https://arxiv.org/abs/2403.00835 *(fine-tunes the target)* ·
+ELMoE-3D — https://arxiv.org/abs/2604.14626

@@ -132,6 +132,7 @@ __global__ void k_nomem_f8(const float* __restrict__ xg, float* __restrict__ out
     const int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, nwarp=(gridDim.x*blockDim.x)>>5;
     for(int row=warp;row<nrows;row+=nwarp){
         float acc=0.f, s=1.0009f;
+        #pragma unroll
         for(int c=0;c<CH_F8;++c){
             uint32_t r=seed^(uint32_t)(row*31+c); int kb=c*(16*32)+lane*16;
             #pragma unroll
@@ -154,10 +155,15 @@ __global__ void k_nomem_f4(const float* __restrict__ xg, float* __restrict__ out
     const int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, nwarp=(gridDim.x*blockDim.x)>>5;
     for(int row=warp;row<nrows;row+=nwarp){
         float acc=0.f;
+        #pragma unroll
         for(int c=0;c<CH_F4;++c){
-            uint32_t r=seed^(uint32_t)(row*31+c); int kb=c*(32*32)+lane*32; float sc=1.0009f;
+            uint32_t r=seed^(uint32_t)(row*31+c);
+            uint32_t sp=r&0xFFFFu;                       // stands in for the loaded group scales
+            float s0=__int_as_float((((sp&0x7Fu)>>3)+120u)<<23);
+            float s1=__int_as_float(((((sp>>8)&0x7Fu)>>3)+120u)<<23);
+            int kb=c*(32*32)+lane*32;
             #pragma unroll
-            for(int j=0;j<4;++j){ uint32_t v=r*(j+1);
+            for(int j=0;j<4;++j){ uint32_t v=r*(j+1); float sc=(j<2)?s0:s1;
                 #pragma unroll
                 for(int n=0;n<8;++n){ uint32_t c4=(v>>(4*n))&0xFu;
                     acc=fmaf(lut[c4&7u]*((c4&8u)?-sc:sc), sx[kb+j*8+n], acc); } }

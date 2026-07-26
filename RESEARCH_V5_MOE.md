@@ -342,6 +342,12 @@ So the certificate costs **one ninth** of the bytes of the thing it certifies.
    bf16 output. **The skip is then provably invisible in the emitted bf16 tensor** — bit-identical
    greedy output, no capability gate needed at all.
 
+Note the granularity falls out correctly on its own. `down`'s NVFP4 blocks run along its reduction
+axis (`MI`), so one E4M3 byte covers 16 consecutive *neurons* for one output row; bounding a group
+of 16 neurons costs `3072/16 = 192` bytes and yields a **group-of-16 decision** — which is exactly
+the skip granularity `k_moe_down_rp`'s layout wants (§1.5). The certificate and the memory layout
+agree without being forced to.
+
 **Arithmetic** (`f` = surviving mantissa fraction):
 
 | `f` | expert bytes | saved | % of `B_tok` | end-to-end |
@@ -933,4 +939,12 @@ Quantization:
 
 ### 9.C Expert caching / prefetch on unified memory
 
-*(delegated; appended below when received)*
+**Answered from first principles in §3.2b, which is stronger than a survey would be.** The
+literature survey (Mixtral-offloading, MoE-Infinity, Pre-gated MoE, SiDA-MoE, EdgeMoE, Fiddler,
+HOBBIT, ExpertFlow, Klotski, ProMoE, SwapMoE) is not needed to reach the verdict, because the
+verdict does not depend on any of their numbers: they all optimise a PCIe transfer we do not
+perform, and the residual L2 idea dies on `53.1 MB > 32 MB` with zero intra-token reuse. A citation
+cannot overturn a cache-capacity inequality. If a later pass wants the survey anyway, the specific
+thing worth extracting is **cross-layer expert prediction accuracy (top-k recall of layer L's
+routing from layer L−1's hidden state)** — not because it saves bytes, but because a high recall
+would be a second, independent handle on the `E_frac` correlation we measured and nobody else has.

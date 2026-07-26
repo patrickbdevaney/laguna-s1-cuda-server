@@ -244,6 +244,35 @@ struct Engine {
     // it dominates completely (2048 tokens at M=64 vs 39 tokens at M=1) and the percentages
     // describe prefill's bottleneck, not decode's.
     void prof_reset() { for (int i = 0; i < NCAT; ++i) { cat_ms[i] = 0; cat_n[i] = 0; } }
+
+    // ---- activation-sparsity dump. Off unless LG_DUMP_MOEH names a layer. Synchronous and slow
+    // by design: it is an instrument, never on a timed path.
+    int   dump_layer_ = -2;          // -2 = not yet resolved, -1 = disabled
+    FILE* dump_fp_ = nullptr;
+    std::vector<float> dump_host_;
+    void dump_moeh(int L, const float* d_h, long n, cudaStream_t st) {
+        if (dump_layer_ == -2) {
+            const char* e = getenv("LG_DUMP_MOEH");
+            dump_layer_ = e ? atoi(e) : -1;
+            if (dump_layer_ >= 0) {
+                const char* f = getenv("LG_DUMP_MOEH_FILE");
+                dump_fp_ = fopen(f ? f : "moeh.bin", "ab");
+                fprintf(stderr, "[dump] h=SiLU(gate)*up layer %d -> %s\n",
+                        dump_layer_, f ? f : "moeh.bin");
+            }
+        }
+        if (dump_layer_ < 0 || L != dump_layer_ || !dump_fp_) return;
+        // A synchronize or a memcpy inside a graph capture is illegal and aborts the process --
+        // which is exactly how the first dump run dumped core after 540 rows. The decode path is
+        // graph-captured, so ask rather than assume.
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(st, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone)
+            return;
+        if ((long)dump_host_.size() < n) dump_host_.resize(n);
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        CUDA_CHECK(cudaMemcpy(dump_host_.data(), d_h, n * 4, cudaMemcpyDeviceToHost));
+        fwrite(dump_host_.data(), 4, n, dump_fp_);
+    }
     void prof_report(int steps) {
         if (!prof) return;
         double tot = 0; for (int i = 0; i < NCAT; ++i) tot += cat_ms[i];
@@ -375,6 +404,14 @@ struct Engine {
                                moe_part, st);
                     f32_to_bf16(moe_hb, moe_h, (long)M * TK * MI, st);
                 }
+                // Optional dump of h = SiLU(gate)*up for the selected experts (LG_DUMP_MOEH=<layer>,
+                // LG_DUMP_MOEH_FILE=<path>). This is the gating measurement for intra-expert
+                // activation sparsity: the published 87-91% dormancy is measured on models with
+                // moe_intermediate >= 1408, and the ONE published model at our width of 1024
+                // (OLMoE) reached only ~50%. That single number is the difference between a
+                // +24.9% lever and a +12.4% one, so it has to be measured on THIS model rather
+                // than inherited. Raw f32, [M*TK][MI] per record, appended.
+                dump_moeh(L, moe_h, (long)M * TK * MI, st);
                 moe_down_rp(dpart, w.e_down_p, w.e_down_s, w.e_down_inv, moe_hb, elist, eoff,
                          ecount, active, nactive, nact, H, MI, c.nvfp4_group, (M == 1 ? 1 : 4), st);
                 if (efrac) {

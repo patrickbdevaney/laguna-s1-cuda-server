@@ -134,7 +134,7 @@ run_cfg() {
     for kv in "${_KV[@]}"; do export "${kv?}"; done
   fi
 
-  CTX=4096 PORT=8080 ./build/lgserve > "$OUT/server_$tag.log" 2>&1 &
+  CTX=4096 PORT=8080 tools/gpuexcl.sh ./build/lgserve > "$OUT/server_$tag.log" 2>&1 &
   local pid=$!
   for _ in $(seq 1 180); do
     curl -s -m 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break

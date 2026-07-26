@@ -125,3 +125,77 @@ speculation loses on prose.
 4. The remaining live byte lever is unchanged: **routed experts 4.5 → 3.0 bpw**, where the
    hardware question is already settled (Thor absorbs 16 ALU ops/word free) and only accuracy is
    open.
+
+---
+
+## F. Entropy coding — refuted again, this time against the steelman
+
+The first pass killed lossless coding on FP4 *entropy* (streams are statistically uniform, ~5 %).
+That left an objection standing: ZipServ deliberately uses a **fixed-length** code because
+"variable-length bitstreams break SIMT parallelism," and the Shannon-bound work aligns decode
+tiles to GEMM tiles so lanes stay independent — beating DFloat11/NeuZip by up to 11×. The
+earlier microbenchmark had only measured the *serial* Huffman chain, i.e. the weak form.
+
+Measured here on the MoE geometry with static shifts, no bitpos carry chain, independent shared-
+memory LUT lookups:
+
+| decode scheme | symbols / 32-bit word | GB/s | vs raw |
+|---|---:|---:|---:|
+| raw `uint4` stream | — | 239.5 | 100 % |
+| fixed-length, independent lookups | 1 | 239.5 | 100 % |
+| fixed-length | 4 | 178.4 | 74.5 % |
+| **fixed-length — a 7-bit FP8 code needs 4.57** | 5 | **172.2** | **71.9 %** |
+| fixed-length | 8 | 147.7 | 61.7 % |
+| serial Huffman | 5 | 99.5 | 41.5 % |
+
+The clean way to state it:
+
+> A compressed weight stream wins only if `rate_compressed / rate_raw > compression_ratio`.
+> At the ~4.6–5 symbols/word any useful FP8 code needs, this device delivers **0.719**.
+> ⇒ **you must compress below 72 % to break even.**
+> Measured entropy of our FP8 attention weights: 6.572/8 = **82.2 %.**
+
+Off by 14 points, and it loses in both forms — serial Huffman at true entropy is **+98 % time**,
+a fixed-length 7-bit code is **+22 % time**. This is a stronger claim than the literature
+supports in either direction: no lossless-LLM paper publishes raw decompressor GB/s, and every
+headline number is measured against a CPU-offload baseline rather than a resident model.
+
+**Closed for our weight streams in both the variable-length and fixed-length form.**
+
+## G. One of our own "dead on arrival" entries answers the wrong question
+
+`OPTIMIZATION_LOG.md` lists **"FP8/FP4 draft — collapsed τ 13.33 → 11.14"** as settled. That
+measurement was a *quantized drafter replacing the drafter*.
+
+**Cassandra** (arXiv 2605.26558) does something structurally different: the draft is the
+**target's own weights, pruned and mantissa-truncated**, with the verifier at full precision — so
+the output distribution is exactly the target's. Training-free, **2.41× over BF16**, and 1.81×
+more tokens than EAGLE-3 at equal memory.
+
+The distinction matters for us specifically because a draft synthesised from the target's weights
+reads bytes the verify is about to read anyway, which attacks `c` — the one parameter of ours
+that is ~7× the literature's. **This deserves re-litigating; the DOA entry does not cover it.**
+
+## H. Two gaps, stated rather than papered over
+
+* **Exact activation sparsity was not covered** in this pass (arXiv rate limits). Our own gemma
+  measurement — activations magnitude-dense, ≈0 % hard zeros — remains the best evidence we have,
+  and it says no.
+* **The number we actually need does not exist anywhere: 2-bit (or 3-bit) routed experts scored
+  on AIME / GPQA-Diamond for any MoE.** We would have to generate it.
+
+## I. A methodology requirement for the quantization work
+
+When we do evaluate 3.0 bpw routed experts, score it as **wall-clock time-to-correct-answer with
+generated-token counts reported**, not tok/s. Quantization can inflate the number of tokens a
+model needs to reach an answer, and a tok/s improvement that comes with a longer generation is
+not an improvement. This applies to every quality-gated change we make from here.
+
+## Revised ranking after all four passes
+
+1. **Fix the byte table** (see `COST_MODEL_CORRECTION.md`) — done.
+2. **Fuse the ~770 small kernels** — +3.2 %, exact.
+3. **Routed experts → 3.0 bpw** — +15.2 %, quality-gated, hardware question already settled.
+4. **Expert-union-aware drafting** — re-test at candidate surplus.
+5. **K4V4 on the global layers** — long-context only.
+6. ~~4-bit group-scale codebook~~ — repriced from +2.2 % to **+0.8 %**; demoted below fusion.

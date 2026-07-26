@@ -271,38 +271,70 @@ inline Result run(laguna::Weights& W, const Scheme& s, bool apply, int layer_str
 // The configurations this project evaluates. Everything here is exactly representable in the
 // shipped NVFP4 container, so the CUDA kernels are untouched and the speed is identical.
 // ---------------------------------------------------------------------------------------
-inline Scheme scheme_by_name(const std::string& n) {
+// Payload cost of a dense packing of an alphabet of `nlev` levels. These are EXACT packings a
+// CUDA kernel can actually decode, not ceil(log2 L) and not the entropy bound:
+//    3 levels -> 5 per byte     (3^5 = 243  <= 256)     1.600 b/w
+//    5 levels -> 2 per 5 bits   (5^2 =  25  <=  32)     2.500 b/w   (16 weights = 5 bytes)
+//    7 levels -> 1 per 3 bits   (one codeword unused)   3.000 b/w
+//    9 levels -> 5 per 16 bits  (9^5 = 59049 <= 65536)  3.200 b/w
+//   15 levels -> 1 per 4 bits                           4.000 b/w   (the shipped NVFP4)
+// The 7-level entry is deliberately conservative: 8 levels in 3 bits is what any real kernel
+// would do. A tighter 7-level packing exists (8 weights in 23 bits = 2.875 b/w, and the
+// entropy bound is 2.807) and is noted where it matters, but nothing is claimed from it.
+inline float payload_bits_for(int nlev) {
+    switch (nlev) {
+        case 3:  return 1.600f;
+        case 5:  return 2.500f;
+        case 7:  return 3.000f;
+        case 9:  return 3.200f;
+        case 11: return 3.500f;   // 11^2 = 121 <= 128, 2 per 7 bits
+        case 13: return 3.800f;   // 13^5 = 371293 <= 2^19, 5 per 19 bits
+        case 15: return 4.000f;
+        default: return 4.000f;
+    }
+}
+
+// Spec grammar:  "m1,m2,.../group"   e.g.  "1.5,3,6/128"
+// Magnitudes must be E2M1 values from {0.5,1,1.5,2,3,4,6}, ascending. "baseline/16" is the
+// shipped alphabet. Payload bits are derived from the level count; group is the new scale
+// group in weights.
+inline Scheme scheme_from_spec(const std::string& spec) {
     Scheme s;
-    auto set = [&](const char* nm, int nmag, std::initializer_list<int> codes, int grp, float pb) {
-        snprintf(s.name, sizeof s.name, "%s", nm);
-        s.nmag = nmag; s.group = grp; s.payload_bits = pb;
-        int i = 0; for (int c : codes) s.mag_code[i++] = c;
-    };
-    // baseline: the shipped alphabet, untouched. 4 + 8/16 = 4.500 bpw
-    if (n == "baseline")  set("baseline", 7, {1,2,3,4,5,6,7}, 16, 4.0f);
-    // 5 levels {0,+-m1,+-6}, group 16. 2.5 + 8/16 = 3.000 bpw
-    else if (n == "L5g16_15") set("L5g16_15", 2, {3,7}, 16, 2.5f);   // {1.5, 6}   ratio 4
-    else if (n == "L5g16_2")  set("L5g16_2",  2, {4,7}, 16, 2.5f);   // {2, 6}     ratio 3
-    else if (n == "L5g16_3")  set("L5g16_3",  2, {5,7}, 16, 2.5f);   // {3, 6}     ratio 2
-    else if (n == "L5g16_1")  set("L5g16_1",  2, {2,7}, 16, 2.5f);   // {1, 6}     ratio 6
-    // the same 5-level alphabet at group 32. 2.5 + 8/32 = 2.750 bpw
-    else if (n == "L5g32_15") set("L5g32_15", 2, {3,7}, 32, 2.5f);
-    else if (n == "L5g32_2")  set("L5g32_2",  2, {4,7}, 32, 2.5f);
-    else if (n == "L5g32_3")  set("L5g32_3",  2, {5,7}, 32, 2.5f);
-    // 8-level (3 bit) alternatives on the same bpw ladder
-    else if (n == "L7g16")  set("L7g16",  3, {2,4,7}, 16, 3.0f);     // 3.500 bpw
-    else if (n == "L7g32")  set("L7g32",  3, {2,4,7}, 32, 3.0f);     // 3.250 bpw
-    else if (n == "L7g64")  set("L7g64",  3, {2,4,7}, 64, 3.0f);     // 3.125 bpw
-    else if (n == "L7g128") set("L7g128", 3, {2,4,7}, 128, 3.0f);    // 3.063 bpw
-    else if (n == "L7g128b")set("L7g128b",3, {3,5,7}, 128, 3.0f);    // 3.063 bpw, {1.5,3,6}
-    // 3-level ternary
-    else if (n == "L3g16")  set("L3g16",  1, {7}, 16, 1.6f);         // 2.100 bpw
-    else if (n == "L3g32")  set("L3g32",  1, {7}, 32, 1.6f);         // 1.850 bpw
-    // 9-level (0 + 4 magnitudes), 5 codes per 16 bits: 9^5 = 59049 <= 65536 -> 3.2 bits
-    else if (n == "L9g32")  set("L9g32",  4, {2,3,4,7}, 32, 3.2f);   // 3.450 bpw
-    else if (n == "L9g64")  set("L9g64",  4, {2,3,4,7}, 64, 3.2f);   // 3.325 bpw
-    else { fprintf(stderr, "requant: unknown scheme '%s'\n", n.c_str()); abort(); }
+    size_t slash = spec.find('/');
+    std::string mags = spec.substr(0, slash);
+    s.group = (slash == std::string::npos) ? 16 : atoi(spec.c_str() + slash + 1);
+    if (mags == "baseline") {
+        s.nmag = 7;
+        for (int i = 0; i < 7; ++i) s.mag_code[i] = i + 1;
+    } else {
+        s.nmag = 0;
+        size_t p = 0;
+        while (p <= mags.size() && s.nmag < 7) {
+            size_t q = mags.find(',', p);
+            std::string t = mags.substr(p, q == std::string::npos ? std::string::npos : q - p);
+            if (!t.empty()) {
+                float v = (float)atof(t.c_str());
+                int code = -1;
+                for (int i = 1; i < 8; ++i) if (fabsf(e2m1_mag(i) - v) < 1e-4f) code = i;
+                if (code < 0) { fprintf(stderr, "requant: '%s' is not an E2M1 magnitude\n", t.c_str()); abort(); }
+                s.mag_code[s.nmag++] = code;
+            }
+            if (q == std::string::npos) break;
+            p = q + 1;
+        }
+    }
+    s.payload_bits = payload_bits_for(2 * s.nmag + 1);
+    snprintf(s.name, sizeof s.name, "%s", spec.c_str());
     return s;
+}
+
+inline Scheme scheme_by_name(const std::string& n) {
+    // The three configurations the end-to-end sweep runs. Chosen by measured rel_mse in
+    // tools/bits_calib.cu, not by assumption -- see EXPERT_BITS_EVAL.md.
+    if (n == "baseline") return scheme_from_spec("baseline/16");   // 4.500 bpw, applied as a no-op
+    if (n == "B30")      return scheme_from_spec("2,6/16");        // 3.000 bpw
+    if (n == "C275")     return scheme_from_spec("2,6/32");        // 2.750 bpw
+    return scheme_from_spec(n);
 }
 
 } // namespace lgrq

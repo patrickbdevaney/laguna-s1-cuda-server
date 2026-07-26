@@ -41,13 +41,18 @@ int main(int argc, char** argv) {
            W.arena_bytes / 1e9, W.load_seconds, (int)W.from_cache);
 
     std::vector<std::string> names;
-    if (argc > 1) for (int i = 1; i < argc; ++i) names.push_back(argv[i]);
-    else names = {"baseline",
-                  "L9g32", "L9g64",
-                  "L7g16", "L7g32", "L7g64", "L7g128", "L7g128b",
-                  "L5g16_1", "L5g16_15", "L5g16_2", "L5g16_3",
-                  "L5g32_15", "L5g32_2", "L5g32_3",
-                  "L3g16", "L3g32"};
+    if (argc > 1) { for (int i = 1; i < argc; ++i) names.push_back(argv[i]); }
+    else {
+        // magnitude search at a fixed group, then the group ladder for the winners
+        const char* m5[] = {"1,4","1.5,4","2,4","1,6","1.5,6","2,6","3,6","1,3","1.5,3","2,3"};
+        const char* m7[] = {"1,2,4","1,2,6","1,3,6","1.5,3,6","2,4,6","1.5,4,6","0.5,1.5,4",
+                            "1,2,3","0.5,1,2","1,1.5,2"};
+        const char* m3[] = {"2","3","4","6"};
+        names.push_back("baseline/16");
+        for (auto m : m5) names.push_back(std::string(m) + "/16");
+        for (auto m : m7) names.push_back(std::string(m) + "/16");
+        for (auto m : m3) names.push_back(std::string(m) + "/16");
+    }
 
     printf("%-12s %5s %6s %6s %10s %10s %9s %7s\n",
            "scheme", "lev", "grp", "bpw", "rel_mse", "rel_rms", "clipped", "sec");

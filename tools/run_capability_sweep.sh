@@ -68,9 +68,17 @@ echo "=== PREFLIGHT ==="
 
 # G10: a DRAM-saturating benchmark alongside would bias one config's tok/s against another's,
 # and tok/s is half the headline metric.
-pgrep -x lgserve >/dev/null && die "an lgserve is already running (G10)"
-for b in bench_trellis bench_trellis_v2 bench_decode bench_moe bench_ctx; do
-  pgrep -x "$b" >/dev/null && die "$b is running; it saturates DRAM and would bias timings (G10)"
+# NOTE: process names are truncated to 15 chars in /proc/<pid>/comm, so `pgrep -x` can never
+# match a longer binary name (bench_trellis_v2 is 16). Walk /proc directly and match the
+# executable path, skipping this script's own pid so the check cannot self-match.
+for pd in /proc/[0-9]*; do
+  pid=${pd#/proc/}
+  [ "$pid" = "$$" ] && continue
+  exe=$(readlink "$pd/exe" 2>/dev/null) || continue
+  case "${exe##*/}" in
+    bench_*|lgserve)
+      die "${exe##*/} (pid $pid) is running; it saturates DRAM and would bias timings (G10)";;
+  esac
 done
 
 # G1: never trust build/ to match src/. This is the bug that invalidated the first run.

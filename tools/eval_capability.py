@@ -110,6 +110,27 @@ def _sub(out, limit):
     return out
 
 
+def ask_retry(url, prompt, max_tokens, timeout, tries=3):
+    """Bounded retry on transient server errors.
+
+    One request in 200 came back HTTP 500 during a run and was not reproducible afterwards --
+    the same prompt succeeded 5/5 with byte-identical output. A single transient should not
+    discard 199 good problems, but it must not be invisible either: the retry count is recorded
+    per row and summed into the summary, and a problem that exhausts its tries is still a hard
+    error that G7 rejects the whole config for. Retrying is for flakiness, not for hiding a
+    server that is actually broken.
+    """
+    last = None
+    for k in range(tries):
+        try:
+            d, sec = ask(url, prompt, max_tokens, timeout)
+            return d, sec, k
+        except Exception as e:
+            last = e
+            time.sleep(2.0 * (k + 1))
+    raise last
+
+
 def ask(url, prompt, max_tokens, timeout):
     body = json.dumps({"messages": [{"role": "user", "content": prompt}],
                        "max_tokens": max_tokens, "temperature": 0.0}).encode()
@@ -137,7 +158,7 @@ def main():
     print(f"[{a.tag}/{a.suite}] {len(tasks)} problems, max_tokens={a.max_tokens}", flush=True)
     for i, t in enumerate(tasks):
         try:
-            d, sec = ask(a.url, t["prompt"], a.max_tokens, a.timeout)
+            d, sec, nretry = ask_retry(a.url, t["prompt"], a.max_tokens, a.timeout)
         except Exception as e:
             print(f"  {i+1:3d}/{len(tasks)} {t['id']:12s} REQUEST FAILED {type(e).__name__}: {e}",
                   flush=True)
@@ -161,7 +182,7 @@ def main():
         ok = (pred is not None) and (pred == t["gold"])
         wall += sec
         rows.append(dict(id=t["id"], ok=ok, pred=pred, gold=t["gold"], sec=sec, gen=gen,
-                         tps=tps, trunc=trunc))
+                         tps=tps, trunc=trunc, retries=nretry))
         print(f"  {i+1:3d}/{len(tasks)} {t['id']:12s} {'OK ' if ok else '   '} "
               f"pred={str(pred):>4s} gold={t['gold']:>4s} {gen:5d}tok {sec:6.1f}s "
               f"{tps:5.1f}tok/s{' TRUNC' if trunc else ''}", flush=True)
@@ -179,6 +200,7 @@ def main():
         total_gen_tokens=sum(gens),
         mean_tok_s=(sum(tpss) / len(tpss)) if tpss else 0,
         truncated=sum(1 for r in rows if r.get("trunc")),
+        retries=sum(r.get("retries", 0) for r in rows),
         max_tokens=a.max_tokens,
     )
     with open(a.out, "w") as f:
@@ -186,7 +208,8 @@ def main():
     print(f"[{a.tag}/{a.suite}] acc {nc}/{n} = {summary['accuracy']:.3f}   "
           f"wall {wall:.0f}s   S/CORRECT {summary['s_per_correct']:.1f}   "
           f"mean_gen {summary['mean_gen_tokens']:.0f}tok   "
-          f"{summary['mean_tok_s']:.1f}tok/s   trunc {summary['truncated']}", flush=True)
+          f"{summary['mean_tok_s']:.1f}tok/s   trunc {summary['truncated']}   "
+          f"retries {summary['retries']}", flush=True)
 
 
 if __name__ == "__main__":

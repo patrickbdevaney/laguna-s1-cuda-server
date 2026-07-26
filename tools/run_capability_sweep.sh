@@ -15,10 +15,22 @@ OUT=${OUT:-eval_out}
 # hard-reasoning secondary (n=30 -> +-9%, only detects a large drop). Budgets are sized from
 # measured trace lengths on this model: AIME ran 588-3459 tokens with a tail past 14k, GSM8K
 # is roughly a tenth of that.
-LIMIT_GSM=${LIMIT_GSM:-150}
-LIMIT_AIME=${LIMIT_AIME:-30}
-MAXTOK_GSM=${MAXTOK_GSM:-2048}
-MAXTOK_AIME=${MAXTOK_AIME:-12288}
+# Sized from the measured trace distribution on THIS model (n=58 baseline samples):
+# p50=221 tok, p75=727, then a DIVERGENT tail -- raising the budget 1536 -> 2048 rescued only
+# 2 of 58 problems. The tail does not converge, it runs away, so a bigger budget buys almost no
+# extra correct answers and costs a great deal of wall-clock. 1024 keeps 77% of traces whole at
+# a third of the tail cost.
+#
+# Truncation counts as WRONG, and that is the metric, not a compromise. Every config faces the
+# identical budget on the identical problems, so "started rambling instead of answering" is
+# exactly the degradation being hunted, and a tighter budget makes the test MORE sensitive to
+# it, not less.
+#
+# AIME is dropped: n=30 gives +-9% binomial error, too coarse to resolve an effect that would
+# change a ship decision, and its traces run past 14k tokens. Worse instrument, several times
+# the cost.
+LIMIT_GSM=${LIMIT_GSM:-200}
+MAXTOK_GSM=${MAXTOK_GSM:-1024}
 PY=oracle-venv/bin/python
 mkdir -p "$OUT"
 
@@ -42,7 +54,7 @@ run_cfg() {
   echo "################ $tag (LG_EXPERT_LEVELS=${levels:-unset})  free=$(free_gb)GB"
   kill_server
   if [ -n "$levels" ]; then export LG_EXPERT_LEVELS=$levels; else unset LG_EXPERT_LEVELS; fi
-  CTX=16384 PORT=8080 ./build/lgserve > "$OUT/server_$tag.log" 2>&1 &
+  CTX=4096 PORT=8080 ./build/lgserve > "$OUT/server_$tag.log" 2>&1 &
   local pid=$!
   for _ in $(seq 1 180); do
     curl -s -m 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
@@ -54,8 +66,6 @@ run_cfg() {
 
   $PY tools/eval_capability.py --suite gsm8k --limit "$LIMIT_GSM" --max-tokens "$MAXTOK_GSM" \
       --timeout 600 --tag "$tag" --out "$OUT/${tag}_gsm8k.json"
-  $PY tools/eval_capability.py --suite aime --limit "$LIMIT_AIME" --max-tokens "$MAXTOK_AIME" \
-      --timeout 1800 --tag "$tag" --out "$OUT/${tag}_aime.json"
   kill_server
   echo "  done, free=$(free_gb)GB"
 }

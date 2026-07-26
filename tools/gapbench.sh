@@ -9,7 +9,7 @@ while true; do
     # No server: either a gap, or the sweep is finished. Either way it is safe to measure.
     sleep 2
     if ! pgrep -x lgserve >/dev/null 2>&1; then
-      ./build/bench_trellis 1024 > trellis_bench.log 2>&1
+      ./build/bench_trellis_v2 > trellis_bench.log 2>&1
       echo "ran at $(date -Is)" >> trellis_bench.log
       exit 0
     fi

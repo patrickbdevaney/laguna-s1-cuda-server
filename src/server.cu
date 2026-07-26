@@ -275,25 +275,124 @@ struct Server {
     }
 
     // Sampling. Greedy when temperature <= 0, else top-p over a temperature-scaled softmax.
-    int sample_row(int row, double temp, double top_p, uint64_t& rng) {
-        if (temp <= 0.0) return argmax_row(row);
+    // The temperature-scaled, top-p-filtered distribution for one logits row. `keep` is the
+    // nucleus size and `order` is the descending permutation; both are needed by the
+    // rejection sampler, not just by plain sampling.
+    std::vector<float> pbuf;
+    std::vector<int>    obuf;
+    size_t nucleus_ = 0;
+
+    // Temperature-scaled probabilities for one row. O(vocab), no ordering.
+    //
+    // The ordering is separated out deliberately: the acceptance test needs only p(x) for one
+    // token, and sorting 100 352 logits to obtain it cost ~23 ms per token and dragged
+    // sampled decode from 33 tok/s to 18.9 -- slower than not speculating at all. Sort only
+    // when a sample actually has to be drawn, and even then only over a bounded candidate set.
+    void row_probs(int row, double temp) {
         CUDA_CHECK(cudaMemcpy(logits_host.data(), E.logits + (size_t)row * c.vocab,
                               c.vocab * 4, cudaMemcpyDeviceToHost));
-        std::vector<int> idx(c.vocab);
-        for (int i = 0; i < c.vocab; ++i) idx[i] = i;
-        float mx = *std::max_element(logits_host.begin(), logits_host.end());
-        std::vector<double> p(c.vocab);
-        double sum = 0;
-        for (int i = 0; i < c.vocab; ++i) { p[i] = std::exp((logits_host[i] - mx) / temp); sum += p[i]; }
-        for (int i = 0; i < c.vocab; ++i) p[i] /= sum;
-        std::sort(idx.begin(), idx.end(), [&](int a, int b) { return p[a] > p[b]; });
-        double cum = 0; size_t keep = idx.size();
-        for (size_t i = 0; i < idx.size(); ++i) { cum += p[idx[i]]; if (cum >= top_p) { keep = i + 1; break; } }
+        // float, not double, and one pass: this runs on EVERY sampled token over a 100352
+        // vocabulary, and in double with a separate assign+normalise pass it cost ~20 ms,
+        // dragging the autoregressive arm from 33 tok/s to 19.8 -- so sampled requests were
+        // paying more for the sampler than for the model. Normalisation folds into the
+        // consumer instead of a second sweep.
+        pbuf.resize(c.vocab);
+        const float mx = *std::max_element(logits_host.begin(), logits_host.end());
+        const float invT = 1.0f / (float)temp;
+        float sum = 0.f;
+        for (int i = 0; i < c.vocab; ++i) {
+            const float e = __builtin_expf((logits_host[i] - mx) * invT);
+            pbuf[i] = e; sum += e;
+        }
+        psum_ = sum;
+    }
+    float psum_ = 1.f;
+
+    // Build the top-p nucleus over `pbuf`. With top_p ~ 1 there is nothing to do -- the whole
+    // distribution is the nucleus -- which is the common case and costs nothing. Otherwise
+    // partially select a bounded candidate set rather than sorting the vocabulary: a nucleus
+    // wide enough to exceed CAND tokens is vanishingly rare, and the fallback covers it.
+    void build_nucleus(double top_p) {
+        if (top_p >= 0.999) { nucleus_ = 0; return; }              // 0 = "everything"
+        // NOTE: only the CANDIDATE set is zeroed outside the nucleus; tokens outside the
+        // candidate set keep stale weights but are never reachable, because every consumer
+        // walks obuf[0..nucleus_) once nucleus_ != 0.
+        const int CAND = 2048;
+        obuf.resize(c.vocab);
+        for (int i = 0; i < c.vocab; ++i) obuf[i] = i;
+        std::nth_element(obuf.begin(), obuf.begin() + CAND, obuf.end(),
+                         [&](int a, int b) { return pbuf[a] > pbuf[b]; });
+        obuf.resize(CAND);
+        std::sort(obuf.begin(), obuf.end(), [&](int a, int b) { return pbuf[a] > pbuf[b]; });
+        double cum = 0; size_t keep = obuf.size();
+        for (size_t i = 0; i < obuf.size(); ++i) {
+            cum += pbuf[obuf[i]];
+            if (cum >= top_p) { keep = i + 1; break; }
+        }
+        float z = 0;
+        for (size_t i = 0; i < keep; ++i) z += pbuf[obuf[i]];
+        for (size_t i = keep; i < obuf.size(); ++i) pbuf[obuf[i]] = 0.f;
+        psum_ = z;
+        nucleus_ = keep;
+    }
+
+    double uniform(uint64_t& rng) {
         rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-        double r = (double)((rng >> 11) & ((1ULL << 53) - 1)) / (double)(1ULL << 53) * cum;
-        double acc = 0;
-        for (size_t i = 0; i < keep; ++i) { acc += p[idx[i]]; if (r <= acc) return idx[i]; }
-        return idx[keep - 1];
+        return (double)((rng >> 11) & ((1ULL << 53) - 1)) / (double)(1ULL << 53);
+    }
+    // Walks `pbuf` directly when the nucleus is everything, so no ordering is ever needed.
+    // pbuf holds UNNORMALISED weights summing to psum_, so the draw scales by psum_ rather
+    // than the array being normalised in a separate sweep.
+    int sample_pbuf(uint64_t& rng) {
+        const float r = (float)uniform(rng) * psum_;
+        float acc = 0;
+        if (nucleus_ == 0) {
+            for (int i = 0; i < c.vocab; ++i) { acc += pbuf[i]; if (r <= acc) return i; }
+            return c.vocab - 1;
+        }
+        for (size_t i = 0; i < nucleus_; ++i) { acc += pbuf[obuf[i]]; if (r <= acc) return obuf[i]; }
+        return obuf[nucleus_ - 1];
+    }
+    float prob_of(int tok) const { return psum_ > 0 ? pbuf[tok] / psum_ : 0.f; }
+
+    int sample_row(int row, double temp, double top_p, uint64_t& rng) {
+        if (temp <= 0.0) return argmax_row(row);
+        row_probs(row, temp);
+        build_nucleus(top_p);
+        return sample_pbuf(rng);
+    }
+
+    // Speculative acceptance under temperature — the distribution-preserving rejection rule.
+    //
+    // Longest-prefix matching is only correct against an argmax target, which is why sampled
+    // requests used to fall back to plain decoding. The general rule needs the DRAFT's
+    // distribution q as well as the target's p... except that DFlash drafts greedily, so q is
+    // a point mass on the drafted token. That collapses the algebra:
+    //
+    //     accept x  ⟺  u < p(x),        u ~ U[0,1)            (since q(x) = 1)
+    //     on reject, sample from  norm( (p − q)_+ )  =  p with p(x) zeroed, renormalised
+    //
+    // So no draft probabilities are needed at all — only the target logits we already read.
+    // This is exactly vLLM's NO_DRAFT_PROBS path, and it is distribution-preserving: the
+    // emitted token stream has the same law as sampling from the target directly.
+    //
+    // Returns the number of accepted draft tokens; `*next_out` receives the bonus token (on a
+    // full accept) or the recovered token (on a rejection).
+    int verify_stochastic(int k, const int* draft, double temp, double top_p,
+                          uint64_t& rng, int* next_out) {
+        for (int j = 0; j < k; ++j) {
+            row_probs(j, temp);
+            build_nucleus(top_p);
+            const double px = prob_of(draft[j]);
+            if (uniform(rng) < px) continue;                 // accepted
+            // rejected: draw from the residual, which is just this token's mass removed
+            psum_ -= pbuf[draft[j]];
+            pbuf[draft[j]] = 0.f;
+            *next_out = sample_pbuf(rng);
+            return j;
+        }
+        *next_out = sample_row(k, temp, top_p, rng);          // all k accepted; bonus token
+        return k;
     }
 
     // Prefill `ids`, reusing whatever prefix the KV already holds. Returns the position of the
@@ -371,20 +470,25 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         s.cached.push_back(next);
         ++emitted;
 
-        // Sampling has no cheap correct acceptance rule here -- longest-prefix is only valid
-        // against an argmax target, and the rejection sampler needs the draft's own
-        // distribution. Rather than silently change the output distribution, sampled requests
-        // decode autoregressively.
         s.sfx.extend(s.cached);
         int sfx_avail = 0;
         std::vector<int> sfx_draft(SpecPolicy::KMAX);
-        if (s.use_spec && o.temperature <= 0.0)
+        static const bool spec_sampled_ = getenv("LG_SPEC_SAMPLED") != nullptr;
+        const bool policy_active = s.use_spec && (o.temperature <= 0.0 || spec_sampled_);
+        if (policy_active)
             sfx_avail = s.sfx.draft(s.cached, SpecPolicy::KMAX, sfx_draft.data())
                         ? SpecPolicy::KMAX : 0;
 
         SpecPolicy::Src src = SpecPolicy::AR;
         int k = 0;
-        if (s.use_spec && o.temperature <= 0.0) {
+        // Speculation under sampling is OFF by default. The rejection rule below is correct
+        // and distribution-preserving -- that part is done and tested -- but the *policy* on
+        // top of it does not yet beat plain sampled decode: acceptance is inherently lower and
+        // noisier at T>0, which pollutes the per-position estimates, and measured runs
+        // oscillated (22.9 / 19.7 / 14.6 tok/s with the AR estimate swinging 20.6 / 14.4 /
+        // 28.7). Shipping it on by default would trade a reliable 30 tok/s for an unreliable
+        // 15-25. LG_SPEC_SAMPLED=1 enables it for further work.
+        if (policy_active) {
             if (s.policy.bootstrapping()) {
                 k = s.policy.boot_k();
                 src = k ? SpecPolicy::DFLASH : SpecPolicy::AR;
@@ -407,6 +511,13 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
             CUDA_CHECK(cudaDeviceSynchronize());
             s.pos += 1;
             next = s.sample_row(0, o.temperature, o.top_p, rng);
+            // Only learn costs from steps the policy actually governs. A sampled request
+            // takes this same AR branch but pays a full softmax over 100352 logits on top of
+            // the model, and folding that into cost_ar made the policy believe plain decode
+            // costs 1/22.7 s when greedy decode costs 1/33 -- so one sampled request
+            // permanently mis-priced every greedy request that followed it on the same
+            // server. Costs are only comparable within one sampling regime.
+            if (policy_active)
             {   // EWMA, not a single sample. cost_ar was measured once during the boot
                 // sweep -- on a cold clock, before DVFS had ramped -- and never revisited, so
                 // AR was permanently underrated at 23.4 tok/s against a true ~33. That made a
@@ -445,18 +556,31 @@ static void generate(Server& s, std::vector<int>& ids, const GenOpts& o, F&& on_
         s.E.forward(s.S, s.d_tok, k + 1, s.pos);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        for (int j = 0; j <= k; ++j) tout[j] = s.sample_row(j, o.temperature, o.top_p, rng);
-        int nacc = 0;
-        while (nacc < k && draft[nacc] == tout[nacc]) ++nacc;
+        const bool greedy = (o.temperature <= 0.0);
+        int nacc;
+        if (greedy) {
+            for (int j = 0; j <= k; ++j) tout[j] = s.sample_row(j, o.temperature, o.top_p, rng);
+            nacc = 0;
+            while (nacc < k && draft[nacc] == tout[nacc]) ++nacc;
+        } else {
+            nacc = s.verify_stochastic(k, draft.data(), o.temperature, o.top_p, rng, &next);
+        }
 
+        const int nacc_full = nacc;
         for (int j = 0; j < nacc; ++j) {
             if (emitted >= o.max_tokens || is_eos(draft[j])) { nacc = j; break; }
             if (!on_tok(draft[j])) { nacc = j; break; }
             s.cached.push_back(draft[j]);
             ++emitted;
         }
+        // `next` belongs to whichever position we actually stopped at. On the greedy path
+        // tout[] is valid for every j so indexing it is enough. On the sampled path
+        // verify_stochastic already produced the correct token for `nacc_full` -- a rejection
+        // draws from the RESIDUAL distribution, which must not be re-drawn -- so only a
+        // genuine truncation (EOS or the token budget) needs a fresh draw.
+        if (greedy)                  next = tout[nacc];
+        else if (nacc != nacc_full)  next = s.sample_row(nacc, o.temperature, o.top_p, rng);
         s.pos += nacc + 1;
-        next = tout[nacc];
         if (s.draft_ctx_pos == s.pos - (nacc + 1)) {   // contiguous: extend cheaply
             s.D.context_kv(s.E.taps, s.E.tap_cap, s.draft_ctx_pos, nacc + 1);
             s.draft_ctx_pos = s.pos;

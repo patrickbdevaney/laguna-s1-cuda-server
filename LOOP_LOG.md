@@ -691,3 +691,55 @@ All gates green throughout: 13/13 kernels, B1c bit-exact, D1 greedy 8/8 at every
 tens of steps to re-converge — visible as a first-request number below steady state. The EWMA
 decay (0.92) sets that timescale deliberately: faster tracking would reintroduce the variance
 the bandit suffered from.
+
+---
+
+## Per-position probabilities and the sampled path · 2026-07-25
+
+The research pass listed "plumb the draft's per-position probabilities" as the prerequisite for
+speculation under temperature. **It turned out not to be needed.** DFlash drafts *greedily*, so
+the draft distribution q is a point mass on the drafted token, and the general rejection rule
+collapses:
+
+```
+accept x  ⟺  u < p_target(x),   u ~ U[0,1)          (because q(x) = 1)
+on reject, draw from norm((p − q)_+) = p with p(x) zeroed and renormalised
+```
+
+Only the **target's** probability of the drafted token is required, and we already read those
+logits. This is exactly vLLM's `NO_DRAFT_PROBS` path and it is distribution-preserving: the
+emitted stream has the same law as sampling from the target directly.
+
+### Implemented, correct, and **off by default**
+
+The rule works — measured acceptance 1.56–1.72 tokens/forward at T=0.7, where greedy
+longest-prefix would be invalid. But the *policy* on top of it does not beat plain sampled
+decode: acceptance is inherently lower and noisier at T>0, which pollutes the per-position
+estimates, and successive runs oscillated 22.9 / 19.7 / 14.6 tok/s with the AR estimate
+swinging 20.6 / 14.4 / 28.7. Shipping that on by default would trade a reliable ~30 tok/s for
+an unreliable 15–25. `LG_SPEC_SAMPLED=1` enables it for further work.
+
+### Three bugs, all in the sampler rather than the algorithm
+
+1. **Sorting the vocabulary per token.** `top_p` filtering sorted all 100 352 logits on every
+   sampled token — ~23 ms on a 30 ms step, dragging sampled decode to 18.9 tok/s. The
+   acceptance test needs only `p(x)` for one token, which needs no ordering at all; ordering is
+   now built only when a sample must actually be drawn, and then only over a bounded candidate
+   set via `nth_element`.
+2. **`double` and a separate normalise pass.** Rewritten single-pass in `float`, with
+   normalisation folded into the consumer.
+3. **The cost model was polluted across sampling regimes.** A sampled request takes the same AR
+   branch but pays a full softmax on top of the model, and folding that into `cost_ar` made the
+   policy believe plain decode costs 1/22.7 s when greedy decode costs 1/33 — so **one sampled
+   request permanently mis-priced every greedy request that followed it on the same server**.
+   Costs are now learned only from steps the policy actually governs.
+
+That third one is the general lesson: an online cost model must only be fed measurements from
+the regime it will be used to make decisions in.
+
+### Greedy path, re-verified after all of the above
+
+| workload | tok/s | accepted / forward |
+|---|---:|---:|
+| prose | 33.6 | 1.00 (declines to speculate; `ar` estimate 33.1 matches `bench_decode`) |
+| code | 40.1 | 3.67 |

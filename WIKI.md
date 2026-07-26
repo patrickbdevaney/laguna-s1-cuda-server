@@ -283,3 +283,23 @@ tools/bench_server.sh           # served decode by workload
 Gates: `build/gate_kernels` (13), `gate_forward`, `gate_longctx` (B1c), `gate_dflash` (D1),
 `gate_tokenizer`, `gate_chat`. Benches: `bench_decode`, `bench_kernels`, `bench_moe`,
 `tools/tau_sweep.py` + `tools/tau_analyze.py`.
+
+---
+
+## 14. Corrections to this wiki
+
+**The attention line of the byte table was wrong by exactly 2×** — recorded as 1.403 GB where
+the true figure is **2.803 GB**. Verified from the shapes: 12 global layers at q/o 6144-wide plus
+36 sliding at 9216-wide, with k/v 1024 and g 48/72, is `2.803 G` parameters, and at FP8 that is
+2.803 GB. The components then sum to 6.163 GB, which with KV/norms/router reaches the 6.251 that
+`bytes_per_token()` computes and that `206/33.0 = 6.242` independently anchors.
+
+So **the total was always right and only the line item was wrong** — a transcription error made
+while writing the research prompt, propagated into this file. It matters because it made
+attention look like 22 % of the budget when it is **45 %**, which would mis-rank any future work
+that used the table.
+
+Caught by an external reviewer reconstructing the tensor shapes from the safetensors headers
+rather than trusting the table. That is the second time in this project a byte-table error
+survived several passes (the first was the hardcoded BF16 `B_tok`), and the lesson is the same
+one, sharpened: **a total that validates does not validate its parts.**

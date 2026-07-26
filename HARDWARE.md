@@ -34,8 +34,14 @@ See `ROOFLINE.md` §6 — that is ~1.6 M KV tokens, far more than the 262 K cont
 | CPU cores | 14 |
 | Build flag | `-arch=sm_110a` |
 
-Inherited verified facts from `~/gemma-cuda-hybrid/CUDA_ENGINEERING_CONSTITUTION.md` §1 — not re-derived:
-TMEM + tcgen05 + TMA present; CUTLASS needs `-DCUTLASS_NVCC_ARCHS=110a` and arch-guard patching;
+Inherited from `~/gemma-cuda-hybrid/CUDA_ENGINEERING_CONSTITUTION.md` §1 — and note that
+"inherited, not re-derived" is how the error below survived:
+~~TMEM + tcgen05 + TMA present~~ → **`tcgen05` is ABSENT on `sm_110a`**; TMA (`cp.async.bulk`),
+`barrier.cluster` and hardware FP8 `cvt.e4m3x2` **are** present, and we use none of them.
+Settled by compilation in `HARDWARE_PROBE.md` — with a positive control against `sm_90a`/`sm_100a`,
+because the first probe reported four features absent and three of those were artifacts of my own
+inline-asm syntax. **A capability probe without a positive control is not a measurement.**
+CUTLASS needs `-DCUTLASS_NVCC_ARCHS=110a` and arch-guard patching;
 `cudaMallocManaged` is **not** GPU-L2-cached on Thor while `cudaMalloc` is — use `cudaMalloc` for weights.
 
 ## ⚠ Open item — power mode is NOT at MAXN

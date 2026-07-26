@@ -121,27 +121,44 @@ gate comparisons per token.
 
 ## 6. Measurements nobody else has
 
+> **Three claims in this section were wrong and are corrected below.** They were repeated across
+> several documents and into research prompts, where they steered effort for weeks. Two were
+> priority claims ("nobody else has this") that a literature check refuted; one was a measurement
+> generalised past the regime it was taken in.
+
 * **`E_frac(M)`** — the fraction of 256 experts a forward touches: 0.039 / 0.141 / 0.264 at
-  M = 1 / 5 / 16. That is **22 % below independent routing at M=5 and 44 % below at M=16** — the
-  most position-correlated MoE routing measured anywhere, and no paper publishes this curve for
-  any model.
+  M = 1 / 5 / 16, i.e. **22 % below independent routing at M=5 and 44 % below at M=16**.
+  ~~The most position-correlated MoE routing measured anywhere, and no paper publishes this curve
+  for any model.~~ **Both halves of that are false.** The curve *is* published (Cohere, EcoSpec,
+  MoE-Spec, ST-MoE), and Cohere measures 20–31 % below independence against our 21.9 % — we are
+  ordinary, not extreme. **What survives is narrower and still useful: no published *cost model*
+  incorporates the correlation.** MoESD's `N(t) = E(1−(1−ρ)^t)` overstates our M=16 union by 79 %.
 * **τ against the two length axes** — acceptance degrades with **prompt length** (0.817 → 0.533
   from 67 to 15 267 tokens) and is **flat-to-rising** with generated position. The literature
-  conflicts on this; we measured it.
-* **The dequant compute budget on Thor** — 16 ALU instructions per 32-bit word, and ≥10
-  shared-memory codebook lookups, absorbed with **zero** bandwidth loss even on a fully serial
-  chain. This makes trellis/codebook decode compute-free here.
+  conflicts on this; we measured it. *(Stands.)*
+* **The dequant compute budget on Thor** — 16 ALU instructions per 32-bit word absorbed with zero
+  bandwidth loss. *(Stands, in the regime it was measured: the NVFP4 shape, nibble-aligned and
+  independent.)* ~~…and ≥10 shared-memory codebook lookups, which makes trellis/codebook decode
+  compute-free here.~~ **Refuted at 3 bits**, which is exactly ~10.7 lookups per 32-bit word —
+  the regime the claim covered. Measured: arithmetic codebook 395 Gweight/s vs shared-memory
+  codebook 271, a **31 % loss**. Trellis decode is compute-**bound** here, not compute-free; it
+  sits at 91 % of its own ALU ceiling. See `TRELLIS_VERDICT.md`.
+  The original measurement was taken where the kernel had bandwidth stall cycles to hide lookups
+  in. The 3-bit path has none — a budget measured under stalls does not transfer to a kernel
+  without them.
 
 ## 7. The open frontier
 
 | lever | estimate | state |
 |---|---:|---|
-| Routed experts → 3.0 bpw trellis | **+15.2 %** | hardware settled; **accuracy on AIME/GPQA-D is the open part, and that number does not exist for any MoE** |
+| ~~Routed experts → 3.0 bpw trellis~~ | ~~+15.2 %~~ → **+5.3 %** | **REJECTED.** Measured: production NVFP4 MoE 332 Gweight/s vs trellis_B 395, applied to a 31.3 % term. The +15.2 % assumed the term stays bandwidth-bound and converts the 1.406× byte saving in full; it does not, because trellis_B sits at 91 % of its own ALU ceiling. See `TRELLIS_VERDICT.md`. |
+| **Attention `q_proj`+`o_proj` → NVFP4** | **+21 %** | **capability MEASURED**: all five attention projections leave greedy output bit-identical, 8/8. Largest term in the profile (44.9 % of `B_tok`) and absent from every prior version of this table. Conversion is the open part. See `REPRICED.md`. |
+| ~~Intra-expert activation sparsity~~ | ~~+24.9 %~~ | **REJECTED on this model.** At the published 87 % operating point, zeroing costs 43.7 % relative error unstructured / 83 % block-32; the bit-exact permutation rescue buys 0.9 pp. Our experts are dynamically, not chronically, sparse — every neuron is in the top-13 % for 9–18 % of tokens. `moe_intermediate`=1024 was the right thing to worry about. See `ACTIVATION_SPARSITY.md`. |
 | Close the M>1 kernel inefficiency | lowers spec break-even τ 3.36 → 2.40 | **would make speculation profitable on prose** |
 | Kernel fusion beyond `moe_invert` | +3.2 % ceiling | ~770 small kernels remain |
 | Cassandra-style draft from truncated *target* weights | re-litigate | our DOA entry answered a different question |
-| Block Verification (joint accept/reject) | 5–8 %, zero extra traffic | accept/reject rule only |
-| CSV-Decode certified `lm_head` skip | ≈ +4.3 % | exact, offline k-means |
+| ~~Block Verification (joint accept/reject)~~ | ~~5–8 %~~ → **0 %** | **Worth exactly zero at greedy**, proven two independent ways. The 5–8 % holds only at γ=8, which the cost model says we cannot afford. |
+| CSV-Decode certified `lm_head` skip | ~~+4.3 %~~ → **≤+3.1 %** | estimate predates the FP8 work; `lm_head` is now 3.0 % of the step, so a *full* skip is the ceiling |
 
 **Out of scope rather than unattractive:** every published fix for long-context acceptance is a
 drafter retrain, and DFlash is the *shipped* head for this checkpoint.

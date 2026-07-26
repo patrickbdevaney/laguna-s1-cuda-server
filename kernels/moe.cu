@@ -65,18 +65,66 @@ __global__ void k_moe_active(int* __restrict__ active, int* __restrict__ nactive
     if (e < E && ecount[e] > 0) active[atomicAdd(nactive, 1)] = e;
 }
 
+// The whole inversion in ONE launch.
+//
+// The staged form was 3 memsets + 4 kernels = 7 launches per MoE layer, 329 per decode step --
+// about 20 % of every launch in the model, for a job whose entire input at decode is 10
+// (token, expert) assignments. A kernel costs ~1.6 us of marginal step time here regardless of
+// how little it does, so the launch count was the cost, not the work.
+//
+// Everything fits one block: E=256 counters in shared memory, the exclusive scan is the same
+// Hillis-Steele over 256 elements the standalone kernel used, and nass = rows*topk <= 160.
+// Outputs are identical to the staged version. `elist` order within an expert still comes from
+// an atomic cursor and so is not reproducible run to run -- that was already true, and it does
+// not affect results because each token's contribution is written to its own dpart row.
+__global__ __launch_bounds__(256)
+void k_moe_invert1(int* __restrict__ ecount, int* __restrict__ eoff, int* __restrict__ elist,
+                   int* __restrict__ cursor, int* __restrict__ active, int* __restrict__ nactive,
+                   const int* __restrict__ sel, int nass, int E, int P) {
+    extern __shared__ int sh[];                 // [P] counts/scan, [P] scratch, [E] cursor
+    int* cnt = sh;
+    int* tmp = sh + P;
+    int* cur = sh + 2 * P;
+    const int t = threadIdx.x, T = blockDim.x;
+
+    for (int i = t; i < P; i += T) { cnt[i] = 0; tmp[i] = 0; }
+    for (int i = t; i < E; i += T) cur[i] = 0;
+    if (t == 0) *nactive = 0;
+    __syncthreads();
+
+    for (int a = t; a < nass; a += T) atomicAdd(&cnt[sel[a]], 1);
+    __syncthreads();
+
+    for (int i = t; i < E; i += T) ecount[i] = cnt[i];
+
+    // inclusive Hillis-Steele over P, double-buffered so no __syncthreads sits in divergent code
+    for (int off = 1; off < P; off <<= 1) {
+        for (int i = t; i < P; i += T) tmp[i] = cnt[i] + (i >= off ? cnt[i - off] : 0);
+        __syncthreads();
+        for (int i = t; i < P; i += T) cnt[i] = tmp[i];
+        __syncthreads();
+    }
+    for (int i = t; i < E; i += T) eoff[i + 1] = cnt[i];
+    if (t == 0) eoff[0] = 0;
+    __syncthreads();
+
+    for (int a = t; a < nass; a += T) {
+        const int e = sel[a];
+        const int base = e ? cnt[e - 1] : 0;                 // exclusive offset
+        elist[base + atomicAdd(&cur[e], 1)] = a;
+    }
+    for (int e = t; e < E; e += T)
+        if (ecount[e] > 0) active[atomicAdd(nactive, 1)] = e;
+}
+
 extern "C" void moe_invert(int* ecount, int* eoff, int* elist, int* cursor,
                            int* active, int* nactive, const int* sel,
                            int rows, int topk, int E, cudaStream_t st) {
-    int nass = rows * topk, T = 256;
-    cudaMemsetAsync(ecount, 0, E * sizeof(int), st);
-    cudaMemsetAsync(cursor, 0, E * sizeof(int), st);
-    cudaMemsetAsync(nactive, 0, sizeof(int), st);
-    k_moe_count<<<(nass + T - 1) / T, T, 0, st>>>(ecount, sel, nass);
+    const int nass = rows * topk;
     int P = 1; while (P < E) P <<= 1;
-    k_moe_scan<<<1, P, P * sizeof(int), st>>>(eoff, ecount, E);
-    k_moe_fill<<<(nass + T - 1) / T, T, 0, st>>>(elist, cursor, sel, eoff, nass);
-    k_moe_active<<<(E + T - 1) / T, T, 0, st>>>(active, nactive, ecount, E);
+    const size_t shb = (size_t)(2 * P + E) * sizeof(int);
+    k_moe_invert1<<<1, 256, shb, st>>>(ecount, eoff, elist, cursor, active, nactive,
+                                       sel, nass, E, P);
 }
 
 // ---------------------------------------------------------------------------------------

@@ -83,6 +83,7 @@ back-to-back A/B/A.
 | 30 | **Shared experts + layer-0 dense BF16 → FP8** | 30.63/30.52 | **33.01/32.87** | **WON +7.8 %**, greedy 8/8 |
 | 31 | L2 `cudaAccessPropertyStreaming` hint on the weight arena | 31.35/31.17 | 31.23/31.15 | **NEUTRAL**, kept (free, and it documents the reasoning) |
 | 32 | MoE threads/block 128 → 256 (`LG_MOE_WY`) | 32.75 | 32.64/32.97 | **NEUTRAL**, default 4 |
+| 33 | **`moe_invert`: 3 memsets + 4 kernels → 1** (329 launches/step removed) | ~32.9 | 33.17/33.23/33.04 | **marginal +0.7 %**, kept (exact) |
 
 ### #23 — the loss was in the SMALL projections, not the big ones
 

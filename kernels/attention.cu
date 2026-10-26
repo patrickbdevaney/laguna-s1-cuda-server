@@ -1,6 +1,6 @@
 // attention.cu — G3c/G6: head-packed GQA over an FP8 KV cache, for both Laguna layer types.
 //
-// Laguna needs TWO tilings, not one (ARCH_DELTA.md §1):
+// Laguna needs TWO tilings, not one (docs/ARCH_DELTA.md §1):
 //   global  layers: 48 heads, 8 kv-heads -> G=6, full-context KV
 //   sliding layers: 72 heads, 8 kv-heads -> G=9, 512-token window
 // Both are handled by the same kernel with G and the window as runtime parameters.
@@ -11,11 +11,11 @@
 //
 // KV is FP8 e4m3 with the STATIC per-layer per-tensor scales shipped in the checkpoint
 // (`self_attn.k_scale` / `v_scale`) — not dynamically computed
-// (MODEL_INVENTORY.md §4: kv_cache_scheme is `dynamic: false`, `strategy: "tensor"`).
+// (docs/MODEL_INVENTORY.md §4: kv_cache_scheme is `dynamic: false`, `strategy: "tensor"`).
 //
 // Sliding layers use a ring buffer of exactly `window` slots, which is what makes the KV
 // budget work: 36 of 48 layers cost a constant 1.05 MB per sequence no matter how long the
-// conversation runs (ROOFLINE.md §6 — a 4.0x KV win over a uniformly-global model).
+// conversation runs (docs/ROOFLINE.md §6 — a 4.0x KV win over a uniformly-global model).
 #include "laguna_kernels.cuh"
 #include <cstdio>
 #include <cstdlib>

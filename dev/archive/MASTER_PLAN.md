@@ -14,7 +14,7 @@ unit of work. **Everything here is priced against `B_tok` = 6.251 GB and a 30.3 
 | MoE experts | 12.24 ms (40.4%) | **bandwidth-bound at 89.8% of ceiling**, NVFP4 unpack ~3 ALU ops/weight nowhere near saturated | any lever removing expert **bytes** converts ~1:1 |
 | trellis decoder | — | **ALU-bound at 91% of its own ceiling** | fewer bytes buy nothing → subsystem rejected |
 
-This is why `TRELLIS_VERDICT.md` does not generalise: it was a statement about a *decoder*, not
+This is why `../../docs/TRELLIS_VERDICT.md` does not generalise: it was a statement about a *decoder*, not
 about the expert term. The expert term still has ~1:1 byte→speed conversion available — just not
 via a more expensive decoder.
 
@@ -46,7 +46,7 @@ without significant accuracy loss", 2.5× MoE layer, **1.2× end-to-end**). Pric
   the same permutation, sorted by mean |SiLU(gate)·up| over a calibration set. Exact identity on the
   dense computation, folded into the existing repack, zero inference cost.
 *This is lossy* (95% score retention ≠ free), but it sits in the same gate class as the expert-bit
-reduction already contemplated — and `EXPERT_BITS_EVAL.md` proved the gate must be the **capability
+reduction already contemplated — and `../../docs/EXPERT_BITS_EVAL.md` proved the gate must be the **capability
 sweep**, not τ (which *rose* when quality fell) and not golden-continuation (a coin flip on a
 modified model).
 *Open risk that multiplies the whole item:* every published measurement is on `moe_intermediate`
@@ -88,9 +88,9 @@ top-k is already at the published floor.
 
 ## Corrections this synthesis forced on our own record
 
-1. `WIKI.md`: "no paper publishes the `E_frac` curve" — **false** (Cohere, EcoSpec, MoE-Spec, ST-MoE).
-2. `WIKI.md`: "the most position-correlated MoE routing measured anywhere" — **false** (Cohere 20–31% below independence vs our 21.9%). What survives: no published *cost model* incorporates the correlation.
-3. `WIKI.md` §6: "≥10 smem codebook lookups absorbed with zero bandwidth loss" — **refuted** at 3 bits (271 vs 395 Gweight/s).
-4. `HARDWARE.md:38`: "tcgen05 present" — **false**. TMA, cluster barriers and hardware FP8 conversion *are* present and unused.
+1. `../../docs/WIKI.md`: "no paper publishes the `E_frac` curve" — **false** (Cohere, EcoSpec, MoE-Spec, ST-MoE).
+2. `../../docs/WIKI.md`: "the most position-correlated MoE routing measured anywhere" — **false** (Cohere 20–31% below independence vs our 21.9%). What survives: no published *cost model* incorporates the correlation.
+3. `../../docs/WIKI.md` §6: "≥10 smem codebook lookups absorbed with zero bandwidth loss" — **refuted** at 3 bits (271 vs 395 Gweight/s).
+4. `../../docs/HARDWARE.md:38`: "tcgen05 present" — **false**. TMA, cluster barriers and hardware FP8 conversion *are* present and unused.
 5. `REPRICED.md` v1: "20.1% of the step moves 1.3% of bytes" — **mine, and wrong**; ~10.5%.
 6. The softplus-gate objection to quantizing `o_proj` — **mine, and a category error**. For weight-only quantization the gate scales signal and error identically, so SNR is invariant.

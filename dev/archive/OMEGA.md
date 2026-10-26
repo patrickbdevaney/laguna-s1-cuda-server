@@ -85,7 +85,7 @@ is ahead of the published state of the art on comparable hardware by roughly 2.4
 unspeculated path. It is not a global maximum, and the largest remaining item is gated by
 training hardware rather than by ideas.
 
-The correct thing to record is the frontier, not a victory. `RESEARCH_PROMPT_V4.md` is written
+The correct thing to record is the frontier, not a victory. `research/RESEARCH_PROMPT_V4.md` is written
 to attack it, and it is deliberately built to invite refutation of the seven premises this
 position rests on — because in three research passes, every finding that changed the code was
 either a device measurement or a corrected premise, and never a survey.

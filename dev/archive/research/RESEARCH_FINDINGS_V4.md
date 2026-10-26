@@ -164,7 +164,7 @@ headline number is measured against a CPU-offload baseline rather than a residen
 
 ## G. One of our own "dead on arrival" entries answers the wrong question
 
-`OPTIMIZATION_LOG.md` lists **"FP8/FP4 draft — collapsed τ 13.33 → 11.14"** as settled. That
+`../../../docs/OPTIMIZATION_LOG.md` lists **"FP8/FP4 draft — collapsed τ 13.33 → 11.14"** as settled. That
 measurement was a *quantized drafter replacing the drafter*.
 
 **Cassandra** (arXiv 2605.26558) does something structurally different: the draft is the
@@ -193,7 +193,7 @@ not an improvement. This applies to every quality-gated change we make from here
 
 ## Revised ranking after all four passes
 
-1. **Fix the byte table** (see `COST_MODEL_CORRECTION.md`) — done.
+1. **Fix the byte table** (see `../../../docs/COST_MODEL_CORRECTION.md`) — done.
 2. **Fuse the ~770 small kernels** — +3.2 %, exact.
 3. **Routed experts → 3.0 bpw** — +15.2 %, quality-gated, hardware question already settled.
 4. **Expert-union-aware drafting** — re-test at candidate surplus.

@@ -1,6 +1,6 @@
 # RESCOPE.md — the plan, corrected against the measured roofline
 
-Supersedes `DIRECTIVE.md` **on facts only**. Goals, deliverable, and invariants are unchanged.
+Supersedes `../dev/archive/DIRECTIVE.md` **on facts only**. Goals, deliverable, and invariants are unchanged.
 Every correction below traces to a file on disk, cited inline. Generated evidence:
 `ROOFLINE.md`, `tools/roofline.py`, `docs/roofline_ctx*.txt`.
 
@@ -29,7 +29,7 @@ measurement; bands not points; a failed gate stops the build.
 
 ---
 
-## 2. Revised priority order (replaces `DIRECTIVE.md` §9)
+## 2. Revised priority order (replaces `../dev/archive/DIRECTIVE.md` §9)
 
 Derived from the byte budget, not from the gemma profile:
 
@@ -53,7 +53,7 @@ Deleted from the priority list: expert-union mitigation as a *primary* lever (it
 
 ## 3. Revised gate definitions
 
-Changes only; everything unstated is as `DIRECTIVE.md` §6.
+Changes only; everything unstated is as `../dev/archive/DIRECTIVE.md` §6.
 
 - **G1 NVFP4 dequant** — group size **confirmed = 16** from `weight_scale [1024,192]` at K=3072.
   Scale layout confirmed: `weight_packed` U8 (2×E2M1/byte) + `weight_scale` F8_E4M3 per 16 +

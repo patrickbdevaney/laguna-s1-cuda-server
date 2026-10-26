@@ -244,7 +244,7 @@ For each axis, return:
 4. **Expected value for us** — % of decode step, with the arithmetic shown against the byte
    table in §3.
 5. **Cost and risk** — implementation size, and whether it preserves bit-exact greedy output
-   (our verify path requires it; see `LOOP_LOG.md` Gate B1c).
+   (our verify path requires it; see `../../../docs/LOOP_LOG.md` Gate B1c).
 
 Rank everything by expected value ÷ cost. **Call out explicitly anything that is a dead end,
 and say why** — a well-supported negative saves us a week.

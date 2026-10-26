@@ -1,6 +1,6 @@
 // tokenizer.h — Laguna / poolside ByteLevel BPE, pure C++, no Python at serve time.
 //
-// Read from models/…/tokenizer.json (MODEL_INVENTORY.md §6). This is a FULL REWRITE relative
+// Read from models/…/tokenizer.json (docs/MODEL_INVENTORY.md §6). This is a FULL REWRITE relative
 // to the gemma port: gemma was `▁`-normalised BPE with byte_fallback and a no-op
 // pre-tokenizer; Laguna is ByteLevel with **no normalizer**, `byte_fallback=false`, and a
 // two-stage pre-tokenizer whose second stage is a GPT-4-class regex with Unicode property

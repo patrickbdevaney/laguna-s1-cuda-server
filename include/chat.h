@@ -1,6 +1,6 @@
 // chat.h — poolside_v1 chat grammar: rendering, reasoning separation, tool calls.
 //
-// Transcribed from models/…/chat_template.jinja (MODEL_INVENTORY.md §7). Replaces both
+// Transcribed from models/…/chat_template.jinja (docs/MODEL_INVENTORY.md §7). Replaces both
 // `--reasoning-parser poolside_v1` and `--tool-call-parser poolside_v1`.
 //
 // Wire format:

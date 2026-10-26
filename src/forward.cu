@@ -24,7 +24,7 @@
 namespace laguna {
 
 // KV cache. Sliding layers get a ring of exactly `window` slots — 36 of 48 layers therefore
-// cost a constant 1.05 MB per sequence regardless of conversation length (ROOFLINE.md §6).
+// cost a constant 1.05 MB per sequence regardless of conversation length (docs/ROOFLINE.md §6).
 struct Session {
     std::vector<uint8_t*> Kc, Vc;
     std::vector<int> cap;

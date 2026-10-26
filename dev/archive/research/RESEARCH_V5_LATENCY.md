@@ -2,7 +2,7 @@
 
 Axis: `attn_core` + `norm+cast` + `router` — the part of the step that moves ~1.3% of the bytes.
 Research pass only; nothing was run on the GPU (it was busy). Every on-device number below is
-re-derived from `prof_production.log`, `MODEL_INVENTORY.md`, `kernels/*.cu` and the V1–V4 ledger.
+re-derived from `prof_production.log`, `../../../docs/MODEL_INVENTORY.md`, `kernels/*.cu` and the V1–V4 ledger.
 
 ---
 
@@ -10,7 +10,7 @@ re-derived from `prof_production.log`, `MODEL_INVENTORY.md`, `kernels/*.cu` and 
 
 This is the one finding in this document that changes what you should do next, so it goes first.
 
-`REPRICED.md` states the caveat itself and then the number escaped it: *"`LG_PROF` serialises and
+`../REPRICED.md` states the caveat itself and then the number escaped it: *"`LG_PROF` serialises and
 disables graph capture, so the total (43.2 ms) is inflated against the real 30.3 ms step and
 **per-launch-heavy categories are over-represented**."* V5's prompt then carries `20.1%` forward as
 a measured share of the shipping step. It is not. It is a share of a **42-millisecond** step.
@@ -65,7 +65,7 @@ advertised size**, and its composition is completely different from what the pro
   problem.
 
 Two side effects of the correction worth noting: **`attn_qkvo_gemm` is 39.7% of the step, not
-34.7%** — which makes `o_proj → NVFP4` worth *more* than `REPRICED.md`'s +9.2%, not less — and
+34.7%** — which makes `o_proj → NVFP4` worth *more* than `../REPRICED.md`'s +9.2%, not less — and
 `lm_head` is 4.2%, not 3.0%.
 
 **Cheapest falsifying experiment (do this before anything else in this document).** Do not trust
@@ -132,7 +132,7 @@ fraction of ≤7.1% (b), against weeks of work, a global register allocation acr
 would undo the TM=1 MoE register win (50 vs 127 registers) and the lane-per-output repack, and no
 precedent on ≤32-SM hardware anywhere.
 
-**One thing the ledger got wrong, though**, and it is worth correcting: `OPTIMIZATION_LOG.md` lists
+**One thing the ledger got wrong, though**, and it is worth correcting: `../../../docs/OPTIMIZATION_LOG.md` lists
 **TMA** as dead because "none are bandwidth levers". That is the right verdict on the wrong axis —
 TMA/`cp.async.bulk` is the *pipelining* primitive that makes term (b) mechanically possible
 (async weight fetch for stage N+1 into shared-memory pages freed by stage N). It was never
@@ -162,7 +162,7 @@ Our recorded blocker (35% of token time in the barrier) is **independently repro
 |---|---|---|---|
 | `grid.sync()` | 2200–2800 cy; ~3 µs real | H100 114 SM / RTX 5090 170 SM | dead, reproduced |
 | custom atomic grid barrier | **2.2 µs** | RTX 5090 | 27% better than dead |
-| `cluster.sync()` | 1100–2100 cy | H100 | **`cta_group` caps at 2 on Thor** (our own measurement, `OPTIMIZATION_LOG.md`) → a 2-CTA barrier cannot serve a 20-SM grid |
+| `cluster.sync()` | 1100–2100 cy | H100 | **`cta_group` caps at 2 on Thor** (our own measurement, `../../../docs/OPTIMIZATION_LOG.md`) → a 2-CTA barrier cannot serve a 20-SM grid |
 | DSMEM inter-SM access | **181 cy** (cluster 2) vs L2 near-hit 258 cy, global 656 cy ([Luo et al., arXiv:2501.12084](https://arxiv.org/html/2501.12084v1)) | H800 | 30% better than L2, but only across 2 CTAs |
 | **global-counter semaphore (MPK / Hazy)** | MPK: **0.28% of total runtime**; Hazy: async barrier ~60 ns even when passed, **40 µs of a 600 µs B200 step (6.7%)** | B200 / H100 | **the answer**: ~8× cheaper than grid.sync (our own V1 estimate: 0.68 ms over ~800 edges) — and still not worth 0.54 ms of prize |
 | **PDL** (`cudaTriggerProgrammaticLaunchCompletion`) | ⚠ **zero overlap observed on GB10** (DGX Spark, small integrated Blackwell) despite correct API use — [NVIDIA forum #359590](https://forums.developer.nvidia.com/t/issue-with-programmatic-dependent-launch-pdl-no-overlapping-execution-observed-on-gb10/359590). NVIDIA's own docs: *"opportunistic and not guaranteed… reliance on concurrent execution in this manner is unsafe and can lead to deadlock."* Hazy Research rejected it as *"very coarse, still introduces unnecessary stalls."* | GB10 = closest small-Blackwell proxy to Thor | **do not build on this.** Works in graphs via `cudaGraphDependencyTypeProgrammatic` (CUDA 12.3+), but the one small-Blackwell datapoint is a null result |
@@ -183,7 +183,7 @@ whole megakernel at ≤1.8% for (a) and 0% for (c).
 
 ## 3. Q6 — `sm_110a` feature inventory, and a contradiction in our own ledger
 
-**Flagging an unresolved contradiction inside this repository.** `HARDWARE.md` line 38 states,
+**Flagging an unresolved contradiction inside this repository.** `../../../docs/HARDWARE.md` line 38 states,
 inherited verbatim from the gemma constitution and never re-derived here: **"TMEM + tcgen05 + TMA
 present."** The V5 prompt states **"tcgen05 is ABSENT."** A community post on the
 [Jetson Thor benchmarking thread](https://forums.developer.nvidia.com/t/performance-benchmarking-on-jetson-thor/349494)
@@ -429,7 +429,7 @@ something, not by being risky.
 |---|---|---:|---|---|---|---|
 | **1** | **§0 doubling ablation of the three categories under CUDA graphs** | decides whether the remaining 10.5% (not 20.1%) is worth any of the work below; re-ranks the whole project | **very high** — δ is a model, not a measurement | **~1 h**, no new kernels, zero risk | n/a | no |
 | **2** | **§6 A1 — NSP sweep (`by_len` 64 → 32/24/16)** | **up to +3.3%** (0.98 ms) | high — FlashInfer's small-GPU finding argues the other way | **~1 h** + greedy re-gate | ⚠ no (re-gate) | no |
-| **3** | **§3 — `ptxas -arch=sm_110a` probe: tcgen05 / TMEM / TMA / `cp.async.bulk`** | resolves a direct contradiction between `HARDWARE.md` and the V5 premise; gates a whole family | **very high** | **~20 min** | n/a | no |
+| **3** | **§3 — `ptxas -arch=sm_110a` probe: tcgen05 / TMEM / TMA / `cp.async.bulk`** | resolves a direct contradiction between `../../../docs/HARDWARE.md` and the V5 premise; gates a whole family | **very high** | **~20 min** | n/a | no |
 | **4** | **§4 R1 — split-K router GEMV + fused last-block sigmoid/top-k** | **+2.1%** (0.61 ms) | medium — occupancy diagnosis is arithmetic, not measured | 1 h to falsify, ~1 d to build | yes | no |
 | **5** | §3 — re-probe `cudaMallocManaged` L2-caching on **CUDA 13.0 + Thor** (the recorded fact is Orin-era) | re-opens zero-copy (160 vs 227 GB/s) if it changed | high | ~1 h | n/a | no |
 | **6** | §6 A3 — hoist `% cap` out of the attention inner loop | +0.2–0.3% | low | 30 min | yes | no |
@@ -475,7 +475,7 @@ something, not by being risky.
 
 **Could not resolve:**
 
-* **tcgen05 / TMEM presence on `sm_110a`.** `HARDWARE.md` says present, V5 says absent, a forum post
+* **tcgen05 / TMEM presence on `sm_110a`.** `../../../docs/HARDWARE.md` says present, V5 says absent, a forum post
   says present, and **NVIDIA's public docs do not document CC 11.0 at all**. Needs the 20-minute
   on-device probe (ranked #3).
 * **Jetson CUDA-graph launch overhead.** No public number exists for Orin or Thor. Our 1.6–1.7 µs

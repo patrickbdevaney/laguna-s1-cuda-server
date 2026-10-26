@@ -7,9 +7,9 @@ Reference, **read-only**: `~/gemma-cuda-hybrid`.
 
 | gate | state | evidence |
 |---|---|---|
-| **H1 — capacity** | ✅ **PASS** | 122 GB unified / 115 GB available / 379 GB disk → `HARDWARE.md` |
-| **R1 — roofline** | ✅ **PASS** | `ROOFLINE.md`, generator `tools/roofline.py`, raw `docs/roofline_ctx*.txt` |
-| **A1 — oracle + arch delta** | ✅ **PASS** | `MODEL_INVENTORY.md`, `ARCH_DELTA.md`, `oracle/`, golden tensors in `docs/golden/` → `LOOP_LOG.md` |
+| **H1 — capacity** | ✅ **PASS** | 122 GB unified / 115 GB available / 379 GB disk → `../../docs/HARDWARE.md` |
+| **R1 — roofline** | ✅ **PASS** | `../../docs/ROOFLINE.md`, generator `tools/roofline.py`, raw `docs/roofline_ctx*.txt` |
+| **A1 — oracle + arch delta** | ✅ **PASS** | `../../docs/MODEL_INVENTORY.md`, `../../docs/ARCH_DELTA.md`, `oracle/`, golden tensors in `docs/golden/` → `../../docs/LOOP_LOG.md` |
 | L1 — loader | ⏳ next | |
 | **B1 — kernels G1–G9** | ✅ **PASS** | `gate_kernels` 13/13; `gate_forward` 8/8 greedy exact; **20.44 tok/s decode** (FP8 attention) / 18.97 bit-exact; G9 CUDA graph DONE |
 | D1 — DFlash + k-sweep | ▫ | |
@@ -34,10 +34,10 @@ weight-resident MoE, and the full 48-layer forward.
 1. **Gate D1 — DFlash.** Now the biggest remaining multiplier (1.6–1.9×) and a deliverable in
    its own right. The kernel arc has spent its easy structural wins: MoE and the BF16
    attention GEMMs are now ~37 % each, so no single kernel dominates.
-2. **Deep-research findings** — five axes commissioned (`RESEARCH_PROMPT.md`); implement the
+2. **Deep-research findings** — five axes commissioned (`research/RESEARCH_PROMPT.md`); implement the
    surviving EV-ranked levers.
 3. **Gate D1 — DFlash.** Mechanism now fully specified from the `speculators` reference —
-   see `ARCH_DELTA.md` §8. It is **cross-attention over the target's fused aux hidden states**,
+   see `../../docs/ARCH_DELTA.md` §8. It is **cross-attention over the target's fused aux hidden states**,
    not a small autoregressive LM. **`k` is hard-bounded to [1,15]** by `block_size` 16, and
    Gate D1 passes only if τ lands near poolside's published 6.44 — τ near 1 would mean the
    structure is wrong.

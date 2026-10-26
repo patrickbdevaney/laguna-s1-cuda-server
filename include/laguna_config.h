@@ -1,6 +1,6 @@
 // laguna_config.h — the ONLY source of Laguna architectural constants.
 //
-// Project invariant (DIRECTIVE.md §0): never invent a model constant. Every field below
+// Project invariant (dev/archive/DIRECTIVE.md §0): never invent a model constant. Every field below
 // is read from the checkpoint's config.json at load time. Nothing here has a numeric
 // default that could silently stand in for a missing field — a missing required key is
 // a hard error, because a wrong constant on a 117B model is undetectable until it is

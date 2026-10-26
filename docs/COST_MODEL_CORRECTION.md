@@ -2,7 +2,7 @@
 
 ## The falsification
 
-`RESEARCH_FINDINGS_V3.md` fitted, from two measured points:
+`../dev/archive/research/RESEARCH_FINDINGS_V3.md` fitted, from two measured points:
 
 ```
 cost(M) = 0.235 + 19.6 · E_frac(M)      in units of one decode step (6.251 GB)

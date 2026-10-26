@@ -1,4 +1,4 @@
-// Measured decode-vs-context curve. ROOFLINE.md 6 claims KV capacity is free and only USED
+// Measured decode-vs-context curve. docs/ROOFLINE.md 6 claims KV capacity is free and only USED
 // context costs bandwidth; this measures it on the real engine instead of modelling it.
 #include "../src/forward.cu"
 #include <algorithm>

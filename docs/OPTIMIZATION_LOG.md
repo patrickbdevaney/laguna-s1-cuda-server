@@ -432,7 +432,7 @@ efficiency the same byte budget would give **26 tok/s** — so roughly two third
 is still unclaimed.
 
 Quality: greedy-exact on the 8-token gate, which is a *weak* signal. The research (see
-`RESEARCH_FINDINGS.md`) puts weight-only 8-bit at measured-lossless — llama.cpp Q8_0 on
+`../dev/archive/research/RESEARCH_FINDINGS.md`) puts weight-only 8-bit at measured-lossless — llama.cpp Q8_0 on
 Llama-3.1-8B moves ppl 7.32 → 7.33 — so confidence is high, but the flag stays opt-in and the
 BF16 path remains the bit-exact gate oracle.
 
@@ -510,7 +510,7 @@ kernel at the *same* occupancy and remove **one thing at a time**.
 | NODEQ | 229–234 | + the FP4 hardware decode — **free** |
 | STREAM | 229–241 | + the entire FMA chain — **free** |
 
-**Correction, from the research pass (`RESEARCH_FINDINGS_V2.md` §A2).** This harness had a
+**Correction, from the research pass (`../dev/archive/research/RESEARCH_FINDINGS_V2.md` §A2).** This harness had a
 defect when those numbers were taken: it read the activation row as 32 scalar 2-byte loads —
 the exact defect #20 removed from production — and MODE 2/3 skipped the activation stream
 entirely, so FULL was being compared against variants carrying no activation traffic. 93 % of
@@ -648,7 +648,7 @@ Poolside quantized only the routed experts; 7.41 GB of every decode step is BF16
 | NVFP4 all attention | 6.015 | 37.7 | +67 % | **−2.3 pts recovery, MEASURED** |
 | NVFP4 all non-expert | 4.718 | 48.1 | +113 % | compounding, unmeasured |
 
-**The research pass changed this entry materially** — see `RESEARCH_FINDINGS.md`. A controlled
+**The research pass changed this entry materially** — see `../dev/archive/research/RESEARCH_FINDINGS.md`. A controlled
 A/B on DeepSeek-R1 (identical GPTQ recipe, attention in vs out) measures **98.81 % → 96.52 %**
 recovery when attention is included. Kimi-K2, DeepSeek-R1-0528 and both Llama-4 models all
 exclude attention; NVIDIA's most aggressive NVFP4 variant adds only `o_proj`. Poolside's choice
@@ -709,7 +709,7 @@ Each is bit-exact and worth a few tenths of a percent; ~+0.3 % combined.
 
 ### 9. Routing-aware draft truncation
 Only if measured `E_frac(k*)` > 0.6. The model says 0.18 at k=5, so this is almost certainly
-unnecessary — logged because `DIRECTIVE.md` §7.5 asks for it explicitly.
+unnecessary — logged because `../dev/archive/DIRECTIVE.md` §7.5 asks for it explicitly.
 
 ---
 

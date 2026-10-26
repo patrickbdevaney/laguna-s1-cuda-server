@@ -359,7 +359,7 @@ is a loader-architecture decision made on measurement, before writing the loader
 
 ## 10. MEASURED `E_frac` (2026-07-24) — replaces the §4 model, and it moves `k*`
 
-`DIRECTIVE.md` §7.3 requires the modelled expert union be replaced by a measurement. First
+`../dev/archive/DIRECTIVE.md` §7.3 requires the modelled expert union be replaced by a measurement. First
 pass done, from the golden run's captured router selections: distinct experts per MoE layer,
 averaged over **every contiguous k-token window × all 47 MoE layers** (54 tokens of real
 prompt). Data: `docs/golden/efrac_measured.json`; the roofline now consumes it directly.

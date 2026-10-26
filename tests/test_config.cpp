@@ -1,5 +1,5 @@
 // Gate A1 sub-check: config.json parses, and every derived quantity matches what
-// ROOFLINE.md computed independently in Python.
+// docs/ROOFLINE.md computed independently in Python.
 #include "../include/laguna_config.h"
 #include <cstdio>
 int main(int argc,char**argv){

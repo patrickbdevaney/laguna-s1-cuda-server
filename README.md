@@ -1,152 +1,233 @@
 # laguna-s1-cuda-server
 
-Pure-CUDA/C++ inference for **`poolside/Laguna-S-2.1-NVFP4`** (117.6 B total / 8.5 B activated)
-with the **`Laguna-S-2.1-DFlash-NVFP4`** speculative draft, on a **Jetson AGX Thor**
-(Blackwell `sm_110a`, 20 SMs, 122 GB LPDDR5X unified). No Python on the hot path.
+A pure-CUDA inference engine and OpenAI-compatible server for
+[`poolside/Laguna-S-2.1-NVFP4`](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4), a 117.6B-parameter
+mixture-of-experts model with 8.5B active, on one NVIDIA Jetson AGX Thor (`sm_110a`, 122 GB unified memory).
+Speculative decoding uses poolside's
+[`Laguna-S-2.1-DFlash-NVFP4`](https://huggingface.co/poolside/Laguna-S-2.1-DFlash-NVFP4) drafter. Everything from the
+checkpoint on disk to the HTTP response is C++/CUDA. Python exists only in `oracle/`, for validation.
 
-Ported from `~/gemma-cuda-hybrid` (read-only reference). Operating directive: `DIRECTIVE.md`;
-corrections to its factual premises: `RESCOPE.md`.
+## Status (2026-07-26)
 
-## State
+This is a research release from a single maintainer. It serves one stream at a time with a 262K-token default
+context, and its greedy output is bit-exact against a reference transcription of poolside's own modeling code.
 
-| gate | status |
+| Component | State |
 |---|---|
-| **H1** capacity | ✅ 122 GB / 115 GB available — viable |
-| **R1** roofline | ✅ `B_tok` = 10.04 GB/token, AR wall 22.6 tok/s |
-| **A1** oracle + arch delta | ✅ bit-exact vs shipped `modeling_laguna.py`; golden tensors from real weights |
-| **L1** loader | ✅ 71.899 GB in one arena, 44.6 s cold, 4.92 GB peak RSS |
-| **B1** kernels G1–G9 | ✅ 13/13 kernel gates; full forward **greedy-exact**; CUDA graph capture |
-| **B1c** batched ≡ sequential | ✅ 10/10 **bit-exact** (MAXTOK 4/16/64 × P 4…1200, above and below the window) |
-| **D1** DFlash + k-sweep | ✅ greedy-exact at every k; τ 4.32; k\* = 3–4; E_frac measured |
-| **S1** server layer | ✅ OpenAI endpoint, prefix cache, WebUI, C++ client, adaptive speculation |
+| 48-layer engine: NVFP4 experts, FP8 attention and dense weights, sliding and global attention | Complete; greedy output bit-exact against the oracle |
+| DFlash speculative decoding | Complete; greedy-exact at every draft length |
+| Server: OpenAI endpoint, prefix cache, tool calls, reasoning split, WebUI, terminal client | Complete |
+| Gates: capacity, roofline, oracle, loader, kernels, batched ≡ sequential, DFlash, server | All pass |
+| NVFP4 attention weights (+19.9% measured available) | Validated, not built |
+| Capability benchmark | Not completed (see [Limitations](#limitations)) |
 
-**Current decode: 33.0 tok/s median** (ctx 4096, greedy, no speculation) — `B_tok` 6.251 GB,
-**91 % of the byte-model wall** at the measured ~254 GB/s ceiling.
-Arc: 3.66 → 21.65 → **33.0** tok/s. See `OPTIMIZATION_LOG.md` #18–#30 and
-`RESEARCH_FINDINGS_V2.md`.
+## Results
 
-For scale: published full-step batch-1 bandwidth efficiency tops out at **82 %**
-(FlashFormer, H100); we are at ~85 %. poolside's own DGX Spark GB10 measurement — the closest
-hardware analogue — is **13–14 tok/s** unspeculated and 22–24 with DFlash.
-**Served, end to end** (`lgserve`, cost-aware speculation policy over {AR, DFlash, suffix}):
+All numbers were measured on one Jetson AGX Thor.
 
-| workload | tok/s | accepted / forward |
+**Decode**
+
+| Workload | tok/s | Tokens accepted per target forward |
 |---|---:|---:|
-| prose | 33.6 | 1.00 (declines to speculate) |
-| code | 40.1 | 3.67 |
-| repetitive / edit-style | **49.7** | **14.6** |
+| Autoregressive, ctx 4,096 | **33.2** | 1 |
+| Served, prose | 33.6 | 1.00 (the policy declines to speculate) |
+| Served, code | 40.1 | 3.67 |
+| Served, repetitive or edit-style | **49.7** | 14.6 |
 
-Reference point: poolside measured **13–14 tok/s** for this model on a DGX Spark (same
-bandwidth class) under vLLM, and **22–24 tok/s** with DFlash.
+- **Bandwidth efficiency.** Plain decode reads 6.25 GB per token, about 85% of the bandwidth wall measured on this
+  box. The best published batch-1 efficiency for a whole decode step is 82% (FlashFormer, on H100).
+- **Reference point.** poolside reports 13–14 tok/s for this model on a DGX Spark, the closest hardware in the same
+  bandwidth class, and 22–24 tok/s with DFlash. Those runs were under vLLM.
 
-## Run the server
+**The path from first forward to 33.2 tok/s.** Every step was measured end to end and kept greedy output 8/8 against
+the oracle ([`docs/OPTIMIZATION_LOG.md`](docs/OPTIMIZATION_LOG.md)):
+
+| Step | tok/s |
+|---|---:|
+| First working forward | 3.66 |
+| Hardware FP4 converter, flash-decoding attention split, MoE grid sized by actual M | 9.23 |
+| Offline expert repack, thread per output | 16.57 |
+| Whole-step CUDA graph | 18.74 |
+| FP8 attention weights (W8A16, per-row scale) | 20.44 |
+| 4 warps per block: the 24-CTA limit had left half the warp slots unreachable | 24.59 |
+| 16-byte FP8 loads; segmented GEMMs (q\|k\|v\|g, gate\|up) | 27.35 |
+| NVFP4 scale layout reordered for coalesced reads | 30.8 |
+| FP8 `lm_head`, shared experts and layer-0 MLP | 33.0 |
+| MoE inversion fused (7 launches per layer → 1) | **33.2** |
+
+**Context.** Only the 12 global-attention layers keep a growing KV cache, at 24,576 bytes per token. The 36
+sliding-window layers use a 512-slot ring, a constant 1.05 MB per sequence.
+- At the 262K default, KV takes 6.48 GB and the process 78 GB of 122.
+- Allocated context costs no decode speed; only context actually used does. At 175 GB/s, 128K of used context
+  keeps 89% of peak decode and 256K keeps 80%.
+
+## Findings
+
+**1. Only the routed experts shipped quantized, so the per-token bytes were twice the naive estimate.**
+- Attention, shared experts, router, layer-0 MLP and `lm_head` shipped in BF16. That is 8.03 GB of the checkpoint
+  and 5.61 GB of every decode step, so bytes per token started at 10.04 GB, not the ~4.5 GB a uniformly quantized
+  model would give.
+- Converting those weights to FP8 here brought it to 6.25 GB.
+- **What is left:** attention projections are now 44.9% of the bytes. Simulated NVFP4 on them keeps greedy output
+  bit-identical, 8/8, while the same gate fails 2.81-bit experts 0/8. A microbenchmark converts 95% of the saving
+  to speed, for +19.9% projected ([`docs/ATTENTION_NVFP4.md`](docs/ATTENTION_NVFP4.md)).
+
+**2. Decode, prefill and speculative verify must be the same arithmetic.**
+- The flash-decoding split count originally depended on M. That changed the fp32 rescale chain, so the same token
+  rounded differently in decode and prefill. 1 ulp at layer 0, amplified ~1.4× per layer, flipped the argmax by
+  layer 48.
+- Sizing the split from key length alone makes all three paths bit-identical (Gate B1c, 10/10). Without that, a
+  DFlash acceptance rate would not mean anything.
+
+**3. The speculation controller, not the drafter, is the live defect** ([`docs/DECODE_FINAL.md`](docs/DECODE_FINAL.md)).
+- A fixed `SPEC_K=2` reaches 40.99 tok/s on code, +21% over no speculation. On prose, speculation off wins every
+  cell (33.9 tok/s).
+- The adaptive policy's boot-time estimate of the plain-decode rate swung between 20.1 and 33.3 across restarts,
+  against a true 33.7–33.9. So it sometimes speculates on prose and sometimes gives up the gain on code.
+- A static rule (speculate on code, not on prose) currently beats it on both workloads.
+
+**4. Acceptance rate cannot grade quantization quality.** Coarsening the experts to 2.81 bits *raised* τ at every
+draft length and gave an apparent +7.6% speed, without saving a byte. It also failed the greedy gate 0/8.
+Degrading the target can make it easier to predict ([`docs/EXPERT_BITS_EVAL.md`](docs/EXPERT_BITS_EVAL.md)).
+
+**5. Several frontier levers were priced against a profile and rejected with arithmetic**, not left as
+aspirations:
+- a 3-bit trellis expert format measured +7% end to end, not the projected +15.2%
+  ([`docs/TRELLIS_VERDICT.md`](docs/TRELLIS_VERDICT.md));
+- activation sparsity ([`docs/ACTIVATION_SPARSITY.md`](docs/ACTIVATION_SPARSITY.md));
+- lossless entropy coding of the weights (FP8 weights measure 82.2% entropy, against a 72% break-even);
+- a grid-cooperative megakernel (35% of token time spent in `grid.sync`);
+- tree verification, Lookahead decoding, and certified expert skipping.
+
+The full list, with the measurement for each, is [`docs/WIKI.md`](docs/WIKI.md) §5.
+
+## Engineering
+
+**The checkpoint's layout is unusual, and each fact below cost a failed gate to learn.**
+- **Global scale.** `weight_global_scale` is a reciprocal (`2688/amax`), so dequantization divides.
+  Multiplying gives absmax ≈ 3e7 and garbage experts, silently.
+- **Router.** It is sigmoid with top-10 of 256. `e_score_correction_bias` affects selection only, never the
+  returned weights.
+- **Per-layer shapes.** Head counts differ by layer type: 48 on global layers, 72 on sliding layers. Rotary
+  differs too: YaRN θ=5e5 on half the dims for global, θ=1e4 on all of them for sliding.
+- **Output head.** `lm_head` is not tied to the embedding, and the vocabulary is 100,352.
+
+**Gate methodology**
+- Kernel gates compare against a bf16-activation reference, because the deployed model is bf16. fp32 activations
+  flip 15 of 540 router selections between experts whose scores differ by 1e-5.
+- Gates on random token ids are the strictest form, since an off-distribution router turns 1 ulp into a different
+  expert. Two paths that round differently are compared against the oracle, never against each other.
+
+**Kernel lessons**
+- A small lookup table indexed at runtime inside an inner loop lives in local memory. The hardware FP4 converter
+  was worth 2.5× on that kernel.
+- An offline expert repack won +70% on the MoE and lost 33% on the BF16 GEMMs. Trading warps for iterations per
+  warp pays only when the iteration count is small.
+
+**Measurement on Thor**
+- Short microbenchmarks measure the idle clock. Spin 300 ms first and discard the first sample.
+- The first kernel over a fresh allocation is dominated by page-table warmup.
+- `cudaMalloc` memory streams at 227–254 GB/s; a `cudaHostRegister`'d mmap only at 160, so weights are never
+  mapped.
+
+**Speculation**
+- A correctness gate cannot see a broken speculator. When a buffer overflow made the drafter emit one constant
+  token, every draft was rejected and output stayed correct. τ = 1.000 was the only signal, so served
+  measurements report accepted tokens per forward.
+
+## Getting started
+
+Requirements:
+- Jetson AGX Thor with CUDA for `sm_110a`.
+- Both checkpoints in `models/`: `Laguna-S-2.1-NVFP4`, which loads as 71.9 GB in one arena, and
+  `Laguna-S-2.1-DFlash-NVFP4`.
+- Run nothing else GPU-heavy alongside.
 
 ```bash
+huggingface-cli download poolside/Laguna-S-2.1-NVFP4        --local-dir models/Laguna-S-2.1-NVFP4
+huggingface-cli download poolside/Laguna-S-2.1-DFlash-NVFP4 --local-dir models/Laguna-S-2.1-DFlash-NVFP4
+
 nvcc -O3 -std=c++17 -arch=sm_110a -I. -o build/lgserve src/server.cu kernels/*.cu -lpthread
 g++  -O2 -std=c++17 -I. -o build/lgchat tools/lgchat.cc -lpthread
 
-CTX=262144 ./build/lgserve            # OpenAI endpoint + WebUI on :8080
-./build/lgchat                        # terminal client
+CTX=262144 ./build/lgserve        # OpenAI endpoint and WebUI on :8080; loads in ~45 s
+./build/lgchat                    # terminal client
 ```
 
-`POST /v1/chat/completions` (streaming and not), `GET /v1/models`, `GET /healthz`, WebUI at
-`/`. Reasoning arrives as `reasoning_content` deltas until the model closes `</think>`, then
-as `content`; tool calls are parsed with the same `poolside_v1` grammar the prompt is rendered
-with. `timings.spec_arms` reports what the speculation bandit currently believes about each
-arm.
+**API**
+- **Endpoints:** `POST /v1/chat/completions` (streaming and not), `GET /v1/models`, `GET /healthz`, and a WebUI at
+  `/`.
+- **Reasoning and tools:** reasoning arrives as `reasoning_content` until the model closes `</think>`, then as
+  `content`. Tool calls are parsed with the same `poolside_v1` grammar the prompt is rendered with.
+- **Speculation control:** `SPEC_K=0` disables speculation; `SPEC_K=2` is the measured best on code.
+- **Policy visibility:** `timings.spec_arms` reports what the speculation policy currently believes about each arm.
 
-## Layout
-
-```
-DIRECTIVE.md        the original operating directive, verbatim (authority on intent)
-RESCOPE.md          corrections to its factual premises, with evidence
-ROOFLINE.md         byte budget, k-sweep, KV policy, measured E_frac
-MODEL_INVENTORY.md  every tensor, the NVFP4 layout, tokenizer, chat grammar
-ARCH_DELTA.md       gemma-4 vs Laguna, per subsystem, with port verdicts
-HARDWARE.md         Gate H1, measured chip/toolchain state
-LOOP_LOG.md         gate-by-gate record: what was checked, against what, verdict
-OPTIMIZATION_LOG.md won/lost/neutral ledger + EV-ranked backlog
-STATUS.md           resume point
-
-include/            laguna_config.h (all constants read from config.json)
-                    laguna_weights.h (arena loader), safetensors.h, third_party/
-kernels/            laguna_kernels.cuh, gemm.cu, elementwise.cu, attention.cu, moe.cu
-src/                forward.cu (the model)
-oracle/             reference transcription + golden-tensor generation (validation only)
-tests/              gate_* (correctness), bench_* (performance), bw/h2d probes
-tools/              roofline.py, captured safetensors headers
-```
-
-## Build and run
+**Gates and benchmarks**
 
 ```bash
-nvcc -O3 -std=c++17 -arch=sm_110a -o build/gate_kernels \
-  tests/gate_kernels.cu kernels/*.cu
-./build/gate_kernels                       # 13 kernel gates
-
-nvcc -O3 -std=c++17 -arch=sm_110a -o build/bench_decode \
-  tests/bench_decode.cu kernels/*.cu
-CTX=4096 N=40 ./build/bench_decode         # median decode + greedy re-check
-CTX=4096 N=40 LG_PROF=1 ./build/bench_decode   # per-category profile
+nvcc -O3 -std=c++17 -arch=sm_110a -o build/gate_kernels tests/gate_kernels.cu kernels/*.cu && ./build/gate_kernels
+nvcc -O3 -std=c++17 -arch=sm_110a -o build/bench_decode tests/bench_decode.cu kernels/*.cu
+CTX=4096 N=40 ./build/bench_decode              # median decode plus a greedy re-check
+CTX=4096 N=40 LG_PROF=1 ./build/bench_decode    # per-category profile
+oracle-venv/bin/python oracle/validate_matrix.py   # oracle validation (needs its venv)
 ```
 
-The oracle (validation only, never on the serving path) needs its venv:
-`oracle-venv/bin/python oracle/validate_matrix.py`.
+## Compatibility
 
-## Facts worth knowing before changing anything
+| Platform | State |
+|---|---|
+| Jetson AGX Thor (`sm_110a`), 122 GB unified | Tested |
+| DGX Spark / GB10 (`sm_121`) | Not tested; same bandwidth class, different architecture target |
+| Other GPUs | Not supported: kernels and occupancy choices are tuned to Thor's 20 SMs |
 
-Each of these cost a failed gate or a measurement to establish; details in `LOOP_LOG.md` and
-`OPTIMIZATION_LOG.md`.
+## Limitations
 
-1. **Only the routed experts are NVFP4.** Attention, shared experts, router, layer-0 MLP and
-   `lm_head` are BF16 — 8.03 GB of the checkpoint, and 5.61 GB of every decode step. `B_tok`
-   is 10.04 GB, not the 4.5 GB a uniformly-quantized model would give.
-2. **`weight_global_scale` is a reciprocal** (`2688/amax`). Dequant **divides**. Multiplying
-   yields `absmax ≈ 3e7` and silently garbage experts.
-3. **`lm_head` is not tied** to the embedding, and `vocab` is 100 352, not 262 144.
-4. **`num_experts_per_tok` is 10**, and the router is **sigmoid**, with
-   `e_score_correction_bias` affecting **selection only** — never the returned weights.
-5. **Head counts differ per layer**: 48 on the 12 global layers, 72 on the 36 sliding ones,
-   so GQA groups are 6 and 9. Rotary is per layer *type*: yarn θ=5e5 on 64 of 128 dims
-   (global), default θ=1e4 on all 128 (sliding).
-6. **The deployed model is bf16.** Kernel gates compare against a bf16-activation reference,
-   not the fp32 oracle — feeding fp32 activations flips 15/540 router selections between
-   experts whose scores differ by 1e-5.
-7. **A small LUT indexed by a runtime value inside an inner loop is local memory.** Replacing
-   `e2m1f`'s `float t[8]` with the hardware FP4 converter was worth 2.5× on that kernel.
-8. **Any per-lane accumulator crossing a shared-memory reduction must keep its lane axis**, or
-   31 of 32 lanes are silently discarded.
-9. **`cudaMalloc` streams at 227 GB/s; a `cudaHostRegister`'d mmap only 160.** Weights are
-   never mapped.
-10. **The profile outranks the byte budget, and the bottleneck moves.** Attention is 56 % of
-    `B_tok`; the MoE is 25 %. Before the expert repack the MoE was **81.5 %** of the step and
-    attention 11.6 %; after it they are **37 % each**. Rank levers by bytes, then re-rank by
-    profile after every win.
-11. **Repack trades warp count for iterations-per-warp.** It won +70 % on the MoE (3
-    iterations/warp) and LOST 33 % on the BF16 GEMMs (12 iterations/warp, and small-N ones
-    collapse to 8–32 warps for the whole GPU).
-12. **The attention split count must not depend on `M`.** It chooses the partition of the
-    key axis, and the flash-decoding combine is a non-associative chain of fp32 rescales — so
-    a decode step and a prefill step of the same token got different roundings. 1 ulp at
-    layer 0, amplified ~1.4× per layer, flips the argmax by layer 48. Sizing the split from
-    key length alone makes decode, prefill and speculative verify bit-identical, which is what
-    lets a DFlash acceptance rate mean anything.
-13. **On uniform-random token IDs this model turns 1 ulp into a different token.** The 256-way
-    sigmoid router is near-uniform off-distribution, so top-10 is a coin toss. Gates on random
-    IDs are the strictest form of the test; two paths that merely round differently must be
-    compared against the oracle, never against each other.
-14. **`__device__` globals are per-module without `-rdc=true`.** An `extern __device__` in a
-    second translation unit silently becomes its own copy; nvcc's warning `#20044-D` is the
-    only sign. Pass device state by pointer instead.
+- **Single stream.** No batching across requests.
+- **No completed capability benchmark.** The GSM8K sweep's baseline run lost its server partway through and is
+  void. Quality evidence is bit-exactness against the reference implementation, which inherits whatever the
+  published NVFP4 checkpoint loses against BF16.
+- **The adaptive speculation policy is unreliable** (Finding 3). Pin `SPEC_K` by workload until it is fixed.
+- **Acceptance degrades with prompt length.** τ falls from 0.817 at 67 prompt tokens to 0.533 at 15,267.
+- **Context past 262,144** needs a documented RoPE override and is untested for quality.
 
-## KV sizing
+## Roadmap
 
-Sliding layers use a 512-slot ring, so 36 of 48 layers cost a constant **1.05 MB/sequence**
-forever. Only the 12 global layers scale, at **24 576 B/token** — a 4× structural win.
+1. **NVFP4 attention projections:** validated on both axes, +19.9% projected to ~39.8 tok/s base.
+2. **Fix the speculation controller:** more samples per arm and periodic re-measurement of unselected arms, or a
+   content-aware static rule. Worth up to +21% on code.
+3. **Complete the capability sweep** against a supervised server.
 
-**Allocation is free with respect to decode speed; only *used* context costs bandwidth**, and
-speculation halves even that (KV is read once per verify block). At 175 GB/s: 128 K context
-keeps **89 %** of peak decode, 256 K keeps 80 %. Budget after weights is ~52 GB → **~1.4–1.9 M
-tokens** of capacity, roughly 2× what poolside reports at the 256 K setting.
+## Repository map
 
-Default `CTX` = 262 144; ceiling 1 048 576 behind the documented rope override.
+| Path | Contents |
+|---|---|
+| [`kernels/`](kernels/) | GEMMs (FP4, FP8, BF16), attention with FP8 KV and sliding rings, MoE, elementwise |
+| [`src/`](src/) | Forward pass and the server |
+| [`include/`](include/) | Config parser (all constants read from `config.json`), arena loader, safetensors reader |
+| [`tests/`](tests/) | `gate_*` (correctness), `bench_*` (performance), bandwidth probes |
+| [`oracle/`](oracle/) | Reference transcription of `modeling_laguna.py` and golden-tensor generation (validation only) |
+| [`tools/`](tools/) | Roofline model, sweeps, terminal client, requantization and evaluation tools |
+| [`docs/`](docs/) | Start at [`WIKI.md`](docs/WIKI.md). Also [`ROOFLINE`](docs/ROOFLINE.md), [`MODEL_INVENTORY`](docs/MODEL_INVENTORY.md), [`ARCH_DELTA`](docs/ARCH_DELTA.md), [`RESCOPE`](docs/RESCOPE.md) (corrections to the original brief), [`LOOP_LOG`](docs/LOOP_LOG.md) (gate record), [`OPTIMIZATION_LOG`](docs/OPTIMIZATION_LOG.md), [`DECODE_FINAL`](docs/DECODE_FINAL.md), cross-model comparison ([`APPENDIX_CROSS_MODEL`](docs/APPENDIX_CROSS_MODEL.md)) |
+| [`dev/archive/`](dev/archive/) | The original directive, superseded plans and status, research prompts and findings, sweep logs |
+
+## Contributing and contact
+
+Issues are welcome for reproducibility problems and wrong numbers. Pull requests are not being accepted yet.
+
+## License
+
+- **Code in this repository:** MIT ([`LICENSE`](LICENSE)).
+- **Third-party code keeps its own license:** `include/third_party/httplib.h` and `json.hpp` (both MIT).
+- **Weights** are not distributed here. Laguna-S-2.1 is released by poolside under OpenMDW-1.1; this work is not
+  affiliated with or endorsed by poolside.
+
+## Citation
+
+```bibtex
+@misc{devaney2026lagunacuda,
+  title  = {laguna-s1-cuda-server: a pure-CUDA server for Laguna-S-2.1 NVFP4 with DFlash speculation on Jetson AGX Thor},
+  author = {Devaney, Patrick},
+  year   = {2026},
+  url    = {https://github.com/patrickbdevaney/laguna-s1-cuda-server}
+}
+```

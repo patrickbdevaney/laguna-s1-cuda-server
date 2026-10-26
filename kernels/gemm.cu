@@ -1,10 +1,10 @@
 // gemm.cu — G1 (NVFP4 dequant) and G2 (dense linear).
 //
-// RESCOPE.md §2 inverts gemma's emphasis: Laguna's dominant dense weights are **BF16**
+// docs/RESCOPE.md §2 inverts gemma's emphasis: Laguna's dominant dense weights are **BF16**
 // (attention q/k/v/o/g = 5.61 GB/step = 56 % of B_tok), not FP4. So the BF16 path is the
 // primary kernel here and the FP4 path serves the routed experts.
 //
-// Shape regime: decode is M=1, speculative verify is M<=6 (k*≈5 per ROOFLINE.md §4). Both
+// Shape regime: decode is M=1, speculative verify is M<=6 (k*≈5 per docs/ROOFLINE.md §4). Both
 // are deep in the memory-bound, weight-stationary regime — the weight is read once and
 // reused across all M rows, which is where gemma measured +21.8 % on its batched lm_head.
 #include "laguna_kernels.cuh"
@@ -240,7 +240,7 @@ extern "C" void gemm_fp4(float* out, const uint8_t* packed, const uint8_t* scale
 // Why per-row and not per-tensor: weight-only INT8/FP8 with per-channel scales is measured
 // lossless (llama.cpp Q8_0: ppl 7.32 -> 7.33), and per-row costs 4 bytes per output channel
 // (37 KB on the largest attention tensor) against 28 MB saved.
-// RESEARCH_FINDINGS.md: quantizing attention to 4 bits costs ~2.3 pts of recovery on a large
+// dev/archive/research/RESEARCH_FINDINGS.md: quantizing attention to 4 bits costs ~2.3 pts of recovery on a large
 // MoE; at 8 bits it is near-lossless. This is the stage-1 lever and deliberately not stage 3.
 // ---------------------------------------------------------------------------------------
 __global__ void k_quant_fp8_rows(uint8_t* __restrict__ q, float* __restrict__ scale,

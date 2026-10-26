@@ -330,7 +330,7 @@ inline Scheme scheme_from_spec(const std::string& spec) {
 
 inline Scheme scheme_by_name(const std::string& n) {
     // The three configurations the end-to-end sweep runs. Chosen by measured rel_mse in
-    // tools/bits_calib.cu, not by assumption -- see EXPERT_BITS_EVAL.md.
+    // tools/bits_calib.cu, not by assumption -- see docs/EXPERT_BITS_EVAL.md.
     if (n == "baseline") return scheme_from_spec("baseline/16");   // 4.500 bpw, applied as a no-op
     if (n == "B30")      return scheme_from_spec("2,6/16");        // 3.000 bpw
     if (n == "C275")     return scheme_from_spec("2,6/32");        // 2.750 bpw

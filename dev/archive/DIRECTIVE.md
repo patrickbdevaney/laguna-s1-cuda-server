@@ -2,7 +2,7 @@
 
 > **Archival copy of the original operating directive, verbatim, as handed over 2026-07-24.**
 > This file is the authority on *intent and scope*. Where its factual premises were refuted by
-> reading the checkpoint, `RESCOPE.md` records the correction and the reason — **`RESCOPE.md`
+> reading the checkpoint, `../../docs/RESCOPE.md` records the correction and the reason — **`../../docs/RESCOPE.md`
 > supersedes this document on facts, never on goals.** Do not edit the text below.
 
 ---
@@ -21,7 +21,7 @@ Three documents in `~/gemma-cuda-hybrid` are the operating manual for this work.
 
 1. `CUDA_ENGINEERING_CONSTITUTION.md` — the champion kernel stack and the full won/lost/neutral ledger. **Everything in the "lost" and "neutral" columns is already-paid tuition. Do not re-pay it.**
 2. `AGENTIC_OPTIMIZATION_METHODOLOGY.md` — the profile-first loop, map-vs-territory discipline, black-swan budget.
-3. `RESEARCH_FINDINGS.md` — what was researched, won, and refuted with evidence (Marlin, FlashInfer, tcgen05, roofline).
+3. `research/RESEARCH_FINDINGS.md` — what was researched, won, and refuted with evidence (Marlin, FlashInfer, tcgen05, roofline).
 
 Then read `README.md`, `SERVER_PLAN.md`, `MEGAKERNEL_PLAN.md`, `TC_FEASIBILITY.md`, and skim `src/forward.cu`, `src/draft.cu`, and `kernels/`.
 
@@ -43,7 +43,7 @@ From the gemma repo's measured constitution, do not re-derive:
 | Shared memory | 228 KB |
 | Toolchain | CUDA 13, `-arch=sm_110a` |
 
-**Gate H1 — capacity.** Before anything else, run `free -g` and `nvidia-smi` (or `tegrastats`). Laguna's NVFP4 weights are ~71 GB resident plus a ~2 GB BF16 draft. **If this box has less than ~110 GB of usable unified memory, this project is not viable and you must stop and report that.** The 64 GB Thor SKU cannot hold this model at any quantization it ships in. Write the result to `HARDWARE.md` as the first line of state.
+**Gate H1 — capacity.** Before anything else, run `free -g` and `nvidia-smi` (or `tegrastats`). Laguna's NVFP4 weights are ~71 GB resident plus a ~2 GB BF16 draft. **If this box has less than ~110 GB of usable unified memory, this project is not viable and you must stop and report that.** The 64 GB Thor SKU cannot hold this model at any quantization it ships in. Write the result to `../../docs/HARDWARE.md` as the first line of state.
 
 ---
 
@@ -81,9 +81,9 @@ Verified from the model cards (2026-07-24). Treat these as fixed; everything els
 
 ## 3. Phase 0 — roofline before code
 
-**Do not write a kernel until `ROOFLINE.md` exists and is defended with arithmetic.** This phase is the highest-value hour in the project because it determines whether the target is 25 tok/s or 50 tok/s, and those imply different engineering.
+**Do not write a kernel until `../../docs/ROOFLINE.md` exists and is defended with arithmetic.** This phase is the highest-value hour in the project because it determines whether the target is 25 tok/s or 50 tok/s, and those imply different engineering.
 
-Produce `ROOFLINE.md` containing:
+Produce `../../docs/ROOFLINE.md` containing:
 
 ### 3.1 Bytes per token
 
@@ -103,9 +103,9 @@ Sanity anchor: 8.5B active × 0.531 B/param (NVFP4 = 4.25 bits) ≈ **4.51 GB**.
 | Improved (larger per-layer work amortizes launch overhead better than gemma) | ~135 GB/s | **~30 tok/s** |
 | Hard ceiling at Thor's achievable streaming BW | ~200 GB/s | **~44 tok/s** |
 
-**44 tok/s is the autoregressive wall.** Nothing gets past it except speculation. Write that sentence in `ROOFLINE.md`.
+**44 tok/s is the autoregressive wall.** Nothing gets past it except speculation. Write that sentence in `../../docs/ROOFLINE.md`.
 
-Note that poolside's GB10 measurement of 13–14 tok/s implies **~59–63 GB/s effective** — roughly a third of Thor's achievable, and well below what the gemma repo already demonstrates on this chip class. That gap is the actual opportunity here, and it is bigger than the +10%-over-vLLM heuristic from the gemma work. **State explicitly in `ROOFLINE.md` that the +10% heuristic does not transfer**: it was measured against a vLLM path that was already near-roofline for gemma-4, whereas vLLM's Laguna MoE path on unified-memory Blackwell appears to be leaving 1.5–2× on the floor.
+Note that poolside's GB10 measurement of 13–14 tok/s implies **~59–63 GB/s effective** — roughly a third of Thor's achievable, and well below what the gemma repo already demonstrates on this chip class. That gap is the actual opportunity here, and it is bigger than the +10%-over-vLLM heuristic from the gemma work. **State explicitly in `../../docs/ROOFLINE.md` that the +10% heuristic does not transfer**: it was measured against a vLLM path that was already near-roofline for gemma-4, whereas vLLM's Laguna MoE path on unified-memory Blackwell appears to be leaving 1.5–2× on the floor.
 
 ### 3.3 The expert-union problem — the dominant unknown
 
@@ -128,15 +128,15 @@ Produce a table of projected tok/s over `k ∈ {3, 5, 7, 9, 11, 15}` under `E_fr
 
 ### 3.4 Gate R1
 
-`ROOFLINE.md` is complete when it contains: measured B_tok, the AR wall, the k-sweep projection table, the `E_frac` sensitivity, and a named `k*` prior. Only then proceed.
+`../../docs/ROOFLINE.md` is complete when it contains: measured B_tok, the AR wall, the k-sweep projection table, the `E_frac` sensitivity, and a named `k*` prior. Only then proceed.
 
 ---
 
 ## 4. Phase 1 — acquisition, inventory, and the reference oracle
 
 1. `hf download poolside/Laguna-S-2.1-NVFP4` and `hf download poolside/Laguna-S-2.1-DFlash-NVFP4`. ~73 GB combined. Verify free disk before starting; a failed 71 GB download is an expensive mistake.
-2. Dump `config.json`, `generation_config.json`, the tokenizer files, and the safetensors index into `MODEL_INVENTORY.md`: every tensor name, shape, dtype, and the NVFP4 scale layout (E2M1 block + E4M3 group scale + FP32 global — confirm the group size, gemma's was 16).
-3. Read the `custom_code` modeling file end to end. Write `ARCH_DELTA.md` — a per-subsystem diff of gemma-4 vs Laguna S 2.1:
+2. Dump `config.json`, `generation_config.json`, the tokenizer files, and the safetensors index into `../../docs/MODEL_INVENTORY.md`: every tensor name, shape, dtype, and the NVFP4 scale layout (E2M1 block + E4M3 group scale + FP32 global — confirm the group size, gemma's was 16).
+3. Read the `custom_code` modeling file end to end. Write `../../docs/ARCH_DELTA.md` — a per-subsystem diff of gemma-4 vs Laguna S 2.1:
 
 | Subsystem | gemma-4-26B-A4B | Laguna S 2.1 | Port verdict |
 |---|---|---|---|
@@ -155,7 +155,7 @@ Produce a table of projected tok/s over `k ∈ {3, 5, 7, 9, 11, 15}` under `E_fr
 
 4. **Stand up the correctness oracle.** Install vLLM 0.25.1 (or Transformers with `trust_remote_code`) in a venv *outside* the build, purely as a reference. Capture golden tensors: per-layer hidden states and logits for a fixed prompt at temp 0. Every gate in §6 is checked bit-exact or within a stated ULP tolerance against these. **This is non-negotiable — the gemma port's entire discipline was correctness-first, and skipping it here on a model 4.7× larger would be unrecoverable.**
 
-**Gate A1.** Reference oracle produces reproducible golden tensors on disk. `ARCH_DELTA.md` complete.
+**Gate A1.** Reference oracle produces reproducible golden tensors on disk. `../../docs/ARCH_DELTA.md` complete.
 
 ---
 
@@ -174,7 +174,7 @@ At 71 GB on a 128 GB unified-memory part, **loading is a first-class engineering
 
 ## 6. Phase 3 — gated kernel build
 
-Mirror the gemma repo's gate discipline. Each gate is bit-exact (or stated-tolerance) against the oracle from §4.4 before the next begins. Log every gate to `LOOP_LOG.md` with pass/fail and the measured delta.
+Mirror the gemma repo's gate discipline. Each gate is bit-exact (or stated-tolerance) against the oracle from §4.4 before the next begins. Log every gate to `../../docs/LOOP_LOG.md` with pass/fail and the measured delta.
 
 - **G1 — NVFP4 dequant.** E2M1 + E4M3 group scale + FP32 global → bf16/fp16, using HW `__nv_cvt_fp4x2` intrinsics. Port from `kernels/nvfp4_quant.cu`. Confirm the group size from the checkpoint rather than assuming 16.
 - **G2 — dense linear / tensor-core GEMM.** Port the Marlin-class raw `mma.sync.m16n8k16` path from `kernels/tc_verify_gemm.cu` wholesale: in-register FP4→fp16 dequant, offline repack, 16-byte `int4` coalesced loads, `__ldcs` evict-first, max-grid-fill. **Retile for Laguna's shapes.** The tcgen05 rejection from the gemma work still holds at M≤16 — do not revisit it.
@@ -197,10 +197,10 @@ Mirror the gemma repo's gate discipline. Each gate is bit-exact (or stated-toler
 3. **Run the k-sweep. This is the single most important experiment in the project.** For `k ∈ {3, 5, 7, 9, 11, 15}`, on a code-generation workload at both temp 0 and temp 0.7, measure:
    - τ (accepted tokens/block)
    - verify step wall time
-   - **measured `E_frac(k)` — instrument the actual count of distinct experts activated per verify block.** This is the number your §3.3 model guessed at. Replace the guess with the measurement and rewrite `ROOFLINE.md`.
+   - **measured `E_frac(k)` — instrument the actual count of distinct experts activated per verify block.** This is the number your §3.3 model guessed at. Replace the guess with the measurement and rewrite `../../docs/ROOFLINE.md`.
    - end-to-end tok/s
 4. Pick `k*` from the measurement, not from either model card. Expect `k*` to land nearer 7 than 15.
-5. If `E_frac(k*) > 0.6`, the naive verify is reading most of the expert weights and you should evaluate **routing-aware draft scheduling**: truncating the verify block at the position where the expert union crosses a byte budget. Log the idea in `OPTIMIZATION_LOG.md` even if you don't build it.
+5. If `E_frac(k*) > 0.6`, the naive verify is reading most of the expert weights and you should evaluate **routing-aware draft scheduling**: truncating the verify block at the position where the expert union crosses a byte budget. Log the idea in `../../docs/OPTIMIZATION_LOG.md` even if you don't build it.
 
 **Gate D1.** DFlash decode tok/s recorded at `k*`, with measured τ and `E_frac`. Head-to-head against vLLM on the same box, same prompt, back-to-back, in `BENCHMARK_COMPARISON.md`.
 
@@ -226,7 +226,7 @@ Port feature-for-feature from the gemma repo. This is the part that makes it an 
 
 ## 9. Phase 6 — optimization loop
 
-Now, and only now, run the `AGENTIC_OPTIMIZATION_METHODOLOGY.md` loop: profile → hypothesis → single change → measure → gate → log. Every attempt goes in `OPTIMIZATION_LOG.md` with a won/lost/neutral verdict, so the ledger for Laguna becomes as reusable as gemma's is.
+Now, and only now, run the `AGENTIC_OPTIMIZATION_METHODOLOGY.md` loop: profile → hypothesis → single change → measure → gate → log. Every attempt goes in `../../docs/OPTIMIZATION_LOG.md` with a won/lost/neutral verdict, so the ledger for Laguna becomes as reusable as gemma's is.
 
 Priority order, derived from the roofline:
 1. MoE grouped GEMM achieved bandwidth (G5) — biggest single lever.
@@ -252,7 +252,7 @@ Priority order, derived from the roofline:
 
 ## 11. State files to maintain in `~/laguna-s1-cuda-server`
 
-`HARDWARE.md` · `ROOFLINE.md` · `MODEL_INVENTORY.md` · `ARCH_DELTA.md` · `STATUS.md` · `LOOP_LOG.md` · `OPTIMIZATION_LOG.md` · `BENCHMARK_COMPARISON.md` · `CUDA_ENGINEERING_CONSTITUTION.md` (Laguna edition) · `README.md`
+`../../docs/HARDWARE.md` · `../../docs/ROOFLINE.md` · `../../docs/MODEL_INVENTORY.md` · `../../docs/ARCH_DELTA.md` · `STATUS.md` · `../../docs/LOOP_LOG.md` · `../../docs/OPTIMIZATION_LOG.md` · `BENCHMARK_COMPARISON.md` · `CUDA_ENGINEERING_CONSTITUTION.md` (Laguna edition) · `README.md`
 
 Update `STATUS.md` at every gate. It is the resume point if this session ends.
 
@@ -271,7 +271,7 @@ Update `STATUS.md` at every gate. It is the resume point if this session ends.
 
 ## First action
 
-Read the three gemma methodology docs. Then run Gate H1. Then produce `ROOFLINE.md`. Report back with the roofline before writing a single kernel.
+Read the three gemma methodology docs. Then run Gate H1. Then produce `../../docs/ROOFLINE.md`. Report back with the roofline before writing a single kernel.
 
 ---
 
@@ -286,6 +286,6 @@ Read the three gemma methodology docs. Then run Gate H1. Then produce `ROOFLINE.
 > every lever possible.
 
 This amendment adds: (a) **KV sizing is a first-class objective**, co-equal with decode tok/s —
-see `RESCOPE.md` §4; (b) the loop runs **autonomously to completion** without checkpointing back;
+see `../../docs/RESCOPE.md` §4; (b) the loop runs **autonomously to completion** without checkpointing back;
 (c) **every lever is in scope**, including levers the original directive did not name (the
-self-quantization lever in `ROOFLINE.md` §5 is the first of these).
+self-quantization lever in `../../docs/ROOFLINE.md` §5 is the first of these).

@@ -6,3 +6,10 @@ build/
 cache/
 oracle-venv/
 docs/golden/*.pt
+
+# Local run outputs: sweeps, server logs and probes. Reproducible; never committed.
+/eval_out/
+/kswee_out/
+/*.log
+/*.bin
+__pycache__/

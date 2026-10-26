@@ -1,6 +1,6 @@
 # HARDWARE_PROBE.md — what `sm_110a` actually has, settled by compilation
 
-`HARDWARE.md:38` says "TMEM + tcgen05 + TMA present". `RESEARCH_PROMPT_V5.md` says tcgen05 is
+`../../docs/HARDWARE.md:38` says "TMEM + tcgen05 + TMA present". `research/RESEARCH_PROMPT_V5.md` says tcgen05 is
 absent. Both cannot be right, and every kernel decision downstream depends on which. This is a
 compile-only probe, so it needed no GPU time and did not disturb the running sweep.
 
@@ -26,7 +26,7 @@ separated the one real finding from three artifacts.
 
 ## What this changes
 
-* **`HARDWARE.md:38` is wrong about tcgen05** and should be corrected. It is right about TMA.
+* **`../../docs/HARDWARE.md:38` is wrong about tcgen05** and should be corrected. It is right about TMA.
 * **TMA and thread-block clusters are available and we use neither.** Both are relevant to the
   attention GEMV work: TMA can stage weight tiles without burning registers on addressing, and
   cluster barriers are a cheaper synchronisation primitive than the `grid.sync` that was blamed

@@ -54,7 +54,7 @@ speculate on code, do not on prose — beats the current adaptive policy on both
 
 ## Honest position on "maximum"
 
-This is **not** the global maximum, and `OMEGA.md` already argued why that claim is not available.
+This is **not** the global maximum, and `../dev/archive/OMEGA.md` already argued why that claim is not available.
 What is true after tonight:
 
 * **Every lever on the frontier list has been re-priced against a profile of the shipping config**,

@@ -28,7 +28,7 @@ shell.
 
 **Capability sweep** — the gate on the whole 3 bpw expert path. GSM8K n=200 at a 1024-token
 budget, three configs (`baseline`, `LG_EXPERT_LEVELS=7`, `=5`), scored as
-seconds-per-correct-answer. Roughly one hour per config. See `EXPERT_BITS_EVAL.md` for why τ and
+seconds-per-correct-answer. Roughly one hour per config. See `../../docs/EXPERT_BITS_EVAL.md` for why τ and
 the golden gate could not answer this and why the metric is in seconds.
 
 **Trellis benchmark** — whether a 3-bit trellis decoder stays memory-bound on 20 SMs. It waits

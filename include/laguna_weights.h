@@ -1,6 +1,6 @@
 // laguna_weights.h — device weight layout + streaming loader.
 //
-// Memory discipline (DIRECTIVE.md §5): the checkpoint is 71.9 GB on a 122 GB box. A naive
+// Memory discipline (dev/archive/DIRECTIVE.md §5): the checkpoint is 71.9 GB on a 122 GB box. A naive
 // load that lets the page cache retain every shard while device buffers fill would need
 // ~144 GB. So: reserve every buffer in ONE arena up front, then make a single pass over the
 // shards, reading each with bulk pread into a reusable host buffer, copying tensors into the
@@ -42,7 +42,7 @@ extern "C" void quant_fp8_rows(uint8_t*, float*, const uint16_t*, int, int, cuda
 namespace laguna {
 
 // ---------------------------------------------------------------------------------------
-// Expert-weight repack (the "offline repack" of DIRECTIVE.md §5 / the gemma Marlin recipe).
+// Expert-weight repack (the "offline repack" of dev/archive/DIRECTIVE.md §5 / the gemma Marlin recipe).
 //
 // The checkpoint stores each expert projection row-major [n][k]. A warp-per-output-row GEMV
 // over that layout gives each warp only H/32/32 = 3 k-iterations, so there is no
@@ -130,7 +130,7 @@ struct LayerW {
     const uint8_t *e_gate_p = nullptr, *e_up_p = nullptr, *e_down_p = nullptr;
     const uint8_t *e_gate_s = nullptr, *e_up_s = nullptr, *e_down_s = nullptr;
     // FP8 (e4m3) attention weights + per-output-row scales, when LG_FP8ATTN is on.
-    // RESEARCH_FINDINGS.md stage 1: near-lossless, 1.39x on B_tok, no calibration needed.
+    // dev/archive/research/RESEARCH_FINDINGS.md stage 1: near-lossless, 1.39x on B_tok, no calibration needed.
     const uint8_t *q8 = nullptr, *k8 = nullptr, *v8 = nullptr, *o8 = nullptr, *g8 = nullptr;
     const float *q8s = nullptr, *k8s = nullptr, *v8s = nullptr, *o8s = nullptr, *g8s = nullptr;
 

@@ -51,12 +51,12 @@ average MoE rate                      = 203.8 GB/s = 89.8 % of ceiling
 
 **The MoE expert term is genuinely BANDWIDTH-BOUND at 89.8 % of the measured ceiling.** This is
 the exact opposite of the trellis finding, and it is *why* the trellis verdict does not
-generalise. `TRELLIS_VERDICT.md` recommended against 3 bpw because the *decoder* hit an ALU
+generalise. `../../../docs/TRELLIS_VERDICT.md` recommended against 3 bpw because the *decoder* hit an ALU
 ceiling at 91 %, so fewer bytes bought nothing. Here the *streaming* is at 90 % of the memory
 ceiling with a 3-ALU-op-per-weight NVFP4 unpack that is nowhere near saturated. **Any lever that
 removes expert BYTES without adding ALU work converts at essentially 1:1.**
 
-Conversion rule used throughout (the same one `REPRICED.md` used for `o_proj`):
+Conversion rule used throughout (the same one `../REPRICED.md` used for `o_proj`):
 `speedup = 1 / (1 − ΔGB / 6.251)`, with a warp-count correction where parallelism changes.
 
 **Note on the 31.3 % figure.** `LG_PROF` serialises, so shares are distorted. By *absolute*
@@ -149,7 +149,7 @@ the project already contemplates.** It is not a new category of risk. This refra
 valuable sentence in this document, because it moves a +25 % lever from "forbidden" to "gated the
 same way as things we already do".
 
-With the caveat `EXPERT_BITS_EVAL.md` established the hard way: **the gate must be the capability
+With the caveat `../../../docs/EXPERT_BITS_EVAL.md` established the hard way: **the gate must be the capability
 sweep, not τ and not golden-continuation.** τ *rose* (2.396 → 2.612) when the experts were
 degraded, and 5-level (more distorting) scored 8/8 golden while 7-level scored 0/8. Because "this
 model turns 1 ulp into a different token — the 256-way sigmoid router puts top-10 on a knife edge",
@@ -360,7 +360,7 @@ agree without being forced to.
 **All of it exact.** This is the only mechanism in this document that satisfies §5's "sublinear in
 the model, *exactly*" without touching the capability gate.
 
-**Why bit-exactness is worth more on this model than on most.** `EXPERT_BITS_EVAL.md` records that
+**Why bit-exactness is worth more on this model than on most.** `../../../docs/EXPERT_BITS_EVAL.md` records that
 this model "turns 1 ulp into a different token, because the 256-way sigmoid router puts top-10 on a
 knife edge". A scheme that is exact *at the bf16 expert output* therefore cannot perturb the next
 layer's routing at all; a scheme that is merely close will flip expert selections and diverge. On a
@@ -504,7 +504,7 @@ falls to 13 %. A 3 bpw code would then be saving 25 % of a 0.94 GB term instead 
 what the trellis was going to save. If §1 lands, the trellis project's ceiling drops from +7 % to
 roughly +2 %.
 
-Conversely — and this is the condition `TRELLIS_VERDICT.md` asked to be revisited on — the row-
+Conversely — and this is the condition `../../../docs/TRELLIS_VERDICT.md` asked to be revisited on — the row-
 contiguous repack of §1.5/§1.6 lifts gate/up toward its bandwidth limit, which *would* make the
 term more bandwidth-bound. But sparsity removes more bytes than the trellis does, so it wins the
 race regardless.
@@ -633,7 +633,7 @@ QTIP's own table (arXiv:2406.11235, Table 5), Llama-2 WikiText-2:
 
 At **2 bits** QTIP beats QuIP# by 0.21 ppl on 70B. At **4 bits** the gap is **0.02**. The entire
 lattice-codebook / incoherence-processing apparatus is a *low-bit* technology. We are at 4.5 bpw.
-`TRELLIS_VERDICT.md` reached the same conclusion from the speed side; this is the accuracy side of
+`../../../docs/TRELLIS_VERDICT.md` reached the same conclusion from the speed side; this is the accuracy side of
 the same wall, from an independent direction. **AQLM is separately dead here**: a 2¹⁶×8 fp16
 codebook = 1 MiB *per linear layer*, and we have 47 × 256 × 3 of them.
 
@@ -732,7 +732,7 @@ day, and it either kills the idea or clears it.
   is A100 **batch 24**, encoder-decoder MT — do not port it.
 * **Attention is more sensitive than experts.** QuantMoE-Bench (arXiv:2406.08155): raising
   attention to 4/8 bits gives **> 5 % gains** versus spending the same bit budget on experts.
-  **This is a direct warning against `REPRICED.md`'s current top item.** `o_proj → NVFP4` is priced
+  **This is a direct warning against `../REPRICED.md`'s current top item.** `o_proj → NVFP4` is priced
   at +9.2 % on bytes; the MoE quantization literature says attention projections are the *worst*
   place in an MoE to spend precision. The two are not contradictory — one is speed, one is
   accuracy — but the +9.2 % should not be treated as low-risk just because it is bandwidth-obvious.

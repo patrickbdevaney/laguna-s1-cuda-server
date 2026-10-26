@@ -42,7 +42,7 @@ hardest, adds only `o_proj` and leaves Q/K/V in higher precision.
 points at 22 B active but **5.7 points at 3.3 B active**. Laguna is **8.5 B active** — between
 them, nearer the fragile end.
 
-### What this does to `ROOFLINE.md` §5
+### What this does to `../../../docs/ROOFLINE.md` §5
 
 The lever survives but its staging is now evidence-driven rather than guessed:
 

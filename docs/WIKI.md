@@ -30,7 +30,7 @@ the oracle at every stage.
 
 | file | what it holds |
 |---|---|
-| `DIRECTIVE.md` | the original operating directive, verbatim |
+| `../dev/archive/DIRECTIVE.md` | the original operating directive, verbatim |
 | `RESCOPE.md` | 12 corrections to its factual premises, with evidence |
 | `ROOFLINE.md` | byte budget, k-sweep, KV policy |
 | `MODEL_INVENTORY.md` | every tensor, the NVFP4 layout, tokenizer, chat grammar |
@@ -40,8 +40,8 @@ the oracle at every stage.
 | `COST_MODEL_CORRECTION.md` | **a model of mine that was physically impossible, and its fix** |
 | `RESEARCH_PROMPT_V2/V3/V4.md` | the research prompts, each built from what the last one taught |
 | `RESEARCH_FINDINGS_V2/V3/V4.md` | what came back, including what refuted us |
-| `IMPLEMENTATION_PLAN.md` | the ranked plan and what has been executed |
-| `OMEGA.md` | **honest answer to "is this the global maximum?" — no, and why** |
+| `../dev/archive/IMPLEMENTATION_PLAN.md` | the ranked plan and what has been executed |
+| `../dev/archive/OMEGA.md` | **honest answer to "is this the global maximum?" — no, and why** |
 
 ## 3. The arc, in order
 
@@ -152,7 +152,7 @@ gate comparisons per token.
 | lever | estimate | state |
 |---|---:|---|
 | ~~Routed experts → 3.0 bpw trellis~~ | ~~+15.2 %~~ → **+5.3 %** | **REJECTED.** Measured: production NVFP4 MoE 332 Gweight/s vs trellis_B 395, applied to a 31.3 % term. The +15.2 % assumed the term stays bandwidth-bound and converts the 1.406× byte saving in full; it does not, because trellis_B sits at 91 % of its own ALU ceiling. See `TRELLIS_VERDICT.md`. |
-| **Attention `q_proj`+`o_proj` → NVFP4** | **+21 %** | **capability MEASURED**: all five attention projections leave greedy output bit-identical, 8/8. Largest term in the profile (44.9 % of `B_tok`) and absent from every prior version of this table. Conversion is the open part. See `REPRICED.md`. |
+| **Attention `q_proj`+`o_proj` → NVFP4** | **+21 %** | **capability MEASURED**: all five attention projections leave greedy output bit-identical, 8/8. Largest term in the profile (44.9 % of `B_tok`) and absent from every prior version of this table. Conversion is the open part. See `../dev/archive/REPRICED.md`. |
 | ~~Intra-expert activation sparsity~~ | ~~+24.9 %~~ | **REJECTED on this model.** At the published 87 % operating point, zeroing costs 43.7 % relative error unstructured / 83 % block-32; the bit-exact permutation rescue buys 0.9 pp. Our experts are dynamically, not chronically, sparse — every neuron is in the top-13 % for 9–18 % of tokens. `moe_intermediate`=1024 was the right thing to worry about. See `ACTIVATION_SPARSITY.md`. |
 | Close the M>1 kernel inefficiency | lowers spec break-even τ 3.36 → 2.40 | **would make speculation profitable on prose** |
 | Kernel fusion beyond `moe_invert` | +3.2 % ceiling | ~770 small kernels remain |
@@ -163,7 +163,7 @@ gate comparisons per token.
 **Out of scope rather than unattractive:** every published fix for long-context acceptance is a
 drafter retrain, and DFlash is the *shipped* head for this checkpoint.
 
-`OMEGA.md` argues this is a strong **local** maximum — roughly 2.4× ahead of the published state
+`../dev/archive/OMEGA.md` argues this is a strong **local** maximum — roughly 2.4× ahead of the published state
 of the art on comparable hardware — and states plainly what would have to be true for it to be a
 global one. None of those four things holds.
 

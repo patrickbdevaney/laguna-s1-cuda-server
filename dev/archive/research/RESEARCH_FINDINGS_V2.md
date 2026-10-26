@@ -13,7 +13,7 @@ research pass that only confirms you is a research pass that was not worth runni
 
 ### A1. `ncu` hardware counters are NOT blocked. `ERR_NVGPUCTRPERM` is just non-root.
 
-`OPTIMIZATION_LOG.md` §0 said counters were unavailable and treated that as terminal. It is
+`../../../docs/OPTIMIZATION_LOG.md` §0 said counters were unavailable and treated that as terminal. It is
 not: `sudo -E env PATH=$PATH ncu --csv -k regex:... ./build/bench_moe` works on this box today.
 
 Caveat that matters: **`dram__*` metrics return `n/a` on Tegra** — there are no DRAM
@@ -125,7 +125,7 @@ single-stream datapoint is `zeux/calm`'s `gf4` at 87 % on an MoE — bought with
 
 ### C1. Pin the EMC clock — **needs root, biggest single free lever**
 `/sys/class/devfreq/bwmgr/` reads `cur_freq` **3200 MHz against `max_freq` 4266 MHz**. This
-applies to *every* kernel, not just the MoE. `ROOFLINE.md` §11 estimated +3–8 %; the measured
+applies to *every* kernel, not just the MoE. `../../../docs/ROOFLINE.md` §11 estimated +3–8 %; the measured
 clock ratio suggests the ceiling is higher. **Not attempted — it is a system-wide change on a
 box running remote-access services, and it is the owner's call.**
 
@@ -224,7 +224,7 @@ L2 for nothing. Plus `prefetch.global.L2` (sm_20+, unlike the TMA-family
 1. **Short microbenchmarks on this part measure the idle clock.** The same shape gave 0.194 ms
    and 0.627 ms in two processes with identical code — a 3.2× swing — purely on whether the
    preceding variant ran long enough to ramp DVFS. `bench_moe` now spins 300 ms before any
-   measurement. **Several earlier "neutral" results in `OPTIMIZATION_LOG.md` were taken with
+   measurement. **Several earlier "neutral" results in `../../../docs/OPTIMIZATION_LOG.md` were taken with
    20-iteration warmups and are worth re-running.**
 2. **The first kernel over a freshly allocated arena is not measurable** — page-table and TLB
    warmup made a 182 GB/s shape read as 56 GB/s, which pointed at entirely the wrong conclusion.

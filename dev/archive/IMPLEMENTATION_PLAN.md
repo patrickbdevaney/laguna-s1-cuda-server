@@ -1,6 +1,6 @@
 # IMPLEMENTATION_PLAN.md — what the research pass says to build, in order
 
-Derived from `RESEARCH_FINDINGS_V2.md`. Ranked by expected value ÷ cost. Items marked **DONE**
+Derived from `research/RESEARCH_FINDINGS_V2.md`. Ranked by expected value ÷ cost. Items marked **DONE**
 were implemented and measured during the pass itself.
 
 Baseline at the start of the pass: **27.4 tok/s** base decode, 33.6 tok/s served on code.
